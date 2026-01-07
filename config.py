@@ -10,8 +10,8 @@ from typing import Optional
 class TrainingConfig:
     """训练配置"""
     # 数据路径
-    tum_dir: str = './data/tumor'
-    norm_dir: str = './data/normal'
+    tum_dir: str = '/data/xuwen/NCT-CRC-HE-100K/TUM'
+    norm_dir: str = '/data/xuwen/NCT-CRC-HE-100K/NORM'
     hovernet_path: Optional[str] = None
     
     # 训练参数
@@ -21,7 +21,7 @@ class TrainingConfig:
     device: str = 'cuda'
     
     # 模型保存
-    save_dir: str = './checkpoints'
+    save_dir: str = './logs/checkpoints'
     save_interval: int = 10  # 每 N 个 epoch 保存一次
     
     # 损失权重

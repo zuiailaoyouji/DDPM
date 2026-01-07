@@ -52,7 +52,15 @@ def train(
     print("初始化模型...")
     unet = create_model().to(device)
     scheduler = DDPMScheduler(num_train_timesteps=1000)
-    feedback_criterion = FeedbackLoss(hovernet, scheduler).to(device)
+    
+    # 初始化反馈损失（仅在 hovernet 可用时）
+    if hovernet is not None:
+        feedback_criterion = FeedbackLoss(hovernet, scheduler).to(device)
+        print("运行模式：带反馈损失的 DDPM 训练")
+    else:
+        feedback_criterion = None
+        print("运行模式：基础 DDPM 训练（无反馈损失）")
+    
     optimizer = torch.optim.AdamW(unet.parameters(), lr=lr)
     
     # 2. 加载数据集
@@ -109,7 +117,7 @@ def train(
             
             # 8. 计算反馈 Loss (特征增强能力)
             # 建议：前 N 个 Epoch 可以先不加这个 Loss，或者权重设为 0
-            if epoch >= use_feedback_from_epoch:
+            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
                 loss_prob, loss_entropy = feedback_criterion(
                     noisy_images, noise_pred, timesteps, labels
                 )
@@ -119,7 +127,7 @@ def train(
             
             # 9. 总 Loss
             # lambda 系数需要微调，建议从 0.01 开始
-            if epoch >= use_feedback_from_epoch and hovernet is not None:
+            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
                 loss_total = loss_mse + feedback_weight_prob * loss_prob + feedback_weight_entropy * loss_entropy
             else:
                 loss_total = loss_mse
