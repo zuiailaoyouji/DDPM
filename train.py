@@ -8,12 +8,15 @@ from torch.utils.data import DataLoader
 from diffusers import DDPMScheduler
 import os
 import argparse
+import csv  # 新增
 from tqdm import tqdm
 
 from dataset import NCTDataset
 from unet_wrapper import create_model
 from feedback_loss import FeedbackLoss
 from utils import load_hovernet, get_device
+# 新增: 导入可视化模块
+from visualization import save_training_progress_images
 
 
 def train(
@@ -28,6 +31,7 @@ def train(
     feedback_weight_prob=0.05,
     feedback_weight_entropy=0.01,
     use_feedback_from_epoch=5,
+    resume_path=None,
 ):
     """
     训练 DDPM 模型
@@ -44,9 +48,23 @@ def train(
         feedback_weight_prob: 概率损失权重
         feedback_weight_entropy: 熵损失权重
         use_feedback_from_epoch: 从第几个 epoch 开始使用反馈损失
+        resume_path: 恢复训练的检查点路径（可选）
     """
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
+    
+    # 新增: 准备可视化目录
+    vis_dir = os.path.join(save_dir, 'visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # 新增: 初始化 CSV 日志
+    log_path = os.path.join(save_dir, 'training_log.csv')
+    csv_mode = 'a' if os.path.exists(log_path) else 'w'
+    with open(log_path, csv_mode, newline='') as f:
+        writer = csv.writer(f)
+        if csv_mode == 'w':
+            # 写入表头：增加了 TUM_Conf, NORM_Conf, L1_Diff
+            writer.writerow(['Epoch', 'Total_Loss', 'MSE', 'Prob_Loss', 'Entropy', 'TUM_Conf', 'NORM_Conf', 'L1_Diff'])
     
     # 1. 初始化模型和调度器
     print("初始化模型...")
@@ -63,6 +81,16 @@ def train(
     
     optimizer = torch.optim.AdamW(unet.parameters(), lr=lr)
     
+    # 如果需要断点续训加载代码
+    start_epoch = 0
+    if resume_path is not None and os.path.exists(resume_path):
+        print(f"加载检查点: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        unet.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+        print(f"从 Epoch {start_epoch} 继续训练")
+    
     # 2. 加载数据集
     print("加载数据集...")
     dataset = NCTDataset(tum_dir, norm_dir, oversample=True)
@@ -77,12 +105,15 @@ def train(
     
     # 3. 训练循环
     print(f"开始训练，共 {epochs} 个 epoch...")
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         unet.train()
-        total_loss = 0.0
-        total_mse = 0.0
-        total_prob = 0.0
-        total_entropy = 0.0
+        
+        # 初始化累加器
+        acc = {
+            'loss': 0.0, 'mse': 0.0, 'prob': 0.0, 'entropy': 0.0,
+            'tum_conf': 0.0, 'norm_conf': 0.0, 'l1': 0.0,
+            'tum_count': 0, 'norm_count': 0
+        }
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         
@@ -115,15 +146,34 @@ def train(
             # 7. 计算 MSE Loss (基础重建能力)
             loss_mse = F.mse_loss(noise_pred, noise)
             
+            # 关键修改: 总是计算增强图 x0_pred 以便监控 L1
+            # 即使在阶段一 (无反馈)，我们也想看看模型生成的图和原图差多少
+            with torch.no_grad():
+                if feedback_criterion is not None:
+                    x0_pred = feedback_criterion.predict_x0_from_noise(noisy_images, noise_pred, timesteps)
+                else:
+                    # 如果没有 feedback_criterion，手动计算 x0_pred（用于可视化）
+                    device_img = noisy_images.device
+                    dtype_img = noisy_images.dtype
+                    alpha_prod_t = scheduler.alphas_cumprod[timesteps].to(device_img).to(dtype_img).view(-1, 1, 1, 1)
+                    beta_prod_t = 1 - alpha_prod_t
+                    x0_pred = (noisy_images - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
+                    x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
+                l1_diff = F.l1_loss(x0_pred, clean_images)
+            
             # 8. 计算反馈 Loss (特征增强能力)
             # 建议：前 N 个 Epoch 可以先不加这个 Loss，或者权重设为 0
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                loss_prob, loss_entropy = feedback_criterion(
+                # 接收 4 个返回值
+                loss_prob, loss_entropy, conf_tum, conf_norm = feedback_criterion(
                     noisy_images, noise_pred, timesteps, labels
                 )
             else:
+                # 占位符
                 loss_prob = torch.tensor(0.0, device=device)
                 loss_entropy = torch.tensor(0.0, device=device)
+                conf_tum = torch.tensor(0.0, device=device)
+                conf_norm = torch.tensor(0.0, device=device)
             
             # 9. 总 Loss
             # lambda 系数需要微调，建议从 0.01 开始
@@ -139,31 +189,57 @@ def train(
             torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
             optimizer.step()
             
-            # 记录损失
-            total_loss += loss_total.item()
-            total_mse += loss_mse.item()
-            total_prob += loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob
-            total_entropy += loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy
+            # 累加记录
+            acc['loss'] += loss_total.item()
+            acc['mse'] += loss_mse.item()
+            acc['prob'] += loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob
+            acc['entropy'] += loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy
+            acc['l1'] += l1_diff.item()
+            
+            if conf_tum > 0:
+                acc['tum_conf'] += conf_tum.item()
+                acc['tum_count'] += 1
+            if conf_norm > 0:
+                acc['norm_conf'] += conf_norm.item()
+                acc['norm_count'] += 1
+            
+            # 调用可视化模块 (仅在每个 Epoch 的第一个 Batch)
+            if batch_idx == 0:
+                save_training_progress_images(
+                    clean_images, noisy_images, x0_pred, 
+                    epoch=epoch+1, save_dir=vis_dir
+                )
             
             # 更新进度条
-            progress_bar.set_postfix({
-                'Loss': f'{loss_total.item():.4f}',
-                'MSE': f'{loss_mse.item():.4f}',
-                'Prob': f'{loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob:.4f}',
-                'Entropy': f'{loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy:.4f}'
-            })
+            progress_bar.set_postfix({'Loss': f"{loss_total.item():.4f}"})
         
-        # 打印 epoch 统计
-        avg_loss = total_loss / len(dataloader)
-        avg_mse = total_mse / len(dataloader)
-        avg_prob = total_prob / len(dataloader)
-        avg_entropy = total_entropy / len(dataloader)
+        # Epoch 结束: 计算平均值并写入 CSV
+        avg_loss = acc['loss'] / len(dataloader)
+        avg_mse = acc['mse'] / len(dataloader)
+        avg_prob = acc['prob'] / len(dataloader)
+        avg_entropy = acc['entropy'] / len(dataloader)
+        avg_l1 = acc['l1'] / len(dataloader)
+        
+        # 防止除以 0
+        avg_tum_conf = acc['tum_conf'] / max(acc['tum_count'], 1)
+        avg_norm_conf = acc['norm_conf'] / max(acc['norm_count'], 1)
         
         print(f"\nEpoch {epoch+1}/{epochs} 完成:")
         print(f"  平均总损失: {avg_loss:.4f}")
         print(f"  平均MSE损失: {avg_mse:.4f}")
         print(f"  平均概率损失: {avg_prob:.4f}")
         print(f"  平均熵损失: {avg_entropy:.4f}")
+        print(f"  TUM置信度: {avg_tum_conf:.4f} (目标->1.0)")
+        print(f"  NORM置信度: {avg_norm_conf:.4f} (目标->0.0)")
+        print(f"  L1修改幅度: {avg_l1:.4f}")
+        
+        # 写入 CSV 日志
+        with open(log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch+1, avg_loss, avg_mse, avg_prob, avg_entropy, 
+                avg_tum_conf, avg_norm_conf, avg_l1
+            ])
         
         # 保存模型
         if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
@@ -192,6 +268,7 @@ def main():
     parser.add_argument('--feedback_weight_prob', type=float, default=0.05, help='概率损失权重')
     parser.add_argument('--feedback_weight_entropy', type=float, default=0.01, help='熵损失权重')
     parser.add_argument('--use_feedback_from_epoch', type=int, default=5, help='从第几个epoch开始使用反馈损失')
+    parser.add_argument('--resume_path', type=str, default=None, help='恢复训练的检查点路径（可选）')
     
     args = parser.parse_args()
     
@@ -219,6 +296,7 @@ def main():
         feedback_weight_prob=args.feedback_weight_prob,
         feedback_weight_entropy=args.feedback_weight_entropy,
         use_feedback_from_epoch=args.use_feedback_from_epoch,
+        resume_path=args.resume_path,
     )
 
 

@@ -73,6 +73,8 @@ class FeedbackLoss(nn.Module):
         Returns:
             loss_prob: 概率损失（BCE）
             loss_entropy: 熵损失（分类器置信度）
+            conf_tum: TUM 样本的平均置信度
+            conf_norm: NORM 样本的平均置信度
         """
         # 1. 还原 x0
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
@@ -89,15 +91,31 @@ class FeedbackLoss(nn.Module):
         probs = torch.softmax(output['tp'], dim=1)
         mask = torch.sigmoid(output['np'])  # 细胞核掩膜
         
-        # 4. 计算 Loss (概率极大化 + 熵最小化)
+        # 4. 计算指标
         # 获取 Neoplastic (Index 1) 通道
         p_neo = probs[:, 1, :, :]
         
-        # 掩膜引导的平均概率 (只看细胞核区域)
-        # 需要保持梯度，所以不能完全 detach
-        # 对每个样本计算平均概率
+        # 计算每个样本的平均置信度
         avg_prob_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
         
+        # --- 拆分 TUM 和 NORM 置信度 ---
+        # target_label: 1=TUM, 0=NORM
+        is_tum = (target_label == 1)
+        is_norm = (target_label == 0)
+        
+        # 计算 TUM 平均置信度
+        if is_tum.any():
+            conf_tum = avg_prob_per_sample[is_tum].mean()
+        else:
+            conf_tum = torch.tensor(0.0, device=x_t.device)
+            
+        # 计算 NORM 平均置信度
+        if is_norm.any():
+            conf_norm = avg_prob_per_sample[is_norm].mean()
+        else:
+            conf_norm = torch.tensor(0.0, device=x_t.device)
+        
+        # 5. 计算 Loss (概率极大化 + 熵最小化)
         # 引导 Loss: 如果是 TUM(1) -> avg_prob 趋向 1; 如果是 NORM(0) -> avg_prob 趋向 0
         # 使用逐样本的 BCE，而不是批次平均
         target_float = target_label.float()
@@ -107,5 +125,6 @@ class FeedbackLoss(nn.Module):
         entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
         loss_entropy = entropy.mean()
         
-        return loss_prob, loss_entropy
+        # 修改返回值: 增加 conf_tum 和 conf_norm
+        return loss_prob, loss_entropy, conf_tum, conf_norm
 
