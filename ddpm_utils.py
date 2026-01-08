@@ -104,13 +104,37 @@ def load_hovernet(model_path, device='cuda'):
     return net
 
 
-def get_device():
-    """获取可用设备"""
-    if torch.cuda.is_available():
-        return 'cuda'
+def get_device(gpu_id=None):
+    """
+    获取可用设备
+    
+    Args:
+        gpu_id: GPU ID（整数），如果为 None，则自动选择或使用 CPU
+               例如：0 表示使用 GPU 0，1 表示使用 GPU 1
+    
+    Returns:
+        device: 设备字符串，例如 'cuda:0' 或 'cpu'
+    """
+    if gpu_id is not None:
+        if torch.cuda.is_available():
+            if gpu_id < torch.cuda.device_count():
+                device_str = f'cuda:{gpu_id}'
+                print(f"使用指定的 GPU: {device_str}")
+                return device_str
+            else:
+                print(f"警告: GPU {gpu_id} 不存在，可用 GPU 数量: {torch.cuda.device_count()}")
+                print("将使用默认 GPU (cuda:0)")
+                return 'cuda:0'
+        else:
+            print("警告: CUDA 不可用，将使用 CPU")
+            return 'cpu'
     else:
-        print("警告: CUDA 不可用，将使用 CPU")
-        return 'cpu'
+        # 默认行为：自动检测
+        if torch.cuda.is_available():
+            return 'cuda:0'
+        else:
+            print("警告: CUDA 不可用，将使用 CPU")
+            return 'cpu'
 
 
 def count_parameters(model):
@@ -118,4 +142,17 @@ def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total_params, trainable_params
+
+
+def print_gpu_info():
+    """打印可用的 GPU 信息"""
+    if torch.cuda.is_available():
+        print(f"\n可用的 GPU 设备:")
+        for i in range(torch.cuda.device_count()):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3  # GB
+            print(f"  GPU {i}: {gpu_name} ({gpu_memory:.1f} GB)")
+        print()
+    else:
+        print("\n警告: 未检测到可用的 CUDA 设备，将使用 CPU\n")
 

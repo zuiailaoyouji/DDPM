@@ -14,7 +14,7 @@ from tqdm import tqdm
 from ddpm_dataset import NCTDataset
 from unet_wrapper import create_model
 from feedback_loss import FeedbackLoss
-from ddpm_utils import load_hovernet, get_device
+from ddpm_utils import load_hovernet, get_device, print_gpu_info
 # 新增: 导入可视化模块
 from visualization import save_training_progress_images
 
@@ -263,7 +263,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=8, help='批次大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
-    parser.add_argument('--device', type=str, default='cuda', help='设备 (cuda/cpu)')
+    parser.add_argument('--device', type=str, default=None, help='设备 (cuda/cpu)，如果指定 gpu_id 则此参数将被忽略')
+    parser.add_argument('--gpu_id', type=int, default=None, help='指定使用的 GPU ID（例如：0, 1, 2），默认为 None 自动选择')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型保存目录')
     parser.add_argument('--feedback_weight_prob', type=float, default=0.05, help='概率损失权重')
     parser.add_argument('--feedback_weight_entropy', type=float, default=0.01, help='熵损失权重')
@@ -272,11 +273,28 @@ def main():
     
     args = parser.parse_args()
     
-    # 加载 HoVer-Net 模型
+    # 打印 GPU 信息
+    print_gpu_info()
+    
+    # 确定使用的设备
+    if args.gpu_id is not None:
+        # 如果指定了 gpu_id，使用指定的 GPU
+        device = get_device(gpu_id=args.gpu_id)
+    elif args.device is not None:
+        # 如果指定了 device 字符串（兼容旧代码）
+        device = args.device
+        if device.startswith('cuda'):
+            print(f"使用设备: {device}")
+    else:
+        # 默认自动检测
+        device = get_device()
+        print(f"自动检测设备: {device}")
+    
+    # 加载 HoVer-Net 模型（使用确定的设备）
     hovernet = None
     if args.hovernet_path:
         print(f"加载 HoVer-Net 模型: {args.hovernet_path}")
-        hovernet = load_hovernet(args.hovernet_path, device=args.device)
+        hovernet = load_hovernet(args.hovernet_path, device=device)
         
         if hovernet is None:
             print("警告: HoVer-Net 模型未加载，反馈损失将无法使用")
