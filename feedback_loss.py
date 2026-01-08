@@ -76,17 +76,30 @@ class FeedbackLoss(nn.Module):
             conf_tum: TUM 样本的平均置信度
             conf_norm: NORM 样本的平均置信度
         """
-        # 1. 还原 x0
+        # 1. 还原 x0 (尺寸是 [B, 3, 256, 256])
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
         
-        # 2. 裁剪中心 164x164 (匹配 HoVer-Net 输出)
-        # 256 - 164 = 92,  92 / 2 = 46
-        x0_crop = x0_hat[:, :, 46:210, 46:210]
+        # [删除/注释这行] 不要在这里裁剪！HoVer-Net 需要 256 的输入
+        # x0_crop = x0_hat[:, :, 46:210, 46:210]
+        
+        # =========================================================
+        # 强制将输入数据移动到 HoVer-Net 所在的设备
+        # =========================================================
+        hovernet_device = next(self.hovernet.parameters()).device
+        
+        # 使用 x0_hat 而不是 x0_crop
+        if x0_hat.device != hovernet_device:
+            x0_input = x0_hat.to(hovernet_device)
+        else:
+            x0_input = x0_hat
+        # =========================================================
         
         # 3. HoVer-Net 推理
+        # 输入: [B, 3, 256, 256]
+        # 输出: 字典, 其中的 'tp' 和 'np' 会自动变成 [B, C, 164, 164]
         # 注意：虽然 HoVer-Net 参数被冻结，但我们需要保留计算图以便梯度能从 loss 传播到 x0_hat
         # 因此不使用 torch.no_grad()，而是依赖 requires_grad=False 的参数来阻止参数更新
-        output = self.hovernet(x0_crop)
+        output = self.hovernet(x0_input)
         
         probs = torch.softmax(output['tp'], dim=1)
         mask = torch.sigmoid(output['np'])  # 细胞核掩膜
