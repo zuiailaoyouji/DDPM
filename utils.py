@@ -8,28 +8,41 @@ import sys
 
 # 关键：将 HoVer-net 目录加入 python 路径，以便能导入 models 和 run_utils
 # 目录结构：
-#   /home/xuwen
-#     /DDPM          <- 当前文件所在位置
-#     /HoVer-net     <- HoVer-Net 代码所在位置
+#   /home/xuwen/DDPM
+#     /utils.py      <- 当前文件所在位置
+#     /HoVer-net     <- HoVer-Net 代码所在位置（与 utils.py 同级）
 #       /models
 #       /run_utils
 current_dir = os.path.dirname(os.path.abspath(__file__))  # DDPM 目录
-project_root = os.path.dirname(current_dir)  # /home/xuwen
-hovernet_dir = os.path.join(project_root, 'HoVer-net')  # /home/xuwen/HoVer-net
+hovernet_dir = os.path.join(current_dir, 'HoVer-net')  # /home/xuwen/DDPM/HoVer-net
 
 # 将 HoVer-net 目录添加到路径
 if hovernet_dir not in sys.path:
     sys.path.append(hovernet_dir)
 
 # 尝试导入 HoVer-Net 和工具函数
+HoVerNet = None
+convert_pytorch_checkpoint = None
+
 try:
     from models.hovernet.net_desc import HoVerNet
-    from run_utils.utils import convert_pytorch_checkpoint
+    print(f"✓ 成功导入 HoVerNet")
 except ImportError as e:
     print(f"警告: 无法导入 HoVer-Net 模块: {e}")
-    print(f"请确保 'HoVer-net' 目录在项目根目录下: {project_root}")
-    print(f"预期路径: {hovernet_dir}")
-    HoVerNet = None
+    print(f"请确保 'HoVer-net' 目录在 DDPM 目录下（与 utils.py 同级）")
+    print(f"当前 DDPM 目录: {current_dir}")
+    print(f"预期 HoVer-net 路径: {hovernet_dir}")
+
+# 尝试导入 convert_pytorch_checkpoint
+try:
+    from run_utils.utils import convert_pytorch_checkpoint
+    print(f"✓ 成功导入 convert_pytorch_checkpoint")
+except ImportError as e:
+    print(f"警告: 无法导入 convert_pytorch_checkpoint: {e}")
+    # 创建占位函数
+    def convert_pytorch_checkpoint(state_dict):
+        """占位函数：如果导入失败，直接返回原始字典"""
+        return state_dict
 
 
 def load_hovernet(model_path, device='cuda'):
@@ -65,10 +78,11 @@ def load_hovernet(model_path, device='cuda'):
     
     # 4. 转换权重名称 (处理 DataParallel 的 module. 前缀)
     # 需要依赖 run_utils.utils 中的 convert_pytorch_checkpoint
-    try:
-        state_dict = convert_pytorch_checkpoint(state_dict)
-    except Exception as e:
-        print(f"  注意: 权重名称转换失败或不需要转换: {e}")
+    if convert_pytorch_checkpoint is not None:
+        try:
+            state_dict = convert_pytorch_checkpoint(state_dict)
+        except Exception as e:
+            print(f"  注意: 权重名称转换失败或不需要转换: {e}")
     
     # 5. 加载权重到模型
     # strict=False 是为了容忍一些不匹配的键 (如不需要的 loss 参数)
