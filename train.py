@@ -8,7 +8,8 @@ from torch.utils.data import DataLoader
 from diffusers import DDPMScheduler
 import os
 import argparse
-import csv  # 新增
+import csv
+import datetime
 from tqdm import tqdm
 
 from ddpm_dataset import NCTDataset
@@ -17,6 +18,8 @@ from feedback_loss import FeedbackLoss
 from ddpm_utils import load_hovernet, get_device, print_gpu_info
 # 新增: 导入可视化模块
 from visualization import save_training_progress_images
+# 新增: 导入日志模块
+from logger import ExperimentLogger
 
 
 def train(
@@ -32,6 +35,7 @@ def train(
     feedback_weight_entropy=0.01,
     use_feedback_from_epoch=5,
     resume_path=None,
+    logger=None,
 ):
     """
     训练 DDPM 模型
@@ -105,6 +109,7 @@ def train(
     
     # 3. 训练循环
     print(f"开始训练，共 {epochs} 个 epoch...")
+    global_step = 0
     for epoch in range(start_epoch, epochs):
         unet.train()
         
@@ -203,15 +208,41 @@ def train(
                 acc['norm_conf'] += conf_norm.item()
                 acc['norm_count'] += 1
             
+            # 实时记录指标到 TensorBoard (每隔几步记录一次，避免IO过高)
+            if logger is not None and global_step % 10 == 0:
+                metrics = {
+                    "Total_Loss": loss_total.item(),
+                    "MSE_Loss": loss_mse.item(),
+                    "Prob_Loss": loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob,
+                    "Entropy_Loss": loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy,
+                    "L1_Diff": l1_diff.item(),
+                }
+                # 添加置信度（如果有）
+                if conf_tum > 0:
+                    metrics["Tumor_Conf"] = conf_tum.item()
+                if conf_norm > 0:
+                    metrics["Normal_Conf"] = conf_norm.item()
+                
+                logger.log_metrics(metrics, step=global_step, prefix="Train")
+                logger.flush()
+            
             # 调用可视化模块 (仅在每个 Epoch 的第一个 Batch)
             if batch_idx == 0:
                 save_training_progress_images(
                     clean_images, noisy_images, x0_pred, 
                     epoch=epoch+1, save_dir=vis_dir
                 )
+                
+                # 记录图像到 TensorBoard
+                if logger is not None:
+                    logger.log_images("Images/Original", clean_images, step=global_step, max_images=4)
+                    logger.log_images("Images/Noisy", noisy_images, step=global_step, max_images=4)
+                    logger.log_images("Images/Enhanced", x0_pred, step=global_step, max_images=4)
             
             # 更新进度条
             progress_bar.set_postfix({'Loss': f"{loss_total.item():.4f}"})
+            
+            global_step += 1
         
         # Epoch 结束: 计算平均值并写入 CSV
         avg_loss = acc['loss'] / len(dataloader)
@@ -233,6 +264,20 @@ def train(
         print(f"  NORM置信度: {avg_norm_conf:.4f} (目标->0.0)")
         print(f"  L1修改幅度: {avg_l1:.4f}")
         
+        # 记录 Epoch 级别的指标到 TensorBoard
+        if logger is not None:
+            epoch_metrics = {
+                "Total_Loss": avg_loss,
+                "MSE_Loss": avg_mse,
+                "Prob_Loss": avg_prob,
+                "Entropy_Loss": avg_entropy,
+                "Tumor_Conf": avg_tum_conf,
+                "Normal_Conf": avg_norm_conf,
+                "L1_Diff": avg_l1,
+            }
+            logger.log_metrics(epoch_metrics, step=epoch+1, prefix="Epoch")
+            logger.flush()
+        
         # 写入 CSV 日志
         with open(log_path, 'a', newline='') as f:
             writer = csv.writer(f)
@@ -253,6 +298,10 @@ def train(
             print(f"模型已保存到: {checkpoint_path}")
     
     print("训练完成！")
+    
+    # 关闭日志记录器
+    if logger is not None:
+        logger.close()
 
 
 def main():
@@ -270,11 +319,27 @@ def main():
     parser.add_argument('--feedback_weight_entropy', type=float, default=0.01, help='熵损失权重')
     parser.add_argument('--use_feedback_from_epoch', type=int, default=5, help='从第几个epoch开始使用反馈损失')
     parser.add_argument('--resume_path', type=str, default=None, help='恢复训练的检查点路径（可选）')
+    parser.add_argument('--no_tb', action='store_true', help='如果加上这个参数，则关闭 TensorBoard')
+    parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard 日志根目录')
+    parser.add_argument('--exp_name', type=str, default=None, help='实验名称（用于区分不同次运行），默认为时间戳')
     
     args = parser.parse_args()
     
     # 打印 GPU 信息
     print_gpu_info()
+    
+    # 确定实验名称（如果没有指定，使用时间戳）
+    import datetime
+    if args.exp_name is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.exp_name = f"DDPM_{timestamp}"
+    
+    # 初始化日志记录器
+    logger = ExperimentLogger(
+        use_tensorboard=not args.no_tb,
+        log_dir=args.log_dir,
+        experiment_name=args.exp_name
+    )
     
     # 确定使用的设备
     if args.gpu_id is not None:
@@ -298,7 +363,6 @@ def main():
         
         if hovernet is None:
             print("警告: HoVer-Net 模型未加载，反馈损失将无法使用")
-            print("请在 utils.py 中实现 load_hovernet 函数")
     else:
         print("警告: 未提供 HoVer-Net 模型路径，反馈损失将无法使用")
     
@@ -309,12 +373,13 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        device=args.device,
+        device=device,
         save_dir=args.save_dir,
         feedback_weight_prob=args.feedback_weight_prob,
         feedback_weight_entropy=args.feedback_weight_entropy,
         use_feedback_from_epoch=args.use_feedback_from_epoch,
         resume_path=args.resume_path,
+        logger=logger,
     )
 
 
