@@ -15,7 +15,7 @@ from tqdm import tqdm
 from ddpm_dataset import NCTDataset
 from unet_wrapper import create_model
 from feedback_loss import FeedbackLoss
-from ddpm_utils import load_hovernet, get_device, print_gpu_info
+from ddpm_utils import load_hovernet, get_device, print_gpu_info, predict_x0_from_noise_shared
 # 新增: 导入可视化模块
 from visualization import save_training_progress_images
 # 新增: 导入日志模块
@@ -253,29 +253,25 @@ def train(
                     val_enhanced = val_set.generate_enhanced_images(unet, feedback_criterion)
                     
                     if val_enhanced is not None:
-                        # 保存验证集可视化图片（用于论文插图）
-                        save_training_progress_images(
+                        # 保存验证集可视化图片（用于论文插图），并获取拼接好的 tensor
+                        vis_grid = save_training_progress_images(
                             val_set.images, val_set.noisy_images, val_enhanced, 
-                            epoch=epoch+1, save_dir=vis_dir, num_vis=8
+                            epoch=epoch+1, save_dir=vis_dir, num_vis=8, return_tensor=True
                         )
                         
-                        # 记录图像到 TensorBoard
+                        # 记录拼接好的对比图到 TensorBoard（替代原来的三张分开的图）
                         if logger is not None:
-                            logger.log_images("Images/Original", val_set.images, step=global_step, max_images=8)
-                            logger.log_images("Images/Noisy", val_set.noisy_images, step=global_step, max_images=8)
-                            logger.log_images("Images/Enhanced", val_enhanced, step=global_step, max_images=8)
+                            logger.log_images("Validation/Comparison", vis_grid, step=global_step, max_images=1)
                 else:
                     # 如果没有验证集，使用训练集的当前 batch
-                    save_training_progress_images(
+                    vis_grid = save_training_progress_images(
                         clean_images, noisy_images, x0_pred, 
-                        epoch=epoch+1, save_dir=vis_dir
+                        epoch=epoch+1, save_dir=vis_dir, return_tensor=True
                     )
                     
-                    # 记录图像到 TensorBoard
+                    # 记录拼接好的对比图到 TensorBoard
                     if logger is not None:
-                        logger.log_images("Images/Original", clean_images, step=global_step, max_images=4)
-                        logger.log_images("Images/Noisy", noisy_images, step=global_step, max_images=4)
-                        logger.log_images("Images/Enhanced", x0_pred, step=global_step, max_images=4)
+                        logger.log_images("Train/Comparison", vis_grid, step=global_step, max_images=1)
             
             # 更新进度条
             progress_bar.set_postfix({'Loss': f"{loss_total.item():.4f}"})

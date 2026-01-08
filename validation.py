@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import torch
 from diffusers import DDPMScheduler
+from ddpm_utils import predict_x0_from_noise_shared
 
 
 def load_fixed_validation_batch(val_dir, sample_size=256, device='cuda'):
@@ -167,13 +168,10 @@ class ValidationSet:
                     self.noisy_images, pred_noise, self.timesteps
                 )
             else:
-                # 手动还原逻辑
-                device_img = self.noisy_images.device
-                dtype_img = self.noisy_images.dtype
-                alpha_prod_t = self.scheduler.alphas_cumprod[self.timesteps].to(device_img).to(dtype_img).view(-1, 1, 1, 1)
-                beta_prod_t = 1 - alpha_prod_t
-                enhanced = (self.noisy_images - beta_prod_t ** 0.5 * pred_noise) / (alpha_prod_t ** 0.5 + 1e-8)
-                enhanced = torch.clamp(enhanced, 0.0, 1.0)
+                # 使用共享的 x0 还原函数
+                enhanced = predict_x0_from_noise_shared(
+                    self.noisy_images, pred_noise, self.timesteps, self.scheduler
+                )
             
             return enhanced
     

@@ -7,7 +7,7 @@ import os
 import torchvision
 
 
-def save_training_progress_images(clean_images, noisy_images, x0_pred, epoch, save_dir, num_vis=4):
+def save_training_progress_images(clean_images, noisy_images, x0_pred, epoch, save_dir, num_vis=4, return_tensor=False):
     """
     保存训练过程对比图：[原图 | 加噪图 | 增强图 | 差异热力图]
     
@@ -18,6 +18,10 @@ def save_training_progress_images(clean_images, noisy_images, x0_pred, epoch, sa
         epoch: 当前轮数
         save_dir: 保存目录
         num_vis: 保存的样本数量
+        return_tensor: 是否返回拼接好的 tensor（用于 TensorBoard）
+    
+    Returns:
+        vis_tensor: 如果 return_tensor=True，返回拼接好的 tensor [4*N, 3, H, W]
     """
     with torch.no_grad():
         # 1. 截取前 N 张
@@ -43,4 +47,8 @@ def save_training_progress_images(clean_images, noisy_images, x0_pred, epoch, sa
         # nrow=n 表示每行显示 n 张图片 (即每一行对应一种类型)
         filename = os.path.join(save_dir, f'epoch_{epoch}_vis.png')
         torchvision.utils.save_image(vis_tensor, filename, nrow=n, normalize=False)
+        
+        # 5. 返回拼接好的 tensor（用于 TensorBoard）
+        if return_tensor:
+            return vis_tensor
 

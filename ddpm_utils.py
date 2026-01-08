@@ -144,6 +144,28 @@ def count_parameters(model):
     return total_params, trainable_params
 
 
+def predict_x0_from_noise_shared(x_t, noise_pred, t, scheduler):
+    """
+    通用的 x0 还原函数
+    从加噪图像 x_t 和预测的噪声 noise_pred 还原原始图像 x0
+    
+    Args:
+        x_t: 加噪图像 [B, C, H, W]
+        noise_pred: 预测的噪声 [B, C, H, W]
+        t: 时间步 [B]
+        scheduler: DDPMScheduler 实例
+    
+    Returns:
+        pred_x0: 预测的原始图像 [B, C, H, W]，范围 [0, 1]
+    """
+    device = x_t.device
+    dtype = x_t.dtype
+    alpha_prod_t = scheduler.alphas_cumprod[t].to(device).to(dtype).view(-1, 1, 1, 1)
+    beta_prod_t = 1 - alpha_prod_t
+    pred_x0 = (x_t - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
+    return torch.clamp(pred_x0, 0.0, 1.0)
+
+
 def print_gpu_info():
     """打印可用的 GPU 信息"""
     if torch.cuda.is_available():
