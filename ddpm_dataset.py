@@ -25,28 +25,51 @@ class NCTDataset(Dataset):
         
         # 1. 获取所有文件路径，并打上标签
         # 肿瘤样本标签为 1
+        tum_files = []
         if os.path.exists(tum_dir):
             tum_files = [os.path.join(tum_dir, f) for f in os.listdir(tum_dir) 
                         if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
-            self.files.extend([(f, 1) for f in tum_files])
         
         # 正常样本标签为 0
+        norm_files = []
         if os.path.exists(norm_dir):
             norm_files = [os.path.join(norm_dir, f) for f in os.listdir(norm_dir)
                          if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
-            norm_labeled = [(f, 0) for f in norm_files]
-            
-            # 2. 过采样逻辑：让 len(norm) 接近 len(tum)
-            if oversample and len(tum_files) > len(norm_files) and len(norm_files) > 0:
-                # 计算需要重复的次数
+        
+        # 检查数据有效性
+        if len(tum_files) == 0 and len(norm_files) == 0:
+            raise ValueError("错误: 未找到任何图像文件！请检查 tum_dir 和 norm_dir 路径。")
+        
+        # 保存原始数量用于打印
+        original_tum_count = len(tum_files)
+        original_norm_count = len(norm_files)
+        
+        # 2. 过采样逻辑：平衡两类样本数量
+        if oversample and len(tum_files) > 0 and len(norm_files) > 0:
+            # 如果 NORM 比 TUM 少，过采样 NORM
+            if len(norm_files) < len(tum_files):
+                # 计算需要重复的次数，使 NORM 数量接近 TUM
                 repeat_times = (len(tum_files) + len(norm_files) - 1) // len(norm_files)
-                norm_labeled = norm_labeled * repeat_times
+                norm_files = norm_files * repeat_times
                 # 随机打乱
-                random.shuffle(norm_labeled)
+                random.shuffle(norm_files)
                 # 截取到接近肿瘤样本数量
-                norm_labeled = norm_labeled[:len(tum_files)]
-            
-            self.files.extend(norm_labeled)
+                norm_files = norm_files[:len(tum_files)]
+                print(f"  过采样: NORM 从 {original_norm_count} 增加到 {len(norm_files)} (目标: {len(tum_files)})")
+            # 如果 TUM 比 NORM 少，过采样 TUM
+            elif len(tum_files) < len(norm_files):
+                # 计算需要重复的次数，使 TUM 数量接近 NORM
+                repeat_times = (len(norm_files) + len(tum_files) - 1) // len(tum_files)
+                tum_files = tum_files * repeat_times
+                # 随机打乱
+                random.shuffle(tum_files)
+                # 截取到接近正常样本数量
+                tum_files = tum_files[:len(norm_files)]
+                print(f"  过采样: TUM 从 {original_tum_count} 增加到 {len(tum_files)} (目标: {len(norm_files)})")
+        
+        # 3. 添加到文件列表
+        self.files.extend([(f, 1) for f in tum_files])
+        self.files.extend([(f, 0) for f in norm_files])
         
         # 打乱所有样本
         random.shuffle(self.files)

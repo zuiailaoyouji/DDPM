@@ -1,5 +1,5 @@
 """
-工具函数模块 (DDPM/utils.py)
+工具函数模块 (DDPM/ddpm_utils.py)
 包含模型加载、设备管理等辅助函数
 """
 import torch
@@ -9,8 +9,8 @@ import sys
 # 关键：将 HoVer-net 目录加入 python 路径，以便能导入 models 和 run_utils
 # 目录结构：
 #   /home/xuwen/DDPM
-#     /utils.py      <- 当前文件所在位置
-#     /HoVer-net     <- HoVer-Net 代码所在位置（与 utils.py 同级）
+#     /ddpm_utils.py  <- 当前文件所在位置
+#     /HoVer-net      <- HoVer-Net 代码所在位置（与 ddpm_utils.py 同级）
 #       /models
 #       /run_utils
 current_dir = os.path.dirname(os.path.abspath(__file__))  # DDPM 目录
@@ -29,7 +29,7 @@ try:
     print(f"✓ 成功导入 HoVerNet")
 except ImportError as e:
     print(f"警告: 无法导入 HoVer-Net 模块: {e}")
-    print(f"请确保 'HoVer-net' 目录在 DDPM 目录下（与 utils.py 同级）")
+    print(f"请确保 'HoVer-net' 目录在 DDPM 目录下（与 ddpm_utils.py 同级）")
     print(f"当前 DDPM 目录: {current_dir}")
     print(f"预期 HoVer-net 路径: {hovernet_dir}")
 

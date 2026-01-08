@@ -3,10 +3,10 @@
 展示如何使用各个模块进行训练
 """
 import torch
-from dataset import NCTDataset
+from ddpm_dataset import NCTDataset
 from unet_wrapper import create_model
 from feedback_loss import FeedbackLoss
-from utils import load_hovernet, get_device, count_parameters
+from ddpm_utils import load_hovernet, get_device, count_parameters
 from diffusers import DDPMScheduler
 from torch.utils.data import DataLoader
 

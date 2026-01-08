@@ -11,10 +11,10 @@ import argparse
 import csv  # 新增
 from tqdm import tqdm
 
-from dataset import NCTDataset
+from ddpm_dataset import NCTDataset
 from unet_wrapper import create_model
 from feedback_loss import FeedbackLoss
-from utils import load_hovernet, get_device
+from ddpm_utils import load_hovernet, get_device
 # 新增: 导入可视化模块
 from visualization import save_training_progress_images
 
