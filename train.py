@@ -20,6 +20,8 @@ from ddpm_utils import load_hovernet, get_device, print_gpu_info
 from visualization import save_training_progress_images
 # 新增: 导入日志模块
 from logger import ExperimentLogger
+# 新增: 导入验证集模块
+from validation import ValidationSet
 
 
 def train(
@@ -36,6 +38,7 @@ def train(
     use_feedback_from_epoch=5,
     resume_path=None,
     logger=None,
+    val_vis_dir=None,  # 新增参数: 验证集目录（用于固定可视化）
 ):
     """
     训练 DDPM 模型
@@ -53,6 +56,8 @@ def train(
         feedback_weight_entropy: 熵损失权重
         use_feedback_from_epoch: 从第几个 epoch 开始使用反馈损失
         resume_path: 恢复训练的检查点路径（可选）
+        logger: 日志记录器（可选）
+        val_vis_dir: 验证集目录（用于固定可视化），应包含 TUM 和 NORM 子目录（可选）
     """
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
@@ -95,7 +100,21 @@ def train(
         start_epoch = checkpoint.get('epoch', 0)
         print(f"从 Epoch {start_epoch} 继续训练")
     
-    # 2. 加载数据集
+    # 2. 初始化验证集管理器
+    val_set = None
+    if val_vis_dir is not None:
+        val_set = ValidationSet(
+            val_dir=val_vis_dir,
+            scheduler=scheduler,
+            device=device,
+            sample_size=256,
+            fixed_timestep=100
+        )
+        if not val_set.load():
+            val_set = None
+            print(f"⚠️ 警告: 验证集目录不存在或无法加载: {val_vis_dir}，将使用训练集图片进行可视化")
+    
+    # 3. 加载训练数据集
     print("加载数据集...")
     dataset = NCTDataset(tum_dir, norm_dir, oversample=True)
     dataloader = DataLoader(
@@ -107,7 +126,7 @@ def train(
         drop_last=True  # 确保批次大小一致
     )
     
-    # 3. 训练循环
+    # 4. 训练循环
     print(f"开始训练，共 {epochs} 个 epoch...")
     global_step = 0
     for epoch in range(start_epoch, epochs):
@@ -226,18 +245,37 @@ def train(
                 logger.log_metrics(metrics, step=global_step, prefix="Train")
                 logger.flush()
             
-            # 调用可视化模块 (仅在每个 Epoch 的第一个 Batch)
+            # 可视化逻辑 (仅在每个 Epoch 的第一个 Batch)
             if batch_idx == 0:
-                save_training_progress_images(
-                    clean_images, noisy_images, x0_pred, 
-                    epoch=epoch+1, save_dir=vis_dir
-                )
-                
-                # 记录图像到 TensorBoard
-                if logger is not None:
-                    logger.log_images("Images/Original", clean_images, step=global_step, max_images=4)
-                    logger.log_images("Images/Noisy", noisy_images, step=global_step, max_images=4)
-                    logger.log_images("Images/Enhanced", x0_pred, step=global_step, max_images=4)
+                # 优先使用验证集进行可视化（更公平的对比）
+                if val_set is not None and val_set.is_available():
+                    # 使用验证集生成增强图像
+                    val_enhanced = val_set.generate_enhanced_images(unet, feedback_criterion)
+                    
+                    if val_enhanced is not None:
+                        # 保存验证集可视化图片（用于论文插图）
+                        save_training_progress_images(
+                            val_set.images, val_set.noisy_images, val_enhanced, 
+                            epoch=epoch+1, save_dir=vis_dir, num_vis=8
+                        )
+                        
+                        # 记录图像到 TensorBoard
+                        if logger is not None:
+                            logger.log_images("Images/Original", val_set.images, step=global_step, max_images=8)
+                            logger.log_images("Images/Noisy", val_set.noisy_images, step=global_step, max_images=8)
+                            logger.log_images("Images/Enhanced", val_enhanced, step=global_step, max_images=8)
+                else:
+                    # 如果没有验证集，使用训练集的当前 batch
+                    save_training_progress_images(
+                        clean_images, noisy_images, x0_pred, 
+                        epoch=epoch+1, save_dir=vis_dir
+                    )
+                    
+                    # 记录图像到 TensorBoard
+                    if logger is not None:
+                        logger.log_images("Images/Original", clean_images, step=global_step, max_images=4)
+                        logger.log_images("Images/Noisy", noisy_images, step=global_step, max_images=4)
+                        logger.log_images("Images/Enhanced", x0_pred, step=global_step, max_images=4)
             
             # 更新进度条
             progress_bar.set_postfix({'Loss': f"{loss_total.item():.4f}"})
@@ -322,6 +360,7 @@ def main():
     parser.add_argument('--no_tb', action='store_true', help='如果加上这个参数，则关闭 TensorBoard')
     parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard 日志根目录')
     parser.add_argument('--exp_name', type=str, default=None, help='实验名称（用于区分不同次运行），默认为时间戳')
+    parser.add_argument('--val_vis_dir', type=str, default=None, help='验证集目录（用于固定可视化），应包含 tumor 和 normal 子目录')
     
     args = parser.parse_args()
     
@@ -380,6 +419,7 @@ def main():
         use_feedback_from_epoch=args.use_feedback_from_epoch,
         resume_path=args.resume_path,
         logger=logger,
+        val_vis_dir=args.val_vis_dir,
     )
 
 
