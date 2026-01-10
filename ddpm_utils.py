@@ -160,7 +160,9 @@ def predict_x0_from_noise_shared(x_t, noise_pred, t, scheduler):
     """
     device = x_t.device
     dtype = x_t.dtype
-    alpha_prod_t = scheduler.alphas_cumprod[t].to(device).to(dtype).view(-1, 1, 1, 1)
+    # 先把 alphas_cumprod 移动到 device，然后再用 t 去取值
+    # 这样可以避免设备不匹配的问题（t 在 GPU，alphas_cumprod 在 CPU）
+    alpha_prod_t = scheduler.alphas_cumprod.to(device)[t].to(dtype).view(-1, 1, 1, 1)
     beta_prod_t = 1 - alpha_prod_t
     pred_x0 = (x_t - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
     return torch.clamp(pred_x0, 0.0, 1.0)
