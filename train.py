@@ -179,7 +179,9 @@ def train(
                     # 如果没有 feedback_criterion，手动计算 x0_pred（用于可视化）
                     device_img = noisy_images.device
                     dtype_img = noisy_images.dtype
-                    alpha_prod_t = scheduler.alphas_cumprod[timesteps].to(device_img).to(dtype_img).view(-1, 1, 1, 1)
+                    # 先把 alphas_cumprod 移动到 device，然后再用 timesteps 去取值
+                    # 这样可以避免设备不匹配的问题（timesteps 在 GPU，alphas_cumprod 在 CPU）
+                    alpha_prod_t = scheduler.alphas_cumprod.to(device_img)[timesteps].to(dtype_img).view(-1, 1, 1, 1)
                     beta_prod_t = 1 - alpha_prod_t
                     x0_pred = (noisy_images - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
                     x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
