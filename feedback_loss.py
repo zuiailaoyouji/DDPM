@@ -46,8 +46,9 @@ class FeedbackLoss(nn.Module):
         device = x_t.device
         dtype = x_t.dtype
         
-        # 获取 alpha_bar，shape: [B, 1, 1, 1]
-        alpha_prod_t = self.scheduler.alphas_cumprod[t].to(device).to(dtype)
+        # 先把 alphas_cumprod 移动到 device，然后再用 t 去取值
+        # 这样可以避免设备不匹配的问题（t 在 GPU，alphas_cumprod 在 CPU）
+        alpha_prod_t = self.scheduler.alphas_cumprod.to(device)[t].to(dtype)
         alpha_prod_t = alpha_prod_t.view(-1, 1, 1, 1)
         
         beta_prod_t = 1 - alpha_prod_t
@@ -92,23 +93,35 @@ class FeedbackLoss(nn.Module):
             x0_input = x0_hat.to(hovernet_device)
         else:
             x0_input = x0_hat
+        
+        # 关键修复：HoVer-Net 内部会执行 imgs / 255.0，所以需要传入 0-255 范围的输入
+        # x0_hat 当前是 0-1 范围，需要乘以 255.0 恢复到 0-255 范围
+        # 注意：保持梯度连接，所以不能使用 detach()
+        x0_input = x0_input * 255.0
         # =========================================================
         
         # 3. HoVer-Net 推理
-        # 输入: [B, 3, 256, 256]
+        # 输入: [B, 3, 256, 256]，范围 0-255（HoVer-Net 内部会除以 255.0 转换为 0-1）
         # 输出: 字典, 其中的 'tp' 和 'np' 会自动变成 [B, C, 164, 164]
         # 注意：虽然 HoVer-Net 参数被冻结，但我们需要保留计算图以便梯度能从 loss 传播到 x0_hat
         # 因此不使用 torch.no_grad()，而是依赖 requires_grad=False 的参数来阻止参数更新
         output = self.hovernet(x0_input)
         
         probs = torch.softmax(output['tp'], dim=1)
-        mask = torch.sigmoid(output['np'])  # 细胞核掩膜
+        
+        # === 修复点开始 ===
+        # 原代码: mask = torch.sigmoid(output['np'])
+        # 错误原因: mask 是 [B, 2, 164, 164]，无法与 [B, 164, 164] 的 p_neo 直接相乘
+        
+        # 修复: 取出细胞核通道 (Index 1)
+        mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]
+        # === 修复点结束 ===
         
         # 4. 计算指标
         # 获取 Neoplastic (Index 1) 通道
-        p_neo = probs[:, 1, :, :]
+        p_neo = probs[:, 1, :, :]  # [B, 164, 164]
         
-        # 计算每个样本的平均置信度
+        # 现在两个张量都是 [B, 164, 164]，可以正常相乘了
         avg_prob_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
         
         # --- 拆分 TUM 和 NORM 置信度 ---
