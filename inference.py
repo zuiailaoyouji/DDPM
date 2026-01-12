@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import os
 import argparse
+import csv
 from tqdm import tqdm
 from diffusers import DDPMScheduler
 
@@ -89,11 +90,10 @@ def run_inference(
     device='cuda', 
     num_iters=5, 
     noise_t=100,
-    target_score=0.95,
     patience=0.05
 ):
     """
-    运行推理（迭代增强，带智能早停和回退）
+    运行推理（完全自导向推理，根据第一轮趋势自动锁定方向）
     
     Args:
         img_path: 输入图像路径
@@ -104,8 +104,10 @@ def run_inference(
         device: 设备类型
         num_iters: 最大迭代次数
         noise_t: 加噪时间步（t=100 约等于重绘10%）
-        target_score: 目标分数，达到即停（默认 0.95）
-        patience: 容忍度，如果分数下降超过此值则停止（默认 0.05）
+        patience: 容忍度，如果分数变化超过此值则停止（默认 0.05）
+    
+    Returns:
+        stats: 统计数据字典，包含文件名、模式、分数历史等信息
     """
     filename = os.path.basename(img_path)
     name_no_ext = os.path.splitext(filename)[0]
@@ -128,7 +130,7 @@ def run_inference(
     
     # ================= 计算初始评分 (Iter 0) =================
     init_conf = get_hovernet_confidence(hovernet, original_tensor)
-    print(f"  Iter 0 (Original): TUM Conf = {init_conf:.4f}")
+    print(f"  Iter 0: {init_conf:.4f}", end="")
     
     # 保存原图到独立文件夹
     save_path = os.path.join(image_output_dir, f"original_conf{init_conf:.2f}.png")
@@ -137,19 +139,25 @@ def run_inference(
     cv2.imwrite(save_path, save_img_bgr)
     # ==============================================================
     
+    # --- 初始状态：完全未知，等待第一轮结果锁定方向 ---
+    mode = 'pending'
+    print(" -> [方向未知] 正在试探 Iter 1...")
+    
+    # --- 数据记录器（用于 CSV 导出）---
+    stats = {
+        'Filename': filename,
+        'Original_Score': init_conf,
+        'Best_Score': init_conf,
+        'Best_Iter': 0,
+        'Stop_Reason': 'Max_Iters',  # 默认原因
+        'Scores_History': [init_conf],  # 记录每一步的分数
+        'Mode': 'Pending'  # 先标记为 Pending
+    }
+    
     # --- 状态追踪变量（用于早停和最佳结果保存）---
     best_conf = init_conf
     best_tensor = original_tensor.clone()
     best_iter = 0
-    
-    # 如果原图已经达标，直接保存 best 并退出
-    if init_conf >= target_score:
-        print(f"  [提示] 原图得分 ({init_conf:.4f}) 已超过目标 ({target_score})，跳过增强。")
-        save_path = os.path.join(image_output_dir, f"BEST_iter0_conf{init_conf:.2f}.png")
-        save_img_np = (best_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(save_path, save_img_bgr)
-        return
     
     # 2. 迭代增强
     for i in range(num_iters):
@@ -179,47 +187,98 @@ def run_inference(
         
         # --- E. 计算当前轮次的置信度 ---
         current_conf = get_hovernet_confidence(hovernet, pred_x0)
+        stats['Scores_History'].append(current_conf)  # 记录历史分数
         
         # 打印当前轮次结果
-        print(f"  Iter {i+1}/{num_iters}: TUM Conf = {current_conf:.4f}", end="")
+        print(f"  Iter {i+1}: {current_conf:.4f}", end="")
         
-        # --- F. 智能判断逻辑 ---
-        # 1. 更新最佳记录
-        if current_conf > best_conf:
+        # --- F. 核心逻辑：在第一轮结束时锁定方向 ---
+        if i == 0:
+            # 比较 Iter 1 和 Iter 0
+            if current_conf >= init_conf:
+                mode = 'maximize'
+                print(" -> [趋势上升] 锁定方向: Maximize (TUM)")
+            else:
+                mode = 'minimize'
+                print(" -> [趋势下降] 锁定方向: Minimize (NORM)")
+            stats['Mode'] = mode  # 记录锁定后的模式
+        
+        # --- G. 智能判断逻辑（基于锁定的 Mode）---
+        is_new_best = False
+        should_stop = False
+        stop_reason = ""
+        
+        # 只有在方向锁定后才进行判断（第一轮用于锁定方向）
+        if mode != 'pending':
+            # 根据模式设置目标
+            target_goal = 0.98 if mode == 'maximize' else 0.02
+            
+            if mode == 'maximize':
+                # 目标：越高越好
+                if current_conf > best_conf:
+                    is_new_best = True
+                
+                # 早停判断
+                if current_conf >= target_goal:
+                    should_stop = True
+                    stop_reason = 'Target_Reached'
+                elif current_conf < (best_conf - patience):
+                    # 如果不是第一轮（第一轮定义了方向，肯定符合方向），且分数下降
+                    if i > 0:
+                        should_stop = True
+                        stop_reason = 'Degradation'
+                        
+            elif mode == 'minimize':
+                # 目标：越低越好
+                if current_conf < best_conf:
+                    is_new_best = True
+                
+                # 早停判断
+                if current_conf <= target_goal:
+                    should_stop = True
+                    stop_reason = 'Target_Reached'
+                elif current_conf > (best_conf + patience):
+                    if i > 0:
+                        should_stop = True
+                        stop_reason = 'Hallucination'
+        
+        # 更新最佳记录（第一轮时，如果方向已锁定，也可以更新）
+        if is_new_best:
             best_conf = current_conf
             best_tensor = pred_x0.clone()
             best_iter = i + 1
+            stats['Best_Score'] = current_conf
+            stats['Best_Iter'] = i + 1
             print(" (New Best!)")
         else:
             print("")  # 换行
         
-        # 2. 保存中间结果（用于分析过程）
+        # 保存中间结果（用于分析过程）
         save_path = os.path.join(image_output_dir, f"iter{i+1}_conf{current_conf:.2f}.png")
         save_img_np = (pred_x0.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
         cv2.imwrite(save_path, save_img_bgr)
         
-        # 3. 更新 current_tensor 用于下一轮
+        # 更新 current_tensor 用于下一轮
         current_tensor = pred_x0
         
-        # --- G. 早停判断 ---
-        # 条件1: 达到目标分数
-        if current_conf >= target_score:
-            print(f"  [早停] 已达到目标分数 {target_score}，停止循环。")
-            break
-        
-        # 条件2: 分数发生显著退化（对比最佳分数）
-        # 如果当前分数比最佳分数低了超过 patience，说明开始引入伪影，立即停止
-        if current_conf < (best_conf - patience):
-            print(f"  [早停] 分数显著下降 (Best:{best_conf:.4f} -> Curr:{current_conf:.4f})，停止以防伪影。")
+        # --- H. 早停判断 ---
+        if should_stop:
+            print(f"  [早停] {stop_reason}")
+            stats['Stop_Reason'] = stop_reason
             break
     
-    # --- H. 循环结束，保存最佳结果 ---
+    # --- I. 循环结束，保存最佳结果 ---
     print(f"  >> 完成。最佳结果在 Iter {best_iter}，分数为 {best_conf:.4f}")
     save_path = os.path.join(image_output_dir, f"BEST_iter{best_iter}_conf{best_conf:.2f}.png")
     save_img_np = (best_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
     cv2.imwrite(save_path, save_img_bgr)
+    
+    # 记录绝对变化量
+    stats['Improvement_Abs'] = abs(stats['Best_Score'] - stats['Original_Score'])
+    
+    return stats
 
 
 def main():
@@ -240,10 +299,8 @@ def main():
                        help='设备类型（cuda/cpu），如果指定 gpu_id 则此参数将被忽略')
     parser.add_argument('--gpu_id', type=int, default=None,
                        help='指定使用的 GPU ID（例如：0, 1, 2），默认为 None 自动选择')
-    parser.add_argument('--target_score', type=float, default=0.95,
-                       help='目标停止分数，达到此分数即停止增强（默认 0.95）')
     parser.add_argument('--patience', type=float, default=0.05,
-                       help='容忍度，如果分数下降超过此值则停止（默认 0.05）')
+                       help='容忍度，如果分数变化超过此值则停止（默认 0.05）')
     
     args = parser.parse_args()
     
@@ -313,31 +370,72 @@ def main():
         print("❌ 错误: 未找到任何图像文件")
         return
     
+    # 准备 CSV 文件路径
+    csv_path = os.path.join(args.output_dir, 'inference_results.csv')
+    print(f"\n数据将保存到: {csv_path}")
+    
+    # --- CSV 初始化 ---
+    # 定义表头：基础信息 + 每一轮的分数占位符
+    fieldnames = ['Filename', 'Mode', 'Original_Score', 'Best_Score', 'Improvement_Abs', 'Best_Iter', 'Stop_Reason']
+    # 动态添加 Iter_0 到 Iter_Max 列
+    score_cols = [f'Iter_{i}' for i in range(args.iters + 1)]
+    fieldnames.extend(score_cols)
+    
     # 运行推理
     print(f"\n开始推理（迭代次数: {args.iters}, 加噪时间步: {args.noise_t}）...")
     print("=" * 60)
     
-    for img_path in tqdm(files, desc="处理图像"):
-        try:
-            run_inference(
-                img_path, 
-                unet, 
-                hovernet, 
-                scheduler, 
-                args.output_dir, 
-                device, 
-                args.iters, 
-                args.noise_t,
-                args.target_score,
-                args.patience
-            )
-        except Exception as e:
-            print(f"\n❌ 处理 {img_path} 时出错: {e}")
-            import traceback
-            traceback.print_exc()
+    # 打开 CSV 文件准备写入
+    with open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for img_path in tqdm(files, desc="处理图像"):
+            try:
+                # 运行推理，获取统计数据
+                stats = run_inference(
+                    img_path, 
+                    unet, 
+                    hovernet, 
+                    scheduler, 
+                    args.output_dir, 
+                    device, 
+                    args.iters, 
+                    args.noise_t,
+                    args.patience
+                )
+                
+                if stats is not None:
+                    # 整理数据格式写入 CSV
+                    row = {
+                        'Filename': stats['Filename'],
+                        'Mode': stats['Mode'],
+                        'Original_Score': f"{stats['Original_Score']:.6f}",
+                        'Best_Score': f"{stats['Best_Score']:.6f}",
+                        'Improvement_Abs': f"{stats['Improvement_Abs']:.6f}",
+                        'Best_Iter': stats['Best_Iter'],
+                        'Stop_Reason': stats['Stop_Reason']
+                    }
+                    # 填充具体的 Iter 分数
+                    for i in range(args.iters + 1):
+                        col_name = f'Iter_{i}'
+                        if i < len(stats['Scores_History']):
+                            row[col_name] = f"{stats['Scores_History'][i]:.6f}"
+                        else:
+                            row[col_name] = ""  # 没跑到的轮次留空
+                    
+                    writer.writerow(row)
+                    # 强制刷新缓冲区，确保哪怕程序崩了数据也写进去了
+                    csv_file.flush()
+                    
+            except Exception as e:
+                print(f"\n❌ 处理 {img_path} 时出错: {e}")
+                import traceback
+                traceback.print_exc()
     
     print("\n" + "=" * 60)
     print(f"✓ 推理完成！结果保存在: {args.output_dir}")
+    print(f"✓ 数据表格已保存: {csv_path}")
 
 
 if __name__ == '__main__':
