@@ -11,7 +11,7 @@ from tqdm import tqdm
 from diffusers import DDPMScheduler
 
 from unet_wrapper import create_model
-from ddpm_utils import load_hovernet, predict_x0_from_noise_shared
+from ddpm_utils import load_hovernet, predict_x0_from_noise_shared, get_device, print_gpu_info
 
 
 def preprocess_image(img_path, target_size=256, device='cuda'):
@@ -170,15 +170,28 @@ def main():
     parser.add_argument('--noise_t', type=int, default=100,
                        help='加噪时间步（默认 100，约等于重绘10%%）')
     parser.add_argument('--device', type=str, default=None,
-                       help='设备类型（cuda/cpu），默认自动检测')
+                       help='设备类型（cuda/cpu），如果指定 gpu_id 则此参数将被忽略')
+    parser.add_argument('--gpu_id', type=int, default=None,
+                       help='指定使用的 GPU ID（例如：0, 1, 2），默认为 None 自动选择')
     
     args = parser.parse_args()
     
-    # 设备检测
-    if args.device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
+    # 设备选择逻辑（优先级：gpu_id > device > 自动检测）
+    if args.gpu_id is not None:
+        # 如果指定了 gpu_id，使用指定的 GPU
+        device = get_device(gpu_id=args.gpu_id)
+    elif args.device is not None:
+        # 如果指定了 device 字符串（兼容旧代码）
         device = args.device
+    else:
+        # 自动检测
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if device == 'cuda':
+            device = 'cuda:0'  # 默认使用第一个 GPU
+    
+    # 打印 GPU 信息
+    if device.startswith('cuda'):
+        print_gpu_info()
     
     print(f"使用设备: {device}")
     
