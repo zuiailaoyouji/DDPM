@@ -104,6 +104,17 @@ def run_inference(
     
     print(f"\n处理: {filename}")
     
+    # ================= 计算初始评分 (Iter 0) =================
+    init_conf = get_hovernet_confidence(hovernet, original_tensor)
+    print(f"  Iter 0 (Original): TUM Conf = {init_conf:.4f}")
+    
+    # 保存原图（包含置信度信息）
+    save_path = os.path.join(output_dir, f"{name_no_ext}_iter0_conf{init_conf:.2f}.png")
+    save_img_np = (original_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(save_path, save_img_bgr)
+    # ==============================================================
+    
     # 2. 迭代增强
     for i in range(num_iters):
         # --- A. 模拟训练中的"加噪"步骤 ---
@@ -137,18 +148,11 @@ def run_inference(
         conf = get_hovernet_confidence(hovernet, current_tensor)
         print(f"  Iter {i+1}/{num_iters}: TUM Conf = {conf:.4f}")
         
-        # 保存图片
-        save_path = os.path.join(output_dir, f"{name_no_ext}_iter{i+1}.png")
+        # 保存图片（包含置信度信息）
+        save_path = os.path.join(output_dir, f"{name_no_ext}_iter{i+1}_conf{conf:.2f}.png")
         save_img_np = (current_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
         cv2.imwrite(save_path, save_img_bgr)
-    
-    # 保存原始图像（用于对比）
-    original_path = os.path.join(output_dir, f"{name_no_ext}_original.png")
-    if not os.path.exists(original_path):
-        original_img_np = (original_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        original_img_bgr = cv2.cvtColor(original_img_np, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(original_path, original_img_bgr)
 
 
 def main():
