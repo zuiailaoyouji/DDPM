@@ -49,21 +49,34 @@ def preprocess_image(img_path, target_size=256, device='cuda'):
 def get_hovernet_confidence(hovernet, img_tensor):
     """
     获取 HoVer-Net 的肿瘤置信度
+    计算逻辑与 feedback_loss.py 中的逻辑保持一致
     
     Args:
         hovernet: HoVer-Net 模型
         img_tensor: [1, 3, H, W] 的 Tensor，范围 [0, 1]
     
     Returns:
-        tum_conf: 肿瘤置信度 (0-1)
+        tum_conf: 肿瘤置信度 (0-1)，只计算有细胞核区域的加权平均
     """
     with torch.no_grad():
         # 关键：HoVer-Net 内部会执行 / 255.0，所以需要传入 0-255 范围的输入
         hover_input = img_tensor * 255.0
         output = hovernet(hover_input)
+        
+        # 与 feedback_loss.py 保持一致的计算逻辑
         probs = torch.softmax(output['tp'], dim=1)
-        # 获取肿瘤通道 (Index 1) 的平均概率
-        tum_conf = probs[:, 1, :, :].mean().item()
+        
+        # 获取细胞核 mask（与 feedback_loss.py 第 117 行一致）
+        mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # [B, H, W]
+        
+        # 获取肿瘤通道 (Index 1) 的概率
+        p_neo = probs[:, 1, :, :]  # [B, H, W]
+        
+        # 使用 mask 加权平均（与 feedback_loss.py 第 125 行一致）
+        # 只计算有细胞核区域的概率，忽略背景区域
+        avg_prob = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
+        
+        tum_conf = avg_prob.item()
     return tum_conf
 
 
