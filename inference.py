@@ -119,19 +119,19 @@ def run_inference(
     for i in range(num_iters):
         # --- A. 模拟训练中的"加噪"步骤 ---
         # 训练时：noisy_images = scheduler.add_noise(clean_images, noise, timesteps)
-        # 推理时：对当前最好的猜测(current_tensor)进行加噪，让模型继续优化
+        # 推理时：在【上一轮的结果】(current_tensor) 上加噪，让模型继续优化
         
         t_tensor = torch.tensor([noise_t], device=device).long()
         noise = torch.randn_like(current_tensor)
         
-        # 产生加噪图像 x_t
+        # 产生加噪图像 x_t（基于上一轮的结果）
         x_t = scheduler.add_noise(current_tensor, noise, t_tensor)
         
         # --- B. 构建模型输入 (Conditioning) ---
-        # 训练时：model_input = torch.cat([clean_images, noisy_images], dim=1)
-        # 关键决策：condition 始终使用最原始的 original_tensor，
-        # 这保证了无论循环多少次，解剖结构都不会漂移
-        model_input = torch.cat([original_tensor, x_t], dim=1)
+        # 关键修改：Condition 使用【上一轮的结果】(current_tensor) 而不是 original_tensor
+        # 逻辑：告诉模型"目前的图像长 current_tensor 这样，请在它的基础上修补/增强"
+        # 这样每次迭代都是基于上一轮的结果进行累积增强，而不是每次都回到原图
+        model_input = torch.cat([current_tensor, x_t], dim=1)
         
         # --- C. 模型预测噪声 ---
         with torch.no_grad():
