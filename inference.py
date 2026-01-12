@@ -88,10 +88,12 @@ def run_inference(
     output_dir, 
     device='cuda', 
     num_iters=5, 
-    noise_t=100
+    noise_t=100,
+    target_score=0.95,
+    patience=0.05
 ):
     """
-    运行推理（迭代增强）
+    运行推理（迭代增强，带智能早停和回退）
     
     Args:
         img_path: 输入图像路径
@@ -100,13 +102,19 @@ def run_inference(
         scheduler: DDPMScheduler
         output_dir: 输出目录
         device: 设备类型
-        num_iters: 迭代次数
+        num_iters: 最大迭代次数
         noise_t: 加噪时间步（t=100 约等于重绘10%）
+        target_score: 目标分数，达到即停（默认 0.95）
+        patience: 容忍度，如果分数下降超过此值则停止（默认 0.05）
     """
     filename = os.path.basename(img_path)
     name_no_ext = os.path.splitext(filename)[0]
     
-    # 1. 预处理图像
+    # 1. 为每张图像创建独立的文件夹
+    image_output_dir = os.path.join(output_dir, name_no_ext)
+    os.makedirs(image_output_dir, exist_ok=True)
+    
+    # 2. 预处理图像
     original_tensor, _ = preprocess_image(img_path, device=device)
     if original_tensor is None:
         print(f"⚠️ 警告: 无法读取图像 {img_path}")
@@ -116,17 +124,32 @@ def run_inference(
     current_tensor = original_tensor.clone()
     
     print(f"\n处理: {filename}")
+    print(f"  输出目录: {image_output_dir}")
     
     # ================= 计算初始评分 (Iter 0) =================
     init_conf = get_hovernet_confidence(hovernet, original_tensor)
     print(f"  Iter 0 (Original): TUM Conf = {init_conf:.4f}")
     
-    # 保存原图（包含置信度信息）
-    save_path = os.path.join(output_dir, f"{name_no_ext}_iter0_conf{init_conf:.2f}.png")
+    # 保存原图到独立文件夹
+    save_path = os.path.join(image_output_dir, f"original_conf{init_conf:.2f}.png")
     save_img_np = (original_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
     cv2.imwrite(save_path, save_img_bgr)
     # ==============================================================
+    
+    # --- 状态追踪变量（用于早停和最佳结果保存）---
+    best_conf = init_conf
+    best_tensor = original_tensor.clone()
+    best_iter = 0
+    
+    # 如果原图已经达标，直接保存 best 并退出
+    if init_conf >= target_score:
+        print(f"  [提示] 原图得分 ({init_conf:.4f}) 已超过目标 ({target_score})，跳过增强。")
+        save_path = os.path.join(image_output_dir, f"BEST_iter0_conf{init_conf:.2f}.png")
+        save_img_np = (best_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(save_path, save_img_bgr)
+        return
     
     # 2. 迭代增强
     for i in range(num_iters):
@@ -154,18 +177,49 @@ def run_inference(
         # 使用共享的 x0 还原函数，确保与训练逻辑一致
         pred_x0 = predict_x0_from_noise_shared(x_t, noise_pred, t_tensor, scheduler)
         
-        # --- E. 更新当前图像 ---
-        current_tensor = pred_x0
+        # --- E. 计算当前轮次的置信度 ---
+        current_conf = get_hovernet_confidence(hovernet, pred_x0)
         
-        # 计算 HoVer-Net 置信度
-        conf = get_hovernet_confidence(hovernet, current_tensor)
-        print(f"  Iter {i+1}/{num_iters}: TUM Conf = {conf:.4f}")
+        # 打印当前轮次结果
+        print(f"  Iter {i+1}/{num_iters}: TUM Conf = {current_conf:.4f}", end="")
         
-        # 保存图片（包含置信度信息）
-        save_path = os.path.join(output_dir, f"{name_no_ext}_iter{i+1}_conf{conf:.2f}.png")
-        save_img_np = (current_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        # --- F. 智能判断逻辑 ---
+        # 1. 更新最佳记录
+        if current_conf > best_conf:
+            best_conf = current_conf
+            best_tensor = pred_x0.clone()
+            best_iter = i + 1
+            print(" (New Best!)")
+        else:
+            print("")  # 换行
+        
+        # 2. 保存中间结果（用于分析过程）
+        save_path = os.path.join(image_output_dir, f"iter{i+1}_conf{current_conf:.2f}.png")
+        save_img_np = (pred_x0.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
         cv2.imwrite(save_path, save_img_bgr)
+        
+        # 3. 更新 current_tensor 用于下一轮
+        current_tensor = pred_x0
+        
+        # --- G. 早停判断 ---
+        # 条件1: 达到目标分数
+        if current_conf >= target_score:
+            print(f"  [早停] 已达到目标分数 {target_score}，停止循环。")
+            break
+        
+        # 条件2: 分数发生显著退化（对比最佳分数）
+        # 如果当前分数比最佳分数低了超过 patience，说明开始引入伪影，立即停止
+        if current_conf < (best_conf - patience):
+            print(f"  [早停] 分数显著下降 (Best:{best_conf:.4f} -> Curr:{current_conf:.4f})，停止以防伪影。")
+            break
+    
+    # --- H. 循环结束，保存最佳结果 ---
+    print(f"  >> 完成。最佳结果在 Iter {best_iter}，分数为 {best_conf:.4f}")
+    save_path = os.path.join(image_output_dir, f"BEST_iter{best_iter}_conf{best_conf:.2f}.png")
+    save_img_np = (best_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    save_img_bgr = cv2.cvtColor(save_img_np, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(save_path, save_img_bgr)
 
 
 def main():
@@ -186,6 +240,10 @@ def main():
                        help='设备类型（cuda/cpu），如果指定 gpu_id 则此参数将被忽略')
     parser.add_argument('--gpu_id', type=int, default=None,
                        help='指定使用的 GPU ID（例如：0, 1, 2），默认为 None 自动选择')
+    parser.add_argument('--target_score', type=float, default=0.95,
+                       help='目标停止分数，达到此分数即停止增强（默认 0.95）')
+    parser.add_argument('--patience', type=float, default=0.05,
+                       help='容忍度，如果分数下降超过此值则停止（默认 0.05）')
     
     args = parser.parse_args()
     
@@ -269,7 +327,9 @@ def main():
                 args.output_dir, 
                 device, 
                 args.iters, 
-                args.noise_t
+                args.noise_t,
+                args.target_score,
+                args.patience
             )
         except Exception as e:
             print(f"\n❌ 处理 {img_path} 时出错: {e}")
