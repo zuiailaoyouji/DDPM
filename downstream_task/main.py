@@ -6,7 +6,7 @@ import os
 import argparse
 import torch
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torchvision import transforms
 
 from dataset import CRCDataset
@@ -181,16 +181,22 @@ def main():
     print("✨ Running Experiment 2: Ours (Enhanced Data)")
     print("="*50)
     
-    # 关键：这里开启 use_enhanced=True
-    train_ds_ours = CRCDataset(X_train, y_train, transform=train_transform, 
-                               use_enhanced=True, enh_map=enh_map)
+    # 关键：混合原图与增强图（Concatenation）
+    # 教材 A：原版书（use_enhanced=False）
+    train_ds_orig = CRCDataset(X_train, y_train, transform=train_transform, use_enhanced=False)
+    # 教材 B：辅导书（use_enhanced=True，使用增强映射）
+    train_ds_enh = CRCDataset(X_train, y_train, transform=train_transform, 
+                              use_enhanced=True, enh_map=enh_map)
+    # 物理拼接，两份数据叠加
+    train_ds_ours = ConcatDataset([train_ds_orig, train_ds_enh])
     # 测试集保持不变（使用原始图像）
     
     train_loader_ours = DataLoader(train_ds_ours, batch_size=args.batch_size, 
                                    shuffle=True, num_workers=4)
     # test_loader 复用上面的
     
-    model_ours = get_resnet_model(device)
+    # 强制随机初始化（pretrained=False）
+    model_ours = get_resnet_model(device, pretrained=False)
     best_acc_ours, best_f1_ours, best_auc_ours = train_model(
         model_ours, train_loader_ours, test_loader, 
         args.epochs, args.lr, device
