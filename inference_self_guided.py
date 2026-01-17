@@ -393,7 +393,7 @@ def save_batch_images(tensors, filenames, output_dir, suffix):
 
 
 def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
-    """执行 Batch 推理（带分布监控）"""
+    """执行 Batch 推理（带分布监控和动态校正）"""
     
     # 初始化 CSV
     csv_path = os.path.join(args.output_dir, 'batch_results.csv')
@@ -403,6 +403,10 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
             csv.DictWriter(f, fieldnames=fieldnames).writeheader()
     
     device = args.device
+    
+    # 定义经验阈值（用于动态校正）
+    AMBIGUOUS_LOW = 0.35   # 模糊区域下界
+    AMBIGUOUS_HIGH = 0.65  # 模糊区域上界（对称的）
     
     for batch_idx, (img_tensors, filenames) in enumerate(tqdm(dataloader, desc="Batch Processing")):
         
@@ -420,16 +424,19 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
         current_tensors = img_tensors.clone()
         best_tensors = img_tensors.clone()
         
-        # 计算初始分数
+        # 1. 计算初始分数和模式锁定（依然遵循 0.5 的贝叶斯原则）
         init_confs = get_hovernet_confidence_batch(hovernet, img_tensors)
         best_confs = init_confs.clone()
         best_iters = torch.zeros(batch_size, dtype=torch.long, device=device)
         stop_reasons = ["Max_Iters"] * batch_size
         
-        # --- 核心：完全自导向模式锁定 ---
-        # 信任模型：>0.5 就是 TUM(Maximize), <=0.5 就是 NORM(Minimize)
+        # 初始模式锁定：信任模型 >0.5 就是 TUM(Maximize), <=0.5 就是 NORM(Minimize)
         modes = ['maximize' if s > 0.5 else 'minimize' for s in init_confs.tolist()]
         target_goals = torch.tensor([0.98 if m == 'maximize' else 0.02 for m in modes], device=device)
+        
+        # 2. 标记"有资格反悔"的样本（0.35 <= Score <= 0.65）
+        # 只有落在这个区间的样本，才会被监控 Iter 1 的趋势，允许动态校正
+        is_ambiguous = [(s >= AMBIGUOUS_LOW and s <= AMBIGUOUS_HIGH) for s in init_confs.tolist()]
         
         # 初始化分布监控器
         dist_monitor = DistributionConvergenceMonitor(patience=2) # 连续 2 轮比例不变即停止
@@ -460,6 +467,38 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
             
             # E. 评分
             current_confs = get_hovernet_confidence_batch(hovernet, pred_x0)
+            
+            # ===【核心修改：基于 0.35 阈值的动态校正】===
+            # 在 Iter 1 结束时进行动态判定（只在第一轮校正）
+            if i == 0:
+                for idx in range(batch_size):
+                    if not active_mask[idx]: 
+                        continue
+                    
+                    # 只有处于 0.35-0.65 之间的样本才允许校正
+                    # < 0.35 的样本即使涨分了，也视为幻觉，坚决不改方向
+                    if is_ambiguous[idx]:
+                        delta = current_confs[idx].item() - init_confs[idx].item()
+                        current_mode = modes[idx]
+                        
+                        # 场景：初始 0.4 (Minimize)，但增强后变成了 0.45 (+0.05)
+                        # 因为它 > 0.35，我们允许它"反水"变成 Maximize
+                        if current_mode == 'minimize' and delta > 0.02:
+                            print(f"  🔄 [校正] {filenames[idx]}: Minimize -> Maximize (Init={init_confs[idx].item():.2f}, Δ={delta:.4f})")
+                            modes[idx] = 'maximize'
+                            target_goals[idx] = 0.98
+                            # 如果之前没有设置过停止原因，标记为校正切换
+                            if stop_reasons[idx] == "Max_Iters":
+                                stop_reasons[idx] = "Correction_Switch"
+                        
+                        # 场景：初始 0.55 (Maximize)，但增强后变成了 0.50 (-0.05)
+                        elif current_mode == 'maximize' and delta < -0.02:
+                            print(f"  🔄 [校正] {filenames[idx]}: Maximize -> Minimize (Init={init_confs[idx].item():.2f}, Δ={delta:.4f})")
+                            modes[idx] = 'minimize'
+                            target_goals[idx] = 0.02
+                            # 如果之前没有设置过停止原因，标记为校正切换
+                            if stop_reasons[idx] == "Max_Iters":
+                                stop_reasons[idx] = "Correction_Switch"
             
             # ==========================================
             # 分布监控 (Distribution Check)
