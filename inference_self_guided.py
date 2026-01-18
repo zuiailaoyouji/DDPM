@@ -304,9 +304,9 @@ def run_inference(
                 should_stop = True
                 stop_reason = 'Target_Reached'
             elif current_conf > (best_conf + patience):
-                # 如果分数上升超过容忍度，停止（可能是幻觉）
+                # 如果分数上升超过容忍度，停止（退化）
                 should_stop = True
-                stop_reason = 'Hallucination'
+                stop_reason = 'Degradation'
         
         # 更新最佳记录
         if is_new_best:
@@ -393,7 +393,11 @@ def save_batch_images(tensors, filenames, output_dir, suffix):
 
 
 def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
-    """执行 Batch 推理（带分布监控和动态校正）"""
+    """
+    自适应方向推理逻辑：
+    1. Iter 0: 观察模型倾向 (Observe Mode)
+    2. Iter 1+: 锁定方向并增强 (Locked Mode)
+    """
     
     # 初始化 CSV
     csv_path = os.path.join(args.output_dir, 'batch_results.csv')
@@ -403,10 +407,6 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
             csv.DictWriter(f, fieldnames=fieldnames).writeheader()
     
     device = args.device
-    
-    # 定义经验阈值（用于动态校正）
-    AMBIGUOUS_LOW = 0.35   # 模糊区域下界
-    AMBIGUOUS_HIGH = 0.65  # 模糊区域上界（对称的）
     
     for batch_idx, (img_tensors, filenames) in enumerate(tqdm(dataloader, desc="Batch Processing")):
         
@@ -424,22 +424,19 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
         current_tensors = img_tensors.clone()
         best_tensors = img_tensors.clone()
         
-        # 1. 计算初始分数和模式锁定（依然遵循 0.5 的贝叶斯原则）
+        # 1. 计算初始分数（基准线）
         init_confs = get_hovernet_confidence_batch(hovernet, img_tensors)
         best_confs = init_confs.clone()
         best_iters = torch.zeros(batch_size, dtype=torch.long, device=device)
         stop_reasons = ["Max_Iters"] * batch_size
         
-        # 初始模式锁定：信任模型 >0.5 就是 TUM(Maximize), <=0.5 就是 NORM(Minimize)
-        modes = ['maximize' if s > 0.5 else 'minimize' for s in init_confs.tolist()]
-        target_goals = torch.tensor([0.98 if m == 'maximize' else 0.02 for m in modes], device=device)
-        
-        # 2. 标记"有资格反悔"的样本（0.35 <= Score <= 0.65）
-        # 只有落在这个区间的样本，才会被监控 Iter 1 的趋势，允许动态校正
-        is_ambiguous = [(s >= AMBIGUOUS_LOW and s <= AMBIGUOUS_HIGH) for s in init_confs.tolist()]
+        # 2. 模式初始化：设为 'observe'，表示暂未决定方向
+        # 废弃基于 0.5 阈值的预设模式
+        modes = ['observe'] * batch_size
+        target_goals = torch.zeros(batch_size, device=device)  # 暂时无目标
         
         # 初始化分布监控器
-        dist_monitor = DistributionConvergenceMonitor(patience=2) # 连续 2 轮比例不变即停止
+        dist_monitor = DistributionConvergenceMonitor(patience=2)  # 连续 2 轮比例不变即停止
         
         # 保存原图
         save_batch_images(img_tensors, filenames, args.output_dir, "original")
@@ -454,55 +451,62 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
             if not active_mask.any():
                 break
                 
-            # A. 加噪 & 预测 & 还原 (标准流程)
+            # ==========================
+            # A. 标准 DDPM 去噪步
+            # ==========================
             t_tensor = torch.tensor([args.noise_t], device=device).long().expand(batch_size)
             noise = torch.randn_like(current_tensors)
-            x_t = scheduler.add_noise(current_tensors, noise, t_tensor)
-            model_input = torch.cat([current_tensors, x_t], dim=1)
             
+            # 加噪
+            x_t = scheduler.add_noise(current_tensors, noise, t_tensor)
+            
+            # 预测噪声
+            model_input = torch.cat([current_tensors, x_t], dim=1)
             with torch.no_grad():
                 noise_pred = unet(model_input, t_tensor).sample
             
+            # 还原 x0
             pred_x0 = predict_x0_from_noise_shared(x_t, noise_pred, t_tensor, scheduler)
             
-            # E. 评分
+            # ==========================
+            # B. 评分 & 决策核心
+            # ==========================
             current_confs = get_hovernet_confidence_batch(hovernet, pred_x0)
             
-            # ===【核心修改：基于 0.35 阈值的动态校正】===
-            # 在 Iter 1 结束时进行动态判定（只在第一轮校正）
+            # ---> 关键点：在第一轮结束时(Iter 0)，定方向 <---
             if i == 0:
+                print(f"  🔍 [Iter 0] 分析模型增强倾向...")
                 for idx in range(batch_size):
                     if not active_mask[idx]: 
                         continue
                     
-                    # 只有处于 0.35-0.65 之间的样本才允许校正
-                    # < 0.35 的样本即使涨分了，也视为幻觉，坚决不改方向
-                    if is_ambiguous[idx]:
-                        delta = current_confs[idx].item() - init_confs[idx].item()
-                        current_mode = modes[idx]
-                        
-                        # 场景：初始 0.4 (Minimize)，但增强后变成了 0.45 (+0.05)
-                        # 因为它 > 0.35，我们允许它"反水"变成 Maximize
-                        if current_mode == 'minimize' and delta > 0.02:
-                            print(f"  🔄 [校正] {filenames[idx]}: Minimize -> Maximize (Init={init_confs[idx].item():.2f}, Δ={delta:.4f})")
+                    init_s = init_confs[idx].item()
+                    curr_s = current_confs[idx].item()
+                    delta = curr_s - init_s
+                    
+                    # 策略：完全信任模型第一步的选择
+                    # 哪怕初始分是0.33，只要模型把它增强到了0.35，我们就认为它是 Tumor
+                    if delta >= 0:
+                        modes[idx] = 'maximize'
+                        target_goals[idx] = 0.98
+                        # print(f"    - {filenames[idx]}: ↗️ 涨分 ({init_s:.3f}->{curr_s:.3f})，锁定 Maximize")
+                    else:
+                        modes[idx] = 'minimize'
+                        target_goals[idx] = 0.02
+                        # print(f"    - {filenames[idx]}: ↘️ 跌分 ({init_s:.3f}->{curr_s:.3f})，锁定 Minimize")
+                    
+                    # 【可选兜底】：如果 delta 几乎为 0 (例如 < 0.001)，回退到基于 0.5 的硬判定
+                    if abs(delta) < 0.001:
+                        if init_s > 0.5:
                             modes[idx] = 'maximize'
                             target_goals[idx] = 0.98
-                            # 如果之前没有设置过停止原因，标记为校正切换
-                            if stop_reasons[idx] == "Max_Iters":
-                                stop_reasons[idx] = "Correction_Switch"
-                        
-                        # 场景：初始 0.55 (Maximize)，但增强后变成了 0.50 (-0.05)
-                        elif current_mode == 'maximize' and delta < -0.02:
-                            print(f"  🔄 [校正] {filenames[idx]}: Maximize -> Minimize (Init={init_confs[idx].item():.2f}, Δ={delta:.4f})")
+                        else:
                             modes[idx] = 'minimize'
                             target_goals[idx] = 0.02
-                            # 如果之前没有设置过停止原因，标记为校正切换
-                            if stop_reasons[idx] == "Max_Iters":
-                                stop_reasons[idx] = "Correction_Switch"
             
-            # ==========================================
-            # 分布监控 (Distribution Check)
-            # ==========================================
+            # ==========================
+            # C. 分布监控 (Distribution Check)
+            # ==========================
             # 记录当前轮次的分布状态
             ratio, tum_num, norm_num = dist_monitor.update(current_confs)
             
@@ -517,9 +521,9 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
             else:
                 print(" -> [波动]" if i < 2 else " -> [未稳]")
             
-            # ==========================================
-            # 微观控制 (Individual Control)
-            # ==========================================
+            # ==========================
+            # D. 监控 & 早停检查
+            # ==========================
             for idx in range(batch_size):
                 # 如果这个样本已经停了，就不管它
                 if not active_mask[idx]: 
@@ -531,39 +535,67 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                     stop_reasons[idx] = "Batch_Converged"
                     continue
                 
-                # 正常的单样本逻辑
+                # 跳过还在观察期的样本（Iter 0 还未完成锁定）
+                if modes[idx] == 'observe':
+                    # Iter 0 之后应该都锁定了，但以防万一
+                    current_tensors[idx] = pred_x0[idx]
+                    continue
+                
                 curr_score = current_confs[idx].item()
                 best_score = best_confs[idx].item()
                 mode = modes[idx]
-                patience = args.patience
                 target = target_goals[idx].item()
+                patience = args.patience
                 
-                is_new_best = False
                 should_stop = False
                 reason = ""
+                is_new_best = False
                 
-                if mode == 'maximize': # TUM
-                    if curr_score > best_score: is_new_best = True
+                # 逻辑：既然方向是模型自己选的，那么只有"反悔"(Degradation)一种错误
+                # 不再需要 "Hallucination" 这个概念，统一为 Degradation
+                
+                if mode == 'maximize':
+                    # 1. 记录最佳 (分数更高)
+                    if curr_score > best_score:
+                        is_new_best = True
+                    
+                    # 2. 检查是否达标
                     if curr_score >= target:
-                        should_stop = True; reason = "Target_Reached"
+                        should_stop = True
+                        reason = "Target_Reached"
+                    
+                    # 3. 检查是否退化 (相比最佳值跌落超过 patience)
                     elif curr_score < (best_score - patience):
-                        should_stop = True; reason = "Degradation"
-                else: # NORM
-                    if curr_score < best_score: is_new_best = True
-                    if curr_score <= target:
-                        should_stop = True; reason = "Target_Reached"
-                    elif curr_score > (best_score + patience):
-                        should_stop = True; reason = "Hallucination"
+                        should_stop = True
+                        reason = "Degradation"  # 原本想增强，结果跌了
                 
+                elif mode == 'minimize':
+                    # 1. 记录最佳 (分数更低)
+                    if curr_score < best_score:
+                        is_new_best = True
+                    
+                    # 2. 检查是否达标
+                    if curr_score <= target:
+                        should_stop = True
+                        reason = "Target_Reached"
+                    
+                    # 3. 检查是否退化/反弹 (相比最佳值上涨超过 patience)
+                    elif curr_score > (best_score + patience):
+                        should_stop = True
+                        reason = "Degradation"  # 原本想抑制，结果涨了 (原 Hallucination)
+                
+                # 更新最佳状态
                 if is_new_best:
                     best_confs[idx] = curr_score
                     best_tensors[idx] = pred_x0[idx].clone()
                     best_iters[idx] = i + 1
                 
+                # 执行停止
                 if should_stop:
                     active_mask[idx] = False
                     stop_reasons[idx] = reason
                 
+                # 更新当前图，用于下一轮作为输入
                 current_tensors[idx] = pred_x0[idx]
                 
             # 如果 Batch 收敛触发了，跳出循环
