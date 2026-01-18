@@ -522,17 +522,11 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                 print(" -> [波动]" if i < 2 else " -> [未稳]")
             
             # ==========================
-            # D. 监控 & 早停检查
+            # D. 监控 & 早停检查（优先级：单样本 > Batch）
             # ==========================
             for idx in range(batch_size):
                 # 如果这个样本已经停了，就不管它
                 if not active_mask[idx]: 
-                    continue
-                
-                # 如果 Batch 收敛了，强制停止所有 Active 样本
-                if batch_converged:
-                    active_mask[idx] = False
-                    stop_reasons[idx] = "Batch_Converged"
                     continue
                 
                 # 跳过还在观察期的样本（Iter 0 还未完成锁定）
@@ -541,59 +535,82 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                     current_tensors[idx] = pred_x0[idx]
                     continue
                 
+                # =================================================
+                # 核心调整：单样本优先结算
+                # =================================================
+                
+                # --- A. 准备数据 ---
                 curr_score = current_confs[idx].item()
                 best_score = best_confs[idx].item()
                 mode = modes[idx]
                 target = target_goals[idx].item()
                 patience = args.patience
                 
-                should_stop = False
-                reason = ""
+                should_stop_individual = False
+                stop_reason = ""
                 is_new_best = False
                 
-                # 逻辑：既然方向是模型自己选的，那么只有"反悔"(Degradation)一种错误
-                # 不再需要 "Hallucination" 这个概念，统一为 Degradation
-                
+                # --- B. 检查个人达标/退化 (最高优先级) ---
                 if mode == 'maximize':
-                    # 1. 记录最佳 (分数更高)
+                    # 记录最佳 (分数更高)
                     if curr_score > best_score:
                         is_new_best = True
                     
-                    # 2. 检查是否达标
+                    # 检查是否达标
                     if curr_score >= target:
-                        should_stop = True
-                        reason = "Target_Reached"
-                    
-                    # 3. 检查是否退化 (相比最佳值跌落超过 patience)
+                        should_stop_individual = True
+                        stop_reason = "Target_Reached"
+                    # 检查是否退化 (相比最佳值跌落超过 patience)
                     elif curr_score < (best_score - patience):
-                        should_stop = True
-                        reason = "Degradation"  # 原本想增强，结果跌了
+                        should_stop_individual = True
+                        stop_reason = "Degradation"
                 
                 elif mode == 'minimize':
-                    # 1. 记录最佳 (分数更低)
+                    # 记录最佳 (分数更低)
                     if curr_score < best_score:
                         is_new_best = True
                     
-                    # 2. 检查是否达标
+                    # 检查是否达标
                     if curr_score <= target:
-                        should_stop = True
-                        reason = "Target_Reached"
-                    
-                    # 3. 检查是否退化/反弹 (相比最佳值上涨超过 patience)
+                        should_stop_individual = True
+                        stop_reason = "Target_Reached"
+                    # 检查是否退化/反弹 (相比最佳值上涨超过 patience)
                     elif curr_score > (best_score + patience):
-                        should_stop = True
-                        reason = "Degradation"  # 原本想抑制，结果涨了 (原 Hallucination)
+                        should_stop_individual = True
+                        stop_reason = "Degradation"
                 
-                # 更新最佳状态
+                # --- C. 执行个人停止 ---
+                if should_stop_individual:
+                    active_mask[idx] = False
+                    stop_reasons[idx] = stop_reason
+                    # 【关键】因为个人已经结算停止，直接 continue，不再受 Batch 影响
+                    # 但仍需要更新最佳记录（如果有的话）
+                    if is_new_best:
+                        best_confs[idx] = curr_score
+                        best_tensors[idx] = pred_x0[idx].clone()
+                        best_iters[idx] = i + 1
+                    # 更新当前图（用于后续保存）
+                    current_tensors[idx] = pred_x0[idx]
+                    continue
+                
+                # --- D. 检查集体强制停止 (低优先级) ---
+                # 只有个人没达标（还在跑），才看集体脸色
+                if batch_converged:
+                    active_mask[idx] = False
+                    stop_reasons[idx] = "Batch_Converged"
+                    # 即使 Batch 停止，也要更新最佳记录（如果有的话）
+                    if is_new_best:
+                        best_confs[idx] = curr_score
+                        best_tensors[idx] = pred_x0[idx].clone()
+                        best_iters[idx] = i + 1
+                    current_tensors[idx] = pred_x0[idx]
+                    continue
+                
+                # --- E. 如果都没停，更新最佳记录和当前状态 ---
                 if is_new_best:
                     best_confs[idx] = curr_score
                     best_tensors[idx] = pred_x0[idx].clone()
                     best_iters[idx] = i + 1
-                
-                # 执行停止
-                if should_stop:
-                    active_mask[idx] = False
-                    stop_reasons[idx] = reason
                 
                 # 更新当前图，用于下一轮作为输入
                 current_tensors[idx] = pred_x0[idx]
