@@ -1,5 +1,6 @@
 """
 工具函数：文件匹配、路径处理等
+(轻量修复版：仅增加对 BEST.png 的支持)
 """
 import os
 from glob import glob
@@ -35,14 +36,15 @@ def collect_original_images(orig_dir, label):
 def collect_enhanced_images(enh_dir):
     """
     从增强图像目录收集 BEST 图片
-    支持结构: {enh_dir}/{subfolder}/BEST_*.png
+    支持结构: 
+      1. {enh_dir}/{subfolder}/BEST.png   (新增支持)
+      2. {enh_dir}/{subfolder}/BEST_*.png (原有支持)
     
     Args:
-        enh_dir: 增强图像根目录（包含多个子文件夹）
+        enh_dir: 增强图像根目录（必须包含子文件夹）
     
     Returns:
         dict: {prefix: best_file_path} 映射字典
-              例如: {'TUM-TCGA-XXX': '/path/to/BEST_iter5.png'}
     """
     enh_dict = {}
     
@@ -55,16 +57,18 @@ def collect_enhanced_images(enh_dir):
     
     for subfolder in subfolders:
         subfolder_path = os.path.join(enh_dir, subfolder)
-        # 查找 BEST_*.png 文件
-        best_files = glob(os.path.join(subfolder_path, "BEST_*.png"))
+        
+        # 修改点：同时查找 BEST.png 和 BEST_*.png
+        patterns = ["BEST.png", "BEST_*.png"]
+        best_files = []
+        for pat in patterns:
+            best_files.extend(glob(os.path.join(subfolder_path, pat)))
         
         for best_file in best_files:
-            # 从子文件夹名提取前缀
-            # 例如: NORM-TCGA-AASSYQPA -> NORM-TCGA-AASSYQPA
-            # 或者从文件名提取（如果文件名包含前缀信息）
-            prefix = subfolder  # 使用子文件夹名作为前缀
+            # 使用子文件夹名作为前缀
+            prefix = subfolder
             
-            # 如果已经有这个前缀，选择最新的（或第一个）
+            # 简单去重：如果已经有这个前缀，保留第一个找到的
             if prefix not in enh_dict:
                 enh_dict[prefix] = best_file
     
@@ -74,10 +78,6 @@ def collect_enhanced_images(enh_dir):
 def build_enh_map(orig_files, enh_dir_tum, enh_dir_norm):
     """
     建立原始文件名 -> 增强文件路径的映射字典
-    
-    匹配策略：
-    1. 增强图的子文件夹名（如 NORM-TCGA-AASSYQPA）应该包含原始文件名的一部分
-    2. 或者原始文件名包含子文件夹名的关键部分
     
     Args:
         orig_files: 原始文件路径列表
@@ -89,7 +89,7 @@ def build_enh_map(orig_files, enh_dir_tum, enh_dir_norm):
     """
     mapping = {}
     
-    # 收集所有增强图像（按子文件夹名索引）
+    # 收集所有增强图像
     enh_dict_tum = collect_enhanced_images(enh_dir_tum)
     enh_dict_norm = collect_enhanced_images(enh_dir_norm)
     
@@ -97,7 +97,7 @@ def build_enh_map(orig_files, enh_dir_tum, enh_dir_norm):
     all_enh_dict = {**enh_dict_tum, **enh_dict_norm}
     
     if len(all_enh_dict) == 0:
-        print("  ⚠️ 未找到任何增强图像")
+        print("  ⚠️ 警告: 未找到任何增强图像！请检查目录下是否存在子文件夹及 BEST.png 文件。")
         return mapping
     
     print(f"  找到 {len(all_enh_dict)} 个增强图像子文件夹")
@@ -110,39 +110,31 @@ def build_enh_map(orig_files, enh_dir_tum, enh_dir_norm):
         
         matched = False
         
-        # 策略1: 直接匹配文件名（去除扩展名）
-        # 例如：原始文件 TUM-TCGA-XXX.tif，子文件夹 TUM-TCGA-XXX
+        # 策略1: 直接匹配文件名
         if orig_name_no_ext in all_enh_dict:
             mapping[orig_basename] = all_enh_dict[orig_name_no_ext]
             count += 1
             matched = True
         else:
             # 策略2: 子文件夹名包含原始文件名的一部分
-            # 例如：原始文件 TCGA-XXX.tif，子文件夹 TUM-TCGA-XXX
             for prefix, enh_path in all_enh_dict.items():
-                # 检查原始文件名是否在子文件夹名中，或子文件夹名是否在原始文件名中
                 if orig_name_no_ext in prefix or prefix in orig_name_no_ext:
                     mapping[orig_basename] = enh_path
                     count += 1
                     matched = True
                     break
             
-            # 策略3: 提取关键部分进行匹配
-            # 例如：从 "TUM-TCGA-ADFGWHNR" 提取 "TCGA-ADFGWHNR"
-            if not matched:
-                # 尝试提取 TCGA 开头的部分
+            # 策略3: 提取关键部分匹配 (如 TCGA-XXX)
+            if not matched and 'TCGA-' in orig_name_no_ext:
+                orig_tcga_part = orig_name_no_ext.split('TCGA-')[-1]
                 for prefix, enh_path in all_enh_dict.items():
-                    # 从子文件夹名中提取 TCGA 部分
                     if 'TCGA-' in prefix:
                         tcga_part = prefix.split('TCGA-')[-1]
-                        if 'TCGA-' in orig_name_no_ext:
-                            orig_tcga_part = orig_name_no_ext.split('TCGA-')[-1]
-                            if tcga_part == orig_tcga_part or tcga_part in orig_name_no_ext or orig_tcga_part in prefix:
-                                mapping[orig_basename] = enh_path
-                                count += 1
-                                matched = True
-                                break
+                        if tcga_part == orig_tcga_part:
+                            mapping[orig_basename] = enh_path
+                            count += 1
+                            matched = True
+                            break
     
     print(f"  成功匹配到增强图: {count}/{len(orig_files)} ({count/len(orig_files)*100:.1f}%)")
     return mapping
-
