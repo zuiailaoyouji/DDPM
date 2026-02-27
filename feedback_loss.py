@@ -61,65 +61,56 @@ class FeedbackLoss(nn.Module):
         pred_x0 = torch.clamp(pred_x0, 0.0, 1.0)
         return pred_x0
 
-    def forward(self, x_t, noise_pred, t, target_label):
+    def forward(self, x_t, noise_pred, t):
         """
-        计算反馈损失（密集监督：细胞级伪标签 + 图像级 NORM 一票否决）
+        计算纯自监督反馈损失（无 target_label，不区分 TUM/NORM）
 
         Args:
             x_t: 加噪图像 [B, C, H, W]
             noise_pred: U-Net 预测的噪声 [B, C, H, W]
             t: 时间步 [B]
-            target_label: 目标标签 [B]，1 表示肿瘤，0 表示正常
 
         Returns:
-            loss_prob: 概率损失（逐像素 BCE，按细胞核 mask 加权）
-            loss_entropy: 熵损失（分类器置信度）
-            conf_tum: TUM 样本的平均置信度
-            conf_norm: NORM 样本的平均置信度
+            loss_prob: 自监督概率损失（锐化损失）
+            loss_entropy: 自监督熵损失
+            avg_conf: 当前 Batch 细胞的全局平均癌变置信度（用于日志记录）
         """
-        # 1. DDPM 逆推还原 x0_hat 并转换到 HoVer-Net 所在的设备及取值范围 (0-255)
+        # 1. 还原 x0_hat 并转换到 HoVer-Net 设备及 0-255 范围
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
         hovernet_device = next(self.hovernet.parameters()).device
         x0_input = x0_hat.to(hovernet_device) if x0_hat.device != hovernet_device else x0_hat
         x0_input = x0_input * 255.0
 
-        # 2. HoVer-Net 推理，获取概率分布与细胞核掩膜
+        # 2. HoVer-Net 推理
         output = self.hovernet(x0_input)
         probs = torch.softmax(output['tp'], dim=1)
-        mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # [B, 164, 164] 细胞核掩膜
-        p_neo = probs[:, 1, :, :]  # [B, 164, 164] 获取 Neoplastic 概率
+        mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # 细胞核掩膜
 
-        # ==================== 核心修改区块 ====================
-        # 3. 生成细胞级伪标签 (以 0.5 为硬性分界线，充当特征放大器)
-        # 注意：必须使用 .detach() 截断伪标签的梯度
+        # 获取 Neoplastic (癌变) 概率
+        p_neo = probs[:, 1, :, :]  # [B, 164, 164]
+
+        # =========================================================
+        # 纯自监督核心：直接生成伪标签，无视图像真实归属
+        # =========================================================
+        # 以 0.5 为分界线，直接定极点。必须 detach 截断梯度！
         pseudo_target = (p_neo.detach() >= 0.5).float()
 
-        # 4. 结合图像级真实标签 (防范 NORM 图像的假阳性)
-        is_norm = (target_label == 0).view(-1, 1, 1).to(p_neo.device)
-        # NORM 图像一票否决：全图伪标签强制归 0
-        pseudo_target = torch.where(is_norm, torch.zeros_like(pseudo_target), pseudo_target)
-
-        # 5. 逐像素/逐细胞计算 BCE 损失 (密集监督 Dense Supervision)
+        # 3. 计算自监督概率损失 (矩阵级掩膜计算)
         pixel_bce_loss = F.binary_cross_entropy(p_neo, pseudo_target, reduction='none')
-
-        # 6. 利用细胞核 Mask 进行加权求均值 (只关注有细胞核的像素)
+        # 只在有细胞核的地方计算平均损失
         loss_prob_per_sample = (pixel_bce_loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
         loss_prob = loss_prob_per_sample.mean()
-        # ====================================================
 
-        # ---------------------------------------------------------
-        # (可选记录) 计算平均置信度用于 TensorBoard 监控 (不参与梯度)
-        # ---------------------------------------------------------
+        # 4. 计算自监督熵损失 (矩阵级掩膜计算)
+        entropy_matrix = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+        # 只要求网络对细胞核区域的判断确信，不干涉背景的熵
+        entropy_per_sample = (entropy_matrix * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
+        loss_entropy = entropy_per_sample.mean()
+
+        # 5. 计算用于监控的全局平均置信度 (不参与反向传播)
         with torch.no_grad():
-            avg_prob_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
-            is_tum_mask = (target_label == 1)
-            is_norm_mask = (target_label == 0)
-            conf_tum = avg_prob_per_sample[is_tum_mask].mean() if is_tum_mask.any() else torch.tensor(0.0, device=x_t.device)
-            conf_norm = avg_prob_per_sample[is_norm_mask].mean() if is_norm_mask.any() else torch.tensor(0.0, device=x_t.device)
+            avg_conf_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
+            avg_conf = avg_conf_per_sample.mean()
 
-        # 7. 熵 Loss: 保持全局熵最小化作为辅助
-        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
-        loss_entropy = entropy.mean()
-
-        return loss_prob, loss_entropy, conf_tum, conf_norm
+        return loss_prob, loss_entropy, avg_conf
 

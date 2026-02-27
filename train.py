@@ -73,7 +73,7 @@ def train(
         writer = csv.writer(f)
         if csv_mode == 'w':
             # 写入表头：增加了 TUM_Conf, NORM_Conf, L1_Diff
-            writer.writerow(['Epoch', 'Total_Loss', 'MSE', 'Prob_Loss', 'Entropy', 'TUM_Conf', 'NORM_Conf', 'L1_Diff'])
+            writer.writerow(['Epoch', 'Total_Loss', 'MSE', 'Prob_Loss', 'Entropy', 'Avg_Conf', 'L1_Diff'])
     
     # 1. 初始化模型和调度器
     print("初始化模型...")
@@ -132,11 +132,10 @@ def train(
     for epoch in range(start_epoch, epochs):
         unet.train()
         
-        # 初始化累加器
+        # 初始化累加器（自监督模式：仅全局平均癌变置信度）
         acc = {
             'loss': 0.0, 'mse': 0.0, 'prob': 0.0, 'entropy': 0.0,
-            'tum_conf': 0.0, 'norm_conf': 0.0, 'l1': 0.0,
-            'tum_count': 0, 'norm_count': 0
+            'avg_conf': 0.0, 'l1': 0.0
         }
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
@@ -187,19 +186,15 @@ def train(
                     x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
                 l1_diff = F.l1_loss(x0_pred, clean_images)
             
-            # 8. 计算反馈 Loss (特征增强能力)
-            # 建议：前 N 个 Epoch 可以先不加这个 Loss，或者权重设为 0
+            # 8. 计算反馈 Loss (自监督特征增强，无 target_label)
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                # 接收 4 个返回值
-                loss_prob, loss_entropy, conf_tum, conf_norm = feedback_criterion(
-                    noisy_images, noise_pred, timesteps, labels
+                loss_prob, loss_entropy, avg_conf = feedback_criterion(
+                    noisy_images, noise_pred, timesteps
                 )
             else:
-                # 占位符
                 loss_prob = torch.tensor(0.0, device=device)
                 loss_entropy = torch.tensor(0.0, device=device)
-                conf_tum = torch.tensor(0.0, device=device)
-                conf_norm = torch.tensor(0.0, device=device)
+                avg_conf = torch.tensor(0.0, device=device)
             
             # 9. 总 Loss
             # lambda 系数需要微调，建议从 0.01 开始
@@ -221,14 +216,8 @@ def train(
             acc['prob'] += loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob
             acc['entropy'] += loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy
             acc['l1'] += l1_diff.item()
-            
-            if conf_tum > 0:
-                acc['tum_conf'] += conf_tum.item()
-                acc['tum_count'] += 1
-            if conf_norm > 0:
-                acc['norm_conf'] += conf_norm.item()
-                acc['norm_count'] += 1
-            
+            acc['avg_conf'] += avg_conf.item() if isinstance(avg_conf, torch.Tensor) else avg_conf
+
             # 实时记录指标到 TensorBoard (每隔几步记录一次，避免IO过高)
             if logger is not None and global_step % 10 == 0:
                 metrics = {
@@ -237,13 +226,8 @@ def train(
                     "Prob_Loss": loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob,
                     "Entropy_Loss": loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy,
                     "L1_Diff": l1_diff.item(),
+                    "Avg_Conf": avg_conf.item() if isinstance(avg_conf, torch.Tensor) else avg_conf,
                 }
-                # 添加置信度（如果有）
-                if conf_tum > 0:
-                    metrics["Tumor_Conf"] = conf_tum.item()
-                if conf_norm > 0:
-                    metrics["Normal_Conf"] = conf_norm.item()
-                
                 logger.log_metrics(metrics, step=global_step, prefix="Train")
                 logger.flush()
             
@@ -287,19 +271,16 @@ def train(
         avg_entropy = acc['entropy'] / len(dataloader)
         avg_l1 = acc['l1'] / len(dataloader)
         
-        # 防止除以 0
-        avg_tum_conf = acc['tum_conf'] / max(acc['tum_count'], 1)
-        avg_norm_conf = acc['norm_conf'] / max(acc['norm_count'], 1)
-        
+        avg_avg_conf = acc['avg_conf'] / len(dataloader)
+
         print(f"\nEpoch {epoch+1}/{epochs} 完成:")
         print(f"  平均总损失: {avg_loss:.4f}")
         print(f"  平均MSE损失: {avg_mse:.4f}")
         print(f"  平均概率损失: {avg_prob:.4f}")
         print(f"  平均熵损失: {avg_entropy:.4f}")
-        print(f"  TUM置信度: {avg_tum_conf:.4f} (目标->1.0)")
-        print(f"  NORM置信度: {avg_norm_conf:.4f} (目标->0.0)")
+        print(f"  全局平均癌变置信度: {avg_avg_conf:.4f}")
         print(f"  L1修改幅度: {avg_l1:.4f}")
-        
+
         # 记录 Epoch 级别的指标到 TensorBoard
         if logger is not None:
             epoch_metrics = {
@@ -307,19 +288,18 @@ def train(
                 "MSE_Loss": avg_mse,
                 "Prob_Loss": avg_prob,
                 "Entropy_Loss": avg_entropy,
-                "Tumor_Conf": avg_tum_conf,
-                "Normal_Conf": avg_norm_conf,
+                "Avg_Conf": avg_avg_conf,
                 "L1_Diff": avg_l1,
             }
             logger.log_metrics(epoch_metrics, step=epoch+1, prefix="Epoch")
             logger.flush()
-        
+
         # 写入 CSV 日志
         with open(log_path, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                epoch+1, avg_loss, avg_mse, avg_prob, avg_entropy, 
-                avg_tum_conf, avg_norm_conf, avg_l1
+                epoch+1, avg_loss, avg_mse, avg_prob, avg_entropy,
+                avg_avg_conf, avg_l1
             ])
         
         # 保存模型
