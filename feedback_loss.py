@@ -63,94 +63,63 @@ class FeedbackLoss(nn.Module):
 
     def forward(self, x_t, noise_pred, t, target_label):
         """
-        计算反馈损失
-        
+        计算反馈损失（密集监督：细胞级伪标签 + 图像级 NORM 一票否决）
+
         Args:
             x_t: 加噪图像 [B, C, H, W]
             noise_pred: U-Net 预测的噪声 [B, C, H, W]
             t: 时间步 [B]
             target_label: 目标标签 [B]，1 表示肿瘤，0 表示正常
-        
+
         Returns:
-            loss_prob: 概率损失（BCE）
+            loss_prob: 概率损失（逐像素 BCE，按细胞核 mask 加权）
             loss_entropy: 熵损失（分类器置信度）
             conf_tum: TUM 样本的平均置信度
             conf_norm: NORM 样本的平均置信度
         """
-        # 1. 还原 x0 (尺寸是 [B, 3, 256, 256])
+        # 1. DDPM 逆推还原 x0_hat 并转换到 HoVer-Net 所在的设备及取值范围 (0-255)
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
-        
-        # [删除/注释这行] 不要在这里裁剪！HoVer-Net 需要 256 的输入
-        # x0_crop = x0_hat[:, :, 46:210, 46:210]
-        
-        # =========================================================
-        # 强制将输入数据移动到 HoVer-Net 所在的设备
-        # =========================================================
         hovernet_device = next(self.hovernet.parameters()).device
-        
-        # 使用 x0_hat 而不是 x0_crop
-        if x0_hat.device != hovernet_device:
-            x0_input = x0_hat.to(hovernet_device)
-        else:
-            x0_input = x0_hat
-        
-        # 关键修复：HoVer-Net 内部会执行 imgs / 255.0，所以需要传入 0-255 范围的输入
-        # x0_hat 当前是 0-1 范围，需要乘以 255.0 恢复到 0-255 范围
-        # 注意：保持梯度连接，所以不能使用 detach()
+        x0_input = x0_hat.to(hovernet_device) if x0_hat.device != hovernet_device else x0_hat
         x0_input = x0_input * 255.0
-        # =========================================================
-        
-        # 3. HoVer-Net 推理
-        # 输入: [B, 3, 256, 256]，范围 0-255（HoVer-Net 内部会除以 255.0 转换为 0-1）
-        # 输出: 字典, 其中的 'tp' 和 'np' 会自动变成 [B, C, 164, 164]
-        # 注意：虽然 HoVer-Net 参数被冻结，但我们需要保留计算图以便梯度能从 loss 传播到 x0_hat
-        # 因此不使用 torch.no_grad()，而是依赖 requires_grad=False 的参数来阻止参数更新
+
+        # 2. HoVer-Net 推理，获取概率分布与细胞核掩膜
         output = self.hovernet(x0_input)
-        
         probs = torch.softmax(output['tp'], dim=1)
-        
-        # === 修复点开始 ===
-        # 原代码: mask = torch.sigmoid(output['np'])
-        # 错误原因: mask 是 [B, 2, 164, 164]，无法与 [B, 164, 164] 的 p_neo 直接相乘
-        
-        # 修复: 取出细胞核通道 (Index 1)
-        mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]
-        # === 修复点结束 ===
-        
-        # 4. 计算指标
-        # 获取 Neoplastic (Index 1) 通道
-        p_neo = probs[:, 1, :, :]  # [B, 164, 164]
-        
-        # 现在两个张量都是 [B, 164, 164]，可以正常相乘了
-        avg_prob_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
-        
-        # --- 拆分 TUM 和 NORM 置信度 ---
-        # target_label: 1=TUM, 0=NORM
-        is_tum = (target_label == 1)
-        is_norm = (target_label == 0)
-        
-        # 计算 TUM 平均置信度
-        if is_tum.any():
-            conf_tum = avg_prob_per_sample[is_tum].mean()
-        else:
-            conf_tum = torch.tensor(0.0, device=x_t.device)
-            
-        # 计算 NORM 平均置信度
-        if is_norm.any():
-            conf_norm = avg_prob_per_sample[is_norm].mean()
-        else:
-            conf_norm = torch.tensor(0.0, device=x_t.device)
-        
-        # 5. 计算 Loss (概率极大化 + 熵最小化)
-        # 引导 Loss: 如果是 TUM(1) -> avg_prob 趋向 1; 如果是 NORM(0) -> avg_prob 趋向 0
-        # 使用逐样本的 BCE，而不是批次平均
-        target_float = target_label.float()
-        loss_prob = F.binary_cross_entropy(avg_prob_per_sample, target_float)
-        
-        # 熵 Loss: 全局熵最小化 (让分类器不犹豫)
+        mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # [B, 164, 164] 细胞核掩膜
+        p_neo = probs[:, 1, :, :]  # [B, 164, 164] 获取 Neoplastic 概率
+
+        # ==================== 核心修改区块 ====================
+        # 3. 生成细胞级伪标签 (以 0.5 为硬性分界线，充当特征放大器)
+        # 注意：必须使用 .detach() 截断伪标签的梯度
+        pseudo_target = (p_neo.detach() >= 0.5).float()
+
+        # 4. 结合图像级真实标签 (防范 NORM 图像的假阳性)
+        is_norm = (target_label == 0).view(-1, 1, 1).to(p_neo.device)
+        # NORM 图像一票否决：全图伪标签强制归 0
+        pseudo_target = torch.where(is_norm, torch.zeros_like(pseudo_target), pseudo_target)
+
+        # 5. 逐像素/逐细胞计算 BCE 损失 (密集监督 Dense Supervision)
+        pixel_bce_loss = F.binary_cross_entropy(p_neo, pseudo_target, reduction='none')
+
+        # 6. 利用细胞核 Mask 进行加权求均值 (只关注有细胞核的像素)
+        loss_prob_per_sample = (pixel_bce_loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
+        loss_prob = loss_prob_per_sample.mean()
+        # ====================================================
+
+        # ---------------------------------------------------------
+        # (可选记录) 计算平均置信度用于 TensorBoard 监控 (不参与梯度)
+        # ---------------------------------------------------------
+        with torch.no_grad():
+            avg_prob_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
+            is_tum_mask = (target_label == 1)
+            is_norm_mask = (target_label == 0)
+            conf_tum = avg_prob_per_sample[is_tum_mask].mean() if is_tum_mask.any() else torch.tensor(0.0, device=x_t.device)
+            conf_norm = avg_prob_per_sample[is_norm_mask].mean() if is_norm_mask.any() else torch.tensor(0.0, device=x_t.device)
+
+        # 7. 熵 Loss: 保持全局熵最小化作为辅助
         entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
         loss_entropy = entropy.mean()
-        
-        # 修改返回值: 增加 conf_tum 和 conf_norm
+
         return loss_prob, loss_entropy, conf_tum, conf_norm
 
