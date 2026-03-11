@@ -77,7 +77,8 @@ class FeedbackLoss(nn.Module):
         Returns:
             loss_prob: Focal 概率损失
             loss_entropy: 熵损失
-            avg_conf: 当前 Batch 细胞的全局平均癌变置信度（用于日志记录）
+            avg_tumor_conf: 原图癌细胞区域的 p_neo 平均值（无该类时为 -1.0）
+            avg_normal_conf: 原图正常细胞区域的 p_neo 平均值（无该类时为 -1.0）
         """
         # 1. 获取模型当前预测的 x0_hat
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
@@ -102,7 +103,8 @@ class FeedbackLoss(nn.Module):
                 return (
                     torch.tensor(0.0, device=x_t.device),
                     torch.tensor(0.0, device=x_t.device),
-                    torch.tensor(0.0, device=x_t.device),
+                    torch.tensor(-1.0, device=x_t.device),
+                    torch.tensor(-1.0, device=x_t.device),
                 )
 
             tumor_cells = (pseudo_target * mask).sum()
@@ -138,10 +140,21 @@ class FeedbackLoss(nn.Module):
         entropy_per_sample = (entropy_matrix * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
         loss_entropy = entropy_per_sample.mean()
 
-        # 5. 监控置信度
+        # 5. 计算用于监控的分类别平均置信度 (不参与反向传播)
         with torch.no_grad():
-            avg_conf_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
-            avg_conf = avg_conf_per_sample.mean()
+            tumor_mask = pseudo_target * mask
+            normal_mask = (1.0 - pseudo_target) * mask
+            has_tumor = tumor_mask.sum() > 0
+            has_normal = normal_mask.sum() > 0
 
-        return loss_prob, loss_entropy, avg_conf
+            if has_tumor:
+                avg_tumor_conf = (p_neo * tumor_mask).sum() / tumor_mask.sum()
+            else:
+                avg_tumor_conf = torch.tensor(-1.0, device=p_neo.device)
+            if has_normal:
+                avg_normal_conf = (p_neo * normal_mask).sum() / normal_mask.sum()
+            else:
+                avg_normal_conf = torch.tensor(-1.0, device=p_neo.device)
+
+        return loss_prob, loss_entropy, avg_tumor_conf, avg_normal_conf
 
