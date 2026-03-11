@@ -21,7 +21,7 @@ from visualization import save_training_progress_images
 # 新增: 导入日志模块
 from logger import ExperimentLogger
 # 新增: 导入验证集模块
-from validation import ValidationSet
+from validation import ValidationSet, create_val_dataloader
 
 
 def train(
@@ -113,8 +113,12 @@ def train(
         if not val_set.load():
             val_set = None
             print(f"⚠️ 警告: 验证集目录不存在或无法加载: {val_vis_dir}，将使用训练集图片进行可视化")
-    
-    # 3. 加载训练数据集
+
+    # ================= 3. 加载定量验证集 DataLoader =================
+    val_dataloader = create_val_dataloader(val_vis_dir, batch_size, device)
+    best_val_conf_gap = -float('inf')
+
+    # 4. 加载训练数据集
     print("加载数据集...")
     dataset = NCTDataset(tum_dir, norm_dir, oversample=True)
     dataloader = DataLoader(
@@ -126,7 +130,7 @@ def train(
         drop_last=True  # 确保批次大小一致
     )
     
-    # 4. 训练循环
+    # 5. 训练循环
     print(f"开始训练，共 {epochs} 个 epoch...")
     global_step = 0
     for epoch in range(start_epoch, epochs):
@@ -323,7 +327,92 @@ def train(
                 epoch+1, avg_loss, avg_mse, avg_prob, avg_entropy,
                 avg_tumor_conf, avg_normal_conf, avg_conf_gap, avg_l1
             ])
-        
+
+        # =========================================================
+        # 定量验证：在验证集上评估 MSE / Focal / 置信度 Gap
+        # =========================================================
+        if val_dataloader is not None:
+            unet.eval()
+            print(f"\n--- 开始 Epoch {epoch+1} 验证集评估 ---")
+
+            val_acc = {'mse': 0.0, 'prob': 0.0, 'entropy': 0.0}
+            val_tumor_conf_sum = 0.0
+            val_tumor_conf_count = 0
+            val_normal_conf_sum = 0.0
+            val_normal_conf_count = 0
+
+            with torch.no_grad():
+                for val_batch in val_dataloader:
+                    val_clean_images, val_labels = val_batch
+                    val_clean_images = val_clean_images.to(device)
+                    bs = val_clean_images.shape[0]
+
+                    val_noise = torch.randn_like(val_clean_images).to(device)
+                    val_timesteps = torch.randint(0, 1000, (bs,), device=device).long()
+                    val_noisy_images = scheduler.add_noise(val_clean_images, val_noise, val_timesteps)
+
+                    val_model_input = torch.cat([val_clean_images, val_noisy_images], dim=1)
+                    val_noise_pred = unet(val_model_input, val_timesteps).sample
+
+                    val_loss_mse = F.mse_loss(val_noise_pred, val_noise)
+                    val_acc['mse'] += val_loss_mse.item()
+
+                    if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
+                        val_loss_prob, val_loss_entropy, val_t_conf, val_n_conf = feedback_criterion(
+                            val_noisy_images, val_noise_pred, val_timesteps, val_clean_images
+                        )
+                        val_acc['prob'] += val_loss_prob.item() if isinstance(val_loss_prob, torch.Tensor) else val_loss_prob
+                        val_acc['entropy'] += val_loss_entropy.item() if isinstance(val_loss_entropy, torch.Tensor) else val_loss_entropy
+
+                        v_t_conf_val = val_t_conf.item() if isinstance(val_t_conf, torch.Tensor) else val_t_conf
+                        v_n_conf_val = val_n_conf.item() if isinstance(val_n_conf, torch.Tensor) else val_n_conf
+                        if v_t_conf_val >= 0:
+                            val_tumor_conf_sum += v_t_conf_val
+                            val_tumor_conf_count += 1
+                        if v_n_conf_val >= 0:
+                            val_normal_conf_sum += v_n_conf_val
+                            val_normal_conf_count += 1
+
+            val_steps = len(val_dataloader)
+            val_avg_mse = val_acc['mse'] / val_steps
+            print(f"  [Val] MSE Loss: {val_avg_mse:.4f}")
+
+            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
+                val_avg_prob = val_acc['prob'] / val_steps
+                val_avg_entropy = val_acc['entropy'] / val_steps
+                val_avg_tumor_conf = val_tumor_conf_sum / val_tumor_conf_count if val_tumor_conf_count > 0 else 0.0
+                val_avg_normal_conf = val_normal_conf_sum / val_normal_conf_count if val_normal_conf_count > 0 else 0.0
+                val_avg_conf_gap = val_avg_tumor_conf - val_avg_normal_conf
+
+                print(f"  [Val] Focal Loss: {val_avg_prob:.4f} | Entropy Loss: {val_avg_entropy:.4f}")
+                print(f"  [Val] Tumor Conf: {val_avg_tumor_conf:.4f}")
+                print(f"  [Val] Normal Conf: {val_avg_normal_conf:.4f}")
+                print(f"  [Val] Conf Gap: {val_avg_conf_gap:.4f}")
+
+                if logger is not None:
+                    val_metrics = {
+                        "MSE_Loss": val_avg_mse,
+                        "Prob_Loss": val_avg_prob,
+                        "Entropy_Loss": val_avg_entropy,
+                        "Tumor_Conf": val_avg_tumor_conf,
+                        "Normal_Conf": val_avg_normal_conf,
+                        "Conf_Gap": val_avg_conf_gap,
+                    }
+                    logger.log_metrics(val_metrics, step=epoch + 1, prefix="Val")
+
+                if val_avg_conf_gap > best_val_conf_gap:
+                    best_val_conf_gap = val_avg_conf_gap
+                    best_checkpoint_path = os.path.join(save_dir, 'best_unet_model.pth')
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'model_state_dict': unet.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_conf_gap': best_val_conf_gap,
+                    }, best_checkpoint_path)
+                    print(f"  🔥 发现更优模型！验证集 Gap 达到 {best_val_conf_gap:.4f}，已保存至 {best_checkpoint_path}")
+
+            unet.train()
+
         # 保存模型
         if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
             checkpoint_path = os.path.join(save_dir, f'unet_epoch_{epoch+1}.pth')

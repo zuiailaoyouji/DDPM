@@ -1,13 +1,15 @@
 """
 验证集模块
-用于加载和管理固定验证集，用于训练过程中的可视化
+用于加载和管理固定验证集（定性可视化），以及定量验证集的创建与加载。
 """
 import os
 import cv2
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from diffusers import DDPMScheduler
 from ddpm_utils import predict_x0_from_noise_shared
+from ddpm_dataset import NCTDataset
 
 
 def load_fixed_validation_batch(val_dir, sample_size=256, device='cuda'):
@@ -178,4 +180,35 @@ class ValidationSet:
     def is_available(self):
         """检查验证集是否可用"""
         return self.images is not None
+
+
+def create_val_dataloader(val_vis_dir, batch_size, device='cuda'):
+    """
+    创建定量验证集 DataLoader（TUM + NORM 子目录）。
+
+    Args:
+        val_vis_dir: 验证集根目录，需包含 TUM 与 NORM 子目录
+        batch_size: 批次大小
+        device: 设备
+
+    Returns:
+        val_dataloader: DataLoader 或 None（目录不存在时）
+    """
+    if val_vis_dir is None or not os.path.exists(val_vis_dir):
+        return None
+    val_tum_dir = os.path.join(val_vis_dir, 'TUM')
+    val_norm_dir = os.path.join(val_vis_dir, 'NORM')
+    if not os.path.exists(val_tum_dir) or not os.path.exists(val_norm_dir):
+        print("⚠️ 警告: 未找到验证集的 TUM/NORM 子目录，跳过定量验证环节。")
+        return None
+    val_dataset = NCTDataset(val_tum_dir, val_norm_dir, oversample=False)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=(device == 'cuda'),
+    )
+    print(f"验证集加载成功，共 {len(val_dataset)} 张图片。")
+    return val_dataloader
 
