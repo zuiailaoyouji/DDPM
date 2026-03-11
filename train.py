@@ -24,6 +24,15 @@ from logger import ExperimentLogger
 from validation import ValidationSet, create_val_dataloader
 
 
+def tv_loss(x: torch.Tensor) -> torch.Tensor:
+    """
+    总变分损失 (Total Variation Loss)，用于抑制高频噪点。
+    """
+    loss_h = torch.mean(torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:]))
+    loss_v = torch.mean(torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :]))
+    return loss_h + loss_v
+
+
 def train(
     tum_dir,
     norm_dir,
@@ -161,7 +170,11 @@ def train(
             noise = torch.randn_like(clean_images).to(device)
             
             # 3. 采样随机时间步 (Timesteps)
-            timesteps = torch.randint(0, 1000, (bs,), device=device).long()
+            # 第一阶段：全区间；第二阶段：限制在低噪声区间 [50, 200)
+            if epoch < use_feedback_from_epoch or feedback_criterion is None:
+                timesteps = torch.randint(0, 1000, (bs,), device=device).long()
+            else:
+                timesteps = torch.randint(50, 200, (bs,), device=device).long()
             
             # 4. 前向加噪过程 (Forward Diffusion)
             # ---> 这里就是加噪图像的来源 <---
@@ -209,8 +222,21 @@ def train(
             
             # 9. 总 Loss
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                loss_total = loss_mse + feedback_weight_prob * loss_prob + feedback_weight_entropy * loss_entropy
+                # 第二阶段：在结构稳定基础上，弱化 MSE，重点用语义 + 图像保真 + TV 进行精修
+                lambda_mse = 0.2
+                lambda_prob = 0.05
+                lambda_img = 1.0
+                lambda_tv = 1e-5
+                loss_img = l1_diff  # 与 clean_images 的 L1 差异
+                loss_tv = tv_loss(x0_pred)
+                loss_total = (
+                    lambda_mse * loss_mse
+                    + lambda_prob * loss_prob
+                    + lambda_img * loss_img
+                    + lambda_tv * loss_tv
+                )
             else:
+                # 第一阶段：纯 MSE 训练噪声预测
                 loss_total = loss_mse
 
             # 10. 梯度累积：先缩放再反传，每 accumulation_steps 步或最后一个 batch 才更新参数
@@ -352,7 +378,11 @@ def train(
                     bs = val_clean_images.shape[0]
 
                     val_noise = torch.randn_like(val_clean_images).to(device)
-                    val_timesteps = torch.randint(0, 1000, (bs,), device=device).long()
+                    # 验证集时间步与训练保持一致：第一阶段全区间，第二阶段限制在 [50, 200)
+                    if epoch < use_feedback_from_epoch or feedback_criterion is None:
+                        val_timesteps = torch.randint(0, 1000, (bs,), device=device).long()
+                    else:
+                        val_timesteps = torch.randint(50, 200, (bs,), device=device).long()
                     val_noisy_images = scheduler.add_noise(val_clean_images, val_noise, val_timesteps)
 
                     val_model_input = torch.cat([val_clean_images, val_noisy_images], dim=1)

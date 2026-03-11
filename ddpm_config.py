@@ -26,7 +26,7 @@ class TrainingConfig:
     
     # 损失权重
     feedback_weight_prob: float = 0.05
-    feedback_weight_entropy: float = 0.01
+    feedback_weight_entropy: float = 0.0
     use_feedback_from_epoch: int = 5  # 从第几个 epoch 开始使用反馈损失
     
     # 数据加载
