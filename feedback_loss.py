@@ -1,160 +1,214 @@
 """
-反馈损失模块
-核心改变：实现从 ε 还原 x0 的数学公式，并确保梯度链不断
+反馈损失模块：像素级概率转为细胞级概率，避免单个 noisy pixel 主导训练。
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from skimage.measure import label
 
 
 class FeedbackLoss(nn.Module):
-    """
-    反馈损失：利用 HoVer-Net 的分类结果来引导去噪过程；
-    使用原图生成伪标签，并采用动态 Focal Loss。
-    """
-    def __init__(self, hovernet, noise_scheduler, gamma=2.0):
-        """
-        Args:
-            hovernet: HoVer-Net 模型，需要冻结参数
-            noise_scheduler: DDPM 噪声调度器，需要用它的 alpha 参数来还原 x0
-            gamma: Focal Loss 的聚焦参数，默认 2.0
-        """
+    def __init__(self, hovernet, scheduler, np_thresh=0.5, min_cell_pixels=8):
         super().__init__()
         self.hovernet = hovernet
-        self.scheduler = noise_scheduler
-        self.gamma = gamma
+        self.scheduler = scheduler
+        self.np_thresh = np_thresh
+        self.min_cell_pixels = min_cell_pixels
 
         # 冻结 HoVer-Net 参数
-        for param in self.hovernet.parameters():
-            param.requires_grad = False
+        for p in self.hovernet.parameters():
+            p.requires_grad = False
         self.hovernet.eval()
 
     def predict_x0_from_noise(self, x_t, noise_pred, t):
         """
-        数学核心：利用 DDPM 公式逆向推导 x0
-        x_t = sqrt(alpha_bar) * x0 + sqrt(1 - alpha_bar) * noise
-        所以: x0 = (x_t - sqrt(1 - alpha_bar) * noise) / sqrt(alpha_bar)
-        
-        Args:
-            x_t: 加噪图像 [B, C, H, W]
-            noise_pred: U-Net 预测的噪声 [B, C, H, W]
-            t: 时间步 [B]
-        
-        Returns:
-            pred_x0: 预测的原始图像 [B, C, H, W]，范围 [0, 1]
+        用 Tweedie 公式从 x_t 和预测噪声恢复 x0
         """
-        # 获取当前 timestep 对应的 alpha_bar (cumulative alphas)
-        # 注意：需要根据 t 的 shape 提取对应的 alpha 值，并 reshape 成 [B, 1, 1, 1] 以便广播
-        # t 可能是 [B] 形状，需要提取每个样本对应的 alpha_bar
         device = x_t.device
         dtype = x_t.dtype
-        
-        # 先把 alphas_cumprod 移动到 device，然后再用 t 去取值
-        # 这样可以避免设备不匹配的问题（t 在 GPU，alphas_cumprod 在 CPU）
-        alpha_prod_t = self.scheduler.alphas_cumprod.to(device)[t].to(dtype)
-        alpha_prod_t = alpha_prod_t.view(-1, 1, 1, 1)
-        
-        beta_prod_t = 1 - alpha_prod_t
-        
-        # 预测的 x0 (这就是我们要喂给 HoVer-Net 的图)
-        # 这里的 x_t 是加噪图，noise_pred 是 U-Net 的输出
-        pred_x0 = (x_t - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
-        
-        # 裁剪到 [0, 1] 之间，防止数值溢出导致 NaN，但要保留梯度
+
+        alpha_bar = self.scheduler.alphas_cumprod.to(device)[t].to(dtype).view(-1, 1, 1, 1)
+        beta_bar = 1.0 - alpha_bar
+
+        pred_x0 = (x_t - torch.sqrt(beta_bar) * noise_pred) / (torch.sqrt(alpha_bar) + 1e-8)
         pred_x0 = torch.clamp(pred_x0, 0.0, 1.0)
         return pred_x0
 
-    def forward(self, x_t, noise_pred, t, clean_images):
+    def build_instance_map_from_np(self, np_prob_2d):
         """
-        利用原图作为伪标签基准，计算动态 Focal Loss。
+        根据 HoVer-Net np 前景概率图做一个简化版 instance map
+        这里只用连通域，控制变量，不引入 hv 后处理
 
         Args:
-            x_t: 加噪图像 [B, C, H, W]
-            noise_pred: U-Net 预测的噪声 [B, C, H, W]
-            t: 时间步 [B]
-            clean_images: 干净原图 x0 [B, C, H, W]，范围 [0, 1]
+            np_prob_2d: numpy array [H, W]
 
         Returns:
-            loss_prob: Focal 概率损失
-            loss_entropy: 熵损失
-            avg_tumor_conf: 原图癌细胞区域的 p_neo 平均值（无该类时为 -1.0）
-            avg_normal_conf: 原图正常细胞区域的 p_neo 平均值（无该类时为 -1.0）
+            instance_map [H, W]，背景为 0
         """
-        # 1. 获取模型当前预测的 x0_hat
+        binary = (np_prob_2d > self.np_thresh).astype(np.uint8)
+        inst_map = label(binary, connectivity=1)
+        return inst_map
+
+    def aggregate_cell_scores(self, prob_map_2d, inst_map, min_pixels=None):
+        """
+        按 cell instance 聚合分数
+
+        Args:
+            prob_map_2d: torch.Tensor [H, W]
+            inst_map: numpy.ndarray [H, W] 或 torch.Tensor [H, W]
+
+        Returns:
+            cell_ids: list[int]
+            cell_scores: torch.Tensor [N_cells] 或 None
+        """
+        if min_pixels is None:
+            min_pixels = self.min_cell_pixels
+
+        device = prob_map_2d.device
+        if not torch.is_tensor(inst_map):
+            inst_map = torch.from_numpy(inst_map).to(device)
+
+        cell_ids = torch.unique(inst_map)
+        cell_ids = cell_ids[cell_ids > 0]
+
+        kept_ids = []
+        scores = []
+
+        for cid in cell_ids:
+            mask = (inst_map == cid)
+            if mask.sum() < min_pixels:
+                continue
+            kept_ids.append(int(cid.item()))
+            scores.append(prob_map_2d[mask].mean())
+
+        if len(scores) == 0:
+            return [], None
+
+        return kept_ids, torch.stack(scores, dim=0)
+
+    def forward(self, x_t, noise_pred, t, clean_images):
+        """
+        像素级 -> 细胞级 的控制变量版本。
+        在原图上用 HoVer-Net + 连通域得到 cell instance + cell-level pseudo target，
+        在预测图上再按 cell 聚合概率，做 cell-level BCE。
+
+        Returns:
+            loss_prob: 细胞级 BCE 损失
+            loss_entropy: 目前固定返回 0（占位）
+            avg_tumor_conf: 癌细胞平均置信度（无该类时为 -1.0）
+            avg_normal_conf: 正常细胞平均置信度（无该类时为 -1.0）
+        """
+        # 1) 预测 x0_hat
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
         hovernet_device = next(self.hovernet.parameters()).device
 
-        x0_input = x0_hat.to(hovernet_device) if x0_hat.device != hovernet_device else x0_hat
-        x0_input = x0_input * 255.0
+        x0_input = x0_hat.to(hovernet_device)
+        clean_input = clean_images.to(hovernet_device)
 
-        clean_input = clean_images.to(hovernet_device) if clean_images.device != hovernet_device else clean_images
+        # HoVer-Net 输入 0~255
+        x0_input = x0_input * 255.0
         clean_input = clean_input * 255.0
 
-        # 2. 生成原图的伪标签（无需梯度）并计算动态 alpha
+        # 2) clean 侧：构造 cell instance + cell-level pseudo target
         with torch.no_grad():
             clean_output = self.hovernet(clean_input)
-            clean_probs = torch.softmax(clean_output['tp'], dim=1)
-            mask = torch.softmax(clean_output['np'], dim=1)[:, 1, :, :]  # 细胞核掩膜
-            clean_p_neo = clean_probs[:, 1, :, :]
-            pseudo_target = (clean_p_neo >= 0.5).float()
+            clean_tp_probs = torch.softmax(clean_output["tp"], dim=1)   # [B, C_tp, H, W]
+            clean_np_probs = torch.softmax(clean_output["np"], dim=1)   # [B, 2, H, W]
 
-            total_cells = mask.sum()
-            if total_cells < 1:
-                return (
-                    torch.tensor(0.0, device=x_t.device),
-                    torch.tensor(0.0, device=x_t.device),
-                    torch.tensor(-1.0, device=x_t.device),
-                    torch.tensor(-1.0, device=x_t.device),
-                )
+            clean_p_neo = clean_tp_probs[:, 1, :, :]   # [B, H, W]
+            clean_np_fg = clean_np_probs[:, 1, :, :]   # [B, H, W]
 
-            tumor_cells = (pseudo_target * mask).sum()
-            normal_cells = total_cells - tumor_cells
-            # 反比权重：数量越少，权重越大
-            alpha_tumor = (normal_cells / total_cells).item()
-            alpha_normal = (tumor_cells / total_cells).item()
+            instance_maps = []
+            clean_cell_targets = []
 
-        # 3. 对预测的 x0_hat 进行 HoVer-Net 推理（需要梯度）
+            B = clean_p_neo.shape[0]
+            for b in range(B):
+                np_prob_np = clean_np_fg[b].detach().cpu().numpy()
+                inst_map = self.build_instance_map_from_np(np_prob_np)
+                instance_maps.append(inst_map)
+
+                cell_ids, clean_scores = self.aggregate_cell_scores(clean_p_neo[b], inst_map)
+                if clean_scores is None or len(cell_ids) == 0:
+                    clean_cell_targets.append(None)
+                    continue
+
+                # 控制变量：沿用原本 0.5 阈值，只是从 pixel 改成 cell
+                cell_targets = clean_scores.detach()
+
+                clean_cell_targets.append({
+                    "cell_ids": cell_ids,
+                    "targets": cell_targets,
+                })
+
+        # 3) pred 侧：得到 pred_p_neo
         output = self.hovernet(x0_input)
-        probs = torch.softmax(output['tp'], dim=1)
-        p_neo = probs[:, 1, :, :]
+        probs = torch.softmax(output["tp"], dim=1)
+        p_neo = probs[:, 1, :, :]   # [B, H, W]
 
-        # =========================================================
-        # Focal Loss: FL = -alpha * (1 - pt)^gamma * log(pt)
-        # =========================================================
-        pt = torch.where(pseudo_target == 1.0, p_neo, 1.0 - p_neo)
-        alpha_matrix = torch.where(
-            pseudo_target == 1.0,
-            torch.full_like(p_neo, alpha_tumor),
-            torch.full_like(p_neo, alpha_normal),
-        )
-        pt = torch.clamp(pt, min=1e-6, max=1.0 - 1e-6)
-        focal_weight = alpha_matrix * torch.pow(1.0 - pt, self.gamma)
+        # 4) 细胞级 loss_prob
+        total_loss = 0.0
+        valid_count = 0
 
-        pixel_bce_loss = F.binary_cross_entropy(p_neo, pseudo_target, reduction='none')
-        pixel_focal_loss = focal_weight * pixel_bce_loss
-        loss_prob_per_sample = (pixel_focal_loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
-        loss_prob = loss_prob_per_sample.mean()
+        tumor_conf_list = []
+        normal_conf_list = []
 
-        # 4. 熵损失
-        entropy_matrix = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
-        entropy_per_sample = (entropy_matrix * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
-        loss_entropy = entropy_per_sample.mean()
+        B = p_neo.shape[0]
+        for b in range(B):
+            info = clean_cell_targets[b]
+            if info is None:
+                continue
 
-        # 5. 计算用于监控的分类别平均置信度 (不参与反向传播)
-        with torch.no_grad():
-            tumor_mask = pseudo_target * mask
-            normal_mask = (1.0 - pseudo_target) * mask
-            has_tumor = tumor_mask.sum() > 0
-            has_normal = normal_mask.sum() > 0
+            inst_map = instance_maps[b]
+            cell_ids_pred, pred_scores = self.aggregate_cell_scores(p_neo[b], inst_map)
+            if pred_scores is None or len(cell_ids_pred) == 0:
+                continue
 
-            if has_tumor:
-                avg_tumor_conf = (p_neo * tumor_mask).sum() / tumor_mask.sum()
-            else:
-                avg_tumor_conf = torch.tensor(-1.0, device=p_neo.device)
-            if has_normal:
-                avg_normal_conf = (p_neo * normal_mask).sum() / normal_mask.sum()
-            else:
-                avg_normal_conf = torch.tensor(-1.0, device=p_neo.device)
+            # 同一个 inst_map 下，cell_ids 顺序理论上应一致
+            if len(cell_ids_pred) != len(info["cell_ids"]):
+                continue
+
+            cell_targets = info["targets"].to(pred_scores.device)
+
+            # cell-level BCE
+            loss_b = F.binary_cross_entropy(
+                pred_scores.clamp(1e-6, 1 - 1e-6),
+                cell_targets,
+                reduction="mean",
+            )
+
+            total_loss = total_loss + loss_b
+            valid_count += 1
+
+            # 监控：仍然按 cell-level pseudo target 分成 tumor/normal cells 统计
+            tumor_mask = (cell_targets > 0.5)
+            normal_mask = ~tumor_mask
+
+            if tumor_mask.sum() > 0:
+                tumor_conf_list.append(pred_scores[tumor_mask].mean())
+
+            if normal_mask.sum() > 0:
+                normal_conf_list.append(pred_scores[normal_mask].mean())
+
+        if valid_count == 0:
+            zero = torch.tensor(0.0, device=x_t.device)
+            neg_one = torch.tensor(-1.0, device=x_t.device)
+            return zero, zero, neg_one, neg_one
+
+        loss_prob = total_loss / valid_count
+
+        # entropy 先保持接口不变，返回 0（控制变量）
+        loss_entropy = torch.tensor(0.0, device=x_t.device)
+
+        if len(tumor_conf_list) > 0:
+            avg_tumor_conf = torch.stack(tumor_conf_list).mean()
+        else:
+            avg_tumor_conf = torch.tensor(-1.0, device=x_t.device)
+
+        if len(normal_conf_list) > 0:
+            avg_normal_conf = torch.stack(normal_conf_list).mean()
+        else:
+            avg_normal_conf = torch.tensor(-1.0, device=x_t.device)
 
         return loss_prob, loss_entropy, avg_tumor_conf, avg_normal_conf
 
