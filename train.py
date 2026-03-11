@@ -38,11 +38,12 @@ def train(
     use_feedback_from_epoch=5,
     resume_path=None,
     logger=None,
-    val_vis_dir=None,  # 新增参数: 验证集目录（用于固定可视化）
+    val_vis_dir=None,  # 验证集目录（用于固定可视化）
+    accumulation_steps=1,  # 梯度累积步数，等效 batch = batch_size * accumulation_steps
 ):
     """
     训练 DDPM 模型
-    
+
     Args:
         tum_dir: 肿瘤图像目录
         norm_dir: 正常图像目录
@@ -58,6 +59,7 @@ def train(
         resume_path: 恢复训练的检查点路径（可选）
         logger: 日志记录器（可选）
         val_vis_dir: 验证集目录（用于固定可视化），应包含 TUM 和 NORM 子目录（可选）
+        accumulation_steps: 梯度累积步数，等效有效 batch = batch_size * accumulation_steps，不增加显存
     """
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
@@ -146,7 +148,8 @@ def train(
         normal_conf_count = 0
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-        
+        optimizer.zero_grad()
+
         for batch_idx, batch in enumerate(progress_bar):
             # 1. 准备数据
             clean_images, labels = batch  # clean_images 是 [0, 1] 范围
@@ -205,21 +208,22 @@ def train(
                 normal_conf = torch.tensor(-1.0, device=device)
             
             # 9. 总 Loss
-            # lambda 系数需要微调，建议从 0.01 开始
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
                 loss_total = loss_mse + feedback_weight_prob * loss_prob + feedback_weight_entropy * loss_entropy
             else:
                 loss_total = loss_mse
-            
-            # 10. 反向传播
-            optimizer.zero_grad()
+
+            # 10. 梯度累积：先缩放再反传，每 accumulation_steps 步或最后一个 batch 才更新参数
+            loss_for_log = loss_total.item()
+            loss_total = loss_total / accumulation_steps
             loss_total.backward()
-            # 梯度裁剪，防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
-            optimizer.step()
-            
-            # 累加记录
-            acc['loss'] += loss_total.item()
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            # 累加记录（用未缩放的 loss，便于与「无累积」时数值一致）
+            acc['loss'] += loss_for_log
             acc['mse'] += loss_mse.item()
             acc['prob'] += loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob
             acc['entropy'] += loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy
@@ -237,7 +241,7 @@ def train(
             # 实时记录指标到 TensorBoard (每隔几步记录一次，避免IO过高)
             if logger is not None and global_step % 10 == 0:
                 metrics = {
-                    "Total_Loss": loss_total.item(),
+                    "Total_Loss": loss_for_log,
                     "MSE_Loss": loss_mse.item(),
                     "Prob_Loss": loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob,
                     "Entropy_Loss": loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy,
@@ -281,7 +285,7 @@ def train(
                         logger.log_images("Train/Comparison", vis_grid, step=global_step, max_images=1)
             
             # 更新进度条
-            progress_bar.set_postfix({'Loss': f"{loss_total.item():.4f}"})
+            progress_bar.set_postfix({'Loss': f"{loss_for_log:.4f}"})
             
             global_step += 1
         
@@ -450,7 +454,8 @@ def main():
     parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard 日志根目录')
     parser.add_argument('--exp_name', type=str, default=None, help='实验名称（用于区分不同次运行），默认为时间戳')
     parser.add_argument('--val_vis_dir', type=str, default=None, help='验证集目录（用于固定可视化），应包含 tumor 和 normal 子目录')
-    
+    parser.add_argument('--accumulation_steps', type=int, default=1, help='梯度累积步数，等效 batch = batch_size * accumulation_steps（默认 1 即不累积）')
+
     args = parser.parse_args()
     
     # 打印 GPU 信息
@@ -509,6 +514,7 @@ def main():
         resume_path=args.resume_path,
         logger=logger,
         val_vis_dir=args.val_vis_dir,
+        accumulation_steps=args.accumulation_steps,
     )
 
 
