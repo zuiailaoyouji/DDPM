@@ -9,18 +9,21 @@ import torch.nn.functional as F
 
 class FeedbackLoss(nn.Module):
     """
-    反馈损失：利用 HoVer-Net 的分类结果来引导去噪过程
+    反馈损失：利用 HoVer-Net 的分类结果来引导去噪过程；
+    使用原图生成伪标签，并采用动态 Focal Loss。
     """
-    def __init__(self, hovernet, noise_scheduler):
+    def __init__(self, hovernet, noise_scheduler, gamma=2.0):
         """
         Args:
             hovernet: HoVer-Net 模型，需要冻结参数
             noise_scheduler: DDPM 噪声调度器，需要用它的 alpha 参数来还原 x0
+            gamma: Focal Loss 的聚焦参数，默认 2.0
         """
         super().__init__()
         self.hovernet = hovernet
         self.scheduler = noise_scheduler
-        
+        self.gamma = gamma
+
         # 冻结 HoVer-Net 参数
         for param in self.hovernet.parameters():
             param.requires_grad = False
@@ -61,53 +64,81 @@ class FeedbackLoss(nn.Module):
         pred_x0 = torch.clamp(pred_x0, 0.0, 1.0)
         return pred_x0
 
-    def forward(self, x_t, noise_pred, t):
+    def forward(self, x_t, noise_pred, t, clean_images):
         """
-        计算纯自监督反馈损失（无 target_label，不区分 TUM/NORM）
+        利用原图作为伪标签基准，计算动态 Focal Loss。
 
         Args:
             x_t: 加噪图像 [B, C, H, W]
             noise_pred: U-Net 预测的噪声 [B, C, H, W]
             t: 时间步 [B]
+            clean_images: 干净原图 x0 [B, C, H, W]，范围 [0, 1]
 
         Returns:
-            loss_prob: 自监督概率损失（锐化损失）
-            loss_entropy: 自监督熵损失
+            loss_prob: Focal 概率损失
+            loss_entropy: 熵损失
             avg_conf: 当前 Batch 细胞的全局平均癌变置信度（用于日志记录）
         """
-        # 1. 还原 x0_hat 并转换到 HoVer-Net 设备及 0-255 范围
+        # 1. 获取模型当前预测的 x0_hat
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
         hovernet_device = next(self.hovernet.parameters()).device
+
         x0_input = x0_hat.to(hovernet_device) if x0_hat.device != hovernet_device else x0_hat
         x0_input = x0_input * 255.0
 
-        # 2. HoVer-Net 推理
+        clean_input = clean_images.to(hovernet_device) if clean_images.device != hovernet_device else clean_images
+        clean_input = clean_input * 255.0
+
+        # 2. 生成原图的伪标签（无需梯度）并计算动态 alpha
+        with torch.no_grad():
+            clean_output = self.hovernet(clean_input)
+            clean_probs = torch.softmax(clean_output['tp'], dim=1)
+            mask = torch.softmax(clean_output['np'], dim=1)[:, 1, :, :]  # 细胞核掩膜
+            clean_p_neo = clean_probs[:, 1, :, :]
+            pseudo_target = (clean_p_neo >= 0.5).float()
+
+            total_cells = mask.sum()
+            if total_cells < 1:
+                return (
+                    torch.tensor(0.0, device=x_t.device),
+                    torch.tensor(0.0, device=x_t.device),
+                    torch.tensor(0.0, device=x_t.device),
+                )
+
+            tumor_cells = (pseudo_target * mask).sum()
+            normal_cells = total_cells - tumor_cells
+            # 反比权重：数量越少，权重越大
+            alpha_tumor = (normal_cells / total_cells).item()
+            alpha_normal = (tumor_cells / total_cells).item()
+
+        # 3. 对预测的 x0_hat 进行 HoVer-Net 推理（需要梯度）
         output = self.hovernet(x0_input)
         probs = torch.softmax(output['tp'], dim=1)
-        mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # 细胞核掩膜
-
-        # 获取 Neoplastic (癌变) 概率
-        p_neo = probs[:, 1, :, :]  # [B, 164, 164]
+        p_neo = probs[:, 1, :, :]
 
         # =========================================================
-        # 纯自监督核心：直接生成伪标签，无视图像真实归属
+        # Focal Loss: FL = -alpha * (1 - pt)^gamma * log(pt)
         # =========================================================
-        # 以 0.5 为分界线，直接定极点。必须 detach 截断梯度！
-        pseudo_target = (p_neo.detach() >= 0.5).float()
+        pt = torch.where(pseudo_target == 1.0, p_neo, 1.0 - p_neo)
+        alpha_matrix = torch.where(
+            pseudo_target == 1.0,
+            torch.full_like(p_neo, alpha_tumor),
+            torch.full_like(p_neo, alpha_normal),
+        )
+        pt = torch.clamp(pt, min=1e-6, max=1.0 - 1e-6)
+        focal_weight = alpha_matrix * torch.pow(1.0 - pt, self.gamma)
 
-        # 3. 计算自监督概率损失 (矩阵级掩膜计算)
         pixel_bce_loss = F.binary_cross_entropy(p_neo, pseudo_target, reduction='none')
-        # 只在有细胞核的地方计算平均损失
-        loss_prob_per_sample = (pixel_bce_loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
+        pixel_focal_loss = focal_weight * pixel_bce_loss
+        loss_prob_per_sample = (pixel_focal_loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
         loss_prob = loss_prob_per_sample.mean()
 
-        # 4. 计算自监督熵损失 (矩阵级掩膜计算)
+        # 4. 熵损失
         entropy_matrix = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
-        # 只要求网络对细胞核区域的判断确信，不干涉背景的熵
         entropy_per_sample = (entropy_matrix * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
         loss_entropy = entropy_per_sample.mean()
 
-        # 5. 计算用于监控的全局平均置信度 (不参与反向传播)
+        # 5. 监控置信度
         with torch.no_grad():
             avg_conf_per_sample = (p_neo * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
             avg_conf = avg_conf_per_sample.mean()
