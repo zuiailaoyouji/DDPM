@@ -191,23 +191,25 @@ def train(
             
             # 7. 计算 MSE Loss (基础重建能力)
             loss_mse = F.mse_loss(noise_pred, noise)
-            
-            # 关键修改: 总是计算增强图 x0_pred 以便监控 L1
-            # 即使在阶段一 (无反馈)，我们也想看看模型生成的图和原图差多少
+
+            # 关键修改: 计算带梯度的 x0_pred_train，用于图像保真 & TV 损失
+            if feedback_criterion is not None:
+                x0_pred_train = feedback_criterion.predict_x0_from_noise(noisy_images, noise_pred, timesteps)
+            else:
+                device_img = noisy_images.device
+                dtype_img = noisy_images.dtype
+                alpha_prod_t = scheduler.alphas_cumprod.to(device_img)[timesteps].to(dtype_img).view(-1, 1, 1, 1)
+                beta_prod_t = 1 - alpha_prod_t
+                x0_pred_train = (noisy_images - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
+                x0_pred_train = torch.clamp(x0_pred_train, 0.0, 1.0)
+
+            # 图像保真损失（参与反向传播）
+            loss_img = F.l1_loss(x0_pred_train, clean_images)
+
+            # 日志与可视化用：detach 版本
             with torch.no_grad():
-                if feedback_criterion is not None:
-                    x0_pred = feedback_criterion.predict_x0_from_noise(noisy_images, noise_pred, timesteps)
-                else:
-                    # 如果没有 feedback_criterion，手动计算 x0_pred（用于可视化）
-                    device_img = noisy_images.device
-                    dtype_img = noisy_images.dtype
-                    # 先把 alphas_cumprod 移动到 device，然后再用 timesteps 去取值
-                    # 这样可以避免设备不匹配的问题（timesteps 在 GPU，alphas_cumprod 在 CPU）
-                    alpha_prod_t = scheduler.alphas_cumprod.to(device_img)[timesteps].to(dtype_img).view(-1, 1, 1, 1)
-                    beta_prod_t = 1 - alpha_prod_t
-                    x0_pred = (noisy_images - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
-                l1_diff = F.l1_loss(x0_pred, clean_images)
+                l1_diff = loss_img.detach()
+                x0_pred = x0_pred_train.detach()
             
             # 8. 计算反馈 Loss（使用 Focal Loss 和原图引导）
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
@@ -222,13 +224,12 @@ def train(
             
             # 9. 总 Loss
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                # 第二阶段：在结构稳定基础上，弱化 MSE，重点用语义 + 图像保真 + TV 进行精修
+                # 第二阶段：在结构稳定基础上，弱化 MSE，重点用语义 + 图像保真 + TV(残差) 进行精修
                 lambda_mse = 0.2
-                lambda_prob = 0.05
+                lambda_prob = 0.02
                 lambda_img = 1.0
                 lambda_tv = 1e-5
-                loss_img = l1_diff  # 与 clean_images 的 L1 差异
-                loss_tv = tv_loss(x0_pred)
+                loss_tv = tv_loss(x0_pred_train - clean_images)
                 loss_total = (
                     lambda_mse * loss_mse
                     + lambda_prob * loss_prob
