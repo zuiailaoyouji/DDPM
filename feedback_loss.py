@@ -1,5 +1,6 @@
 """
-反馈损失模块：像素级概率转为细胞级概率，避免单个 noisy pixel 主导训练。
+反馈损失模块：cell-level 自适应 directional enhancement。
+不依赖 patch label；每个 cell 按分数自适应增强方向（高分→tumor，低分→normal），高置信 cell 保持。
 """
 import torch
 import torch.nn as nn
@@ -9,12 +10,21 @@ from skimage.measure import label
 
 
 class FeedbackLoss(nn.Module):
-    def __init__(self, hovernet, scheduler, np_thresh=0.5, min_cell_pixels=8):
+    """
+    纯 cell-level 自适应 directional enhancement 版本
+    - 不依赖 patch label
+    - 每个 cell 自适应增强方向：高分往 tumor 方向，低分往 normal 方向
+    - 高置信 cell 保持不动，delta 控制增强幅度
+    """
+    def __init__(self, hovernet, scheduler, np_thresh=0.5, min_cell_pixels=8, delta=0.08, low=0.3, high=0.7):
         super().__init__()
         self.hovernet = hovernet
         self.scheduler = scheduler
         self.np_thresh = np_thresh
         self.min_cell_pixels = min_cell_pixels
+        self.delta = delta
+        self.low = low
+        self.high = high
 
         # 冻结 HoVer-Net 参数
         for p in self.hovernet.parameters():
@@ -22,9 +32,7 @@ class FeedbackLoss(nn.Module):
         self.hovernet.eval()
 
     def predict_x0_from_noise(self, x_t, noise_pred, t):
-        """
-        用 Tweedie 公式从 x_t 和预测噪声恢复 x0
-        """
+        """Tweedie公式预测x0"""
         device = x_t.device
         dtype = x_t.dtype
 
@@ -87,30 +95,54 @@ class FeedbackLoss(nn.Module):
 
         return kept_ids, torch.stack(scores, dim=0)
 
+    def build_cell_targets(self, clean_scores):
+        """
+        基于 cell-level clean score 自适应 directional target
+        - 高分 → tumor 强化
+        - 低分 → normal 强化
+        - 高置信 cell 保持
+        """
+        target_scores = clean_scores.clone()
+        enhance_mask = torch.zeros_like(clean_scores, dtype=torch.bool)
+        preserve_mask = torch.zeros_like(clean_scores, dtype=torch.bool)
+
+        # tumor-like cells
+        tumor_like = clean_scores >= self.high
+        # normal-like cells
+        normal_like = clean_scores <= self.low
+        # uncertain cells
+        uncertain = (~tumor_like) & (~normal_like)
+
+        # 高分 cell 往 tumor 方向微增强
+        target_scores[tumor_like] = torch.clamp(clean_scores[tumor_like] + self.delta, 0.0, 1.0)
+        enhance_mask[tumor_like] = True
+
+        # 低分 cell 往 normal 方向微增强
+        target_scores[normal_like] = torch.clamp(clean_scores[normal_like] - self.delta, 0.0, 1.0)
+        enhance_mask[normal_like] = True
+
+        # 保持 uncertain cell
+        preserve_mask[uncertain] = True
+
+        return target_scores, enhance_mask, preserve_mask
+
     def forward(self, x_t, noise_pred, t, clean_images):
         """
-        像素级 -> 细胞级 的控制变量版本。
-        在原图上用 HoVer-Net + 连通域得到 cell instance + cell-level pseudo target，
-        在预测图上再按 cell 聚合概率，做 cell-level BCE。
-
-        Returns:
-            loss_prob: 细胞级 BCE 损失
-            loss_entropy: 目前固定返回 0（占位）
-            avg_tumor_conf: 癌细胞平均置信度（无该类时为 -1.0）
-            avg_normal_conf: 正常细胞平均置信度（无该类时为 -1.0）
+        Args:
+            x_t: [B,C,H,W] noisy input
+            noise_pred: [B,C,H,W] predicted noise
+            t: [B] timestep
+            clean_images: [B,C,H,W] clean reference
         """
-        # 1) 预测 x0_hat
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
-        hovernet_device = next(self.hovernet.parameters()).device
 
+        hovernet_device = next(self.hovernet.parameters()).device
         x0_input = x0_hat.to(hovernet_device)
         clean_input = clean_images.to(hovernet_device)
-
-        # HoVer-Net 输入 0~255
         x0_input = x0_input * 255.0
         clean_input = clean_input * 255.0
 
-        # 2) clean 侧：构造 cell instance + cell-level pseudo target
+        # 1) clean侧生成 cell-level pseudo target
         with torch.no_grad():
             clean_output = self.hovernet(clean_input)
             clean_tp_probs = torch.softmax(clean_output["tp"], dim=1)   # [B, C_tp, H, W]
@@ -120,42 +152,42 @@ class FeedbackLoss(nn.Module):
             clean_np_fg = clean_np_probs[:, 1, :, :]   # [B, H, W]
 
             instance_maps = []
-            clean_cell_targets = []
+            cell_targets_list = []
+            cell_scores_list = []
 
             B = clean_p_neo.shape[0]
             for b in range(B):
-                np_prob_np = clean_np_fg[b].detach().cpu().numpy()
-                inst_map = self.build_instance_map_from_np(np_prob_np)
+                np_map_np = clean_np_fg[b].detach().cpu().numpy()
+                inst_map = self.build_instance_map_from_np(np_map_np)
                 instance_maps.append(inst_map)
 
                 cell_ids, clean_scores = self.aggregate_cell_scores(clean_p_neo[b], inst_map)
                 if clean_scores is None or len(cell_ids) == 0:
-                    clean_cell_targets.append(None)
+                    cell_targets_list.append(None)
+                    cell_scores_list.append(None)
                     continue
 
-                # 控制变量：沿用原本 0.5 阈值，只是从 pixel 改成 cell
-                cell_targets = clean_scores.detach()
-
-                clean_cell_targets.append({
+                target_scores, enhance_mask, preserve_mask = self.build_cell_targets(clean_scores)
+                cell_targets_list.append({
                     "cell_ids": cell_ids,
-                    "targets": cell_targets,
+                    "target_scores": target_scores,
+                    "enhance_mask": enhance_mask,
+                    "preserve_mask": preserve_mask,
                 })
+                cell_scores_list.append(clean_scores)
 
-        # 3) pred 侧：得到 pred_p_neo
+        # 2) pred侧
         output = self.hovernet(x0_input)
         probs = torch.softmax(output["tp"], dim=1)
         p_neo = probs[:, 1, :, :]   # [B, H, W]
 
-        # 4) 细胞级 loss_prob
         total_loss = 0.0
         valid_count = 0
-
         tumor_conf_list = []
         normal_conf_list = []
 
-        B = p_neo.shape[0]
         for b in range(B):
-            info = clean_cell_targets[b]
+            info = cell_targets_list[b]
             if info is None:
                 continue
 
@@ -163,30 +195,35 @@ class FeedbackLoss(nn.Module):
             cell_ids_pred, pred_scores = self.aggregate_cell_scores(p_neo[b], inst_map)
             if pred_scores is None or len(cell_ids_pred) == 0:
                 continue
-
-            # 同一个 inst_map 下，cell_ids 顺序理论上应一致
             if len(cell_ids_pred) != len(info["cell_ids"]):
                 continue
 
-            cell_targets = info["targets"].to(pred_scores.device)
+            # cell-level directional enhancement loss
+            target_scores = info["target_scores"].to(pred_scores.device)
+            enhance_mask = info["enhance_mask"].to(pred_scores.device)
+            preserve_mask = info["preserve_mask"].to(pred_scores.device)
 
-            # cell-level BCE
-            loss_b = F.binary_cross_entropy(
-                pred_scores.clamp(1e-6, 1 - 1e-6),
-                cell_targets,
-                reduction="mean",
-            )
+            loss_b = 0.0
+            count = 0
 
-            total_loss = total_loss + loss_b
-            valid_count += 1
+            if enhance_mask.sum() > 0:
+                loss_enh = F.smooth_l1_loss(pred_scores[enhance_mask], target_scores[enhance_mask], reduction='mean')
+                loss_b += loss_enh
+                count += 1
+            if preserve_mask.sum() > 0:
+                loss_pres = F.smooth_l1_loss(pred_scores[preserve_mask], target_scores[preserve_mask], reduction='mean')
+                loss_b += 0.5 * loss_pres
+                count += 1
+            if count > 0:
+                loss_b = loss_b / count
+                total_loss += loss_b
+                valid_count += 1
 
-            # 监控：仍然按 cell-level pseudo target 分成 tumor/normal cells 统计
-            tumor_mask = (cell_targets > 0.5)
+            # 监控 tumor/normal confidence
+            tumor_mask = pred_scores > 0.5
             normal_mask = ~tumor_mask
-
             if tumor_mask.sum() > 0:
                 tumor_conf_list.append(pred_scores[tumor_mask].mean())
-
             if normal_mask.sum() > 0:
                 normal_conf_list.append(pred_scores[normal_mask].mean())
 
@@ -196,19 +233,9 @@ class FeedbackLoss(nn.Module):
             return zero, zero, neg_one, neg_one
 
         loss_prob = total_loss / valid_count
-
-        # entropy 先保持接口不变，返回 0（控制变量）
         loss_entropy = torch.tensor(0.0, device=x_t.device)
 
-        if len(tumor_conf_list) > 0:
-            avg_tumor_conf = torch.stack(tumor_conf_list).mean()
-        else:
-            avg_tumor_conf = torch.tensor(-1.0, device=x_t.device)
-
-        if len(normal_conf_list) > 0:
-            avg_normal_conf = torch.stack(normal_conf_list).mean()
-        else:
-            avg_normal_conf = torch.tensor(-1.0, device=x_t.device)
+        avg_tumor_conf = torch.stack(tumor_conf_list).mean() if len(tumor_conf_list) > 0 else torch.tensor(-1.0, device=x_t.device)
+        avg_normal_conf = torch.stack(normal_conf_list).mean() if len(normal_conf_list) > 0 else torch.tensor(-1.0, device=x_t.device)
 
         return loss_prob, loss_entropy, avg_tumor_conf, avg_normal_conf
-
