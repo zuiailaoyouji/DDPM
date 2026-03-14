@@ -144,9 +144,21 @@ class FeedbackLoss(nn.Module):
         loss_prob_per_sample = (pixel_focal_loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
         loss_prob = loss_prob_per_sample.mean()
 
-        # 4. 熵损失
+        # =========================================================
+        # 4. 熵损失 (修改为定向熵损失 Masked Entropy Loss)
+        # =========================================================
         entropy_matrix = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
-        entropy_per_sample = (entropy_matrix * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)
+
+        # 找出当前预测方向正确的细胞核像素
+        # (预测为阳性且标签为阳性) 或 (预测为阴性且标签为阴性)
+        with torch.no_grad():
+            correct_direction = ((p_neo >= 0.5) == (pseudo_target == 1.0)).float()
+
+        # 将原有的细胞核 mask 乘以正确方向的 mask
+        effective_mask = mask * correct_direction
+
+        # 仅对方向正确的区域计算熵损失
+        entropy_per_sample = (entropy_matrix * effective_mask).sum(dim=(1, 2)) / (effective_mask.sum(dim=(1, 2)) + 1e-6)
         loss_entropy = entropy_per_sample.mean()
 
         # 5. 计算用于监控的分类别平均置信度 (不参与反向传播)
