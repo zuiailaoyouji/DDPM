@@ -109,9 +109,18 @@ class FeedbackLoss(nn.Module):
 
             tumor_cells = (pseudo_target * mask).sum()
             normal_cells = total_cells - tumor_cells
-            # 反比权重：数量越少，权重越大
-            alpha_tumor = (normal_cells / total_cells).item()
-            alpha_normal = (tumor_cells / total_cells).item()
+
+            # ====================================================
+            # 引入平滑项 epsilon 进行反比例计算
+            # 设定 epsilon 为总细胞数的 10%，作为两类的“基础先验数量”
+            # 这样既保留了反比例动态加权的特性，又彻底杜绝了权重为 0 的情况
+            # ====================================================
+            epsilon = 0.1 * total_cells
+            smoothed_total = total_cells + 2.0 * epsilon
+
+            # 带平滑项的反比权重计算
+            alpha_tumor = ((normal_cells + epsilon) / smoothed_total).item()
+            alpha_normal = ((tumor_cells + epsilon) / smoothed_total).item()
 
         # 3. 对预测的 x0_hat 进行 HoVer-Net 推理（需要梯度）
         output = self.hovernet(x0_input)
