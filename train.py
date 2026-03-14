@@ -40,6 +40,8 @@ def train(
     logger=None,
     val_vis_dir=None,  # 验证集目录（用于固定可视化）
     accumulation_steps=1,  # 梯度累积步数，等效 batch = batch_size * accumulation_steps
+    alpha_tumor=0.2559,   # 全局癌细胞静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）
+    alpha_normal=0.7441,   # 全局正常细胞静态 Focal Loss 权重
 ):
     """
     训练 DDPM 模型
@@ -60,6 +62,8 @@ def train(
         logger: 日志记录器（可选）
         val_vis_dir: 验证集目录（用于固定可视化），应包含 TUM 和 NORM 子目录（可选）
         accumulation_steps: 梯度累积步数，等效有效 batch = batch_size * accumulation_steps，不增加显存
+        alpha_tumor: 癌细胞的全局静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）
+        alpha_normal: 正常细胞的全局静态 Focal Loss 权重
     """
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
@@ -84,7 +88,12 @@ def train(
     
     # 初始化反馈损失（仅在 hovernet 可用时）
     if hovernet is not None:
-        feedback_criterion = FeedbackLoss(hovernet, scheduler).to(device)
+        feedback_criterion = FeedbackLoss(
+            hovernet,
+            scheduler,
+            alpha_tumor=alpha_tumor,
+            alpha_normal=alpha_normal,
+        ).to(device)
         print("运行模式：带反馈损失的 DDPM 训练")
     else:
         feedback_criterion = None
@@ -455,6 +464,8 @@ def main():
     parser.add_argument('--exp_name', type=str, default=None, help='实验名称（用于区分不同次运行），默认为时间戳')
     parser.add_argument('--val_vis_dir', type=str, default=None, help='验证集目录（用于固定可视化），应包含 tumor 和 normal 子目录')
     parser.add_argument('--accumulation_steps', type=int, default=1, help='梯度累积步数，等效 batch = batch_size * accumulation_steps（默认 1 即不累积）')
+    parser.add_argument('--alpha_tumor', type=float, default=0.2559, help='全局癌细胞静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）')
+    parser.add_argument('--alpha_normal', type=float, default=0.7441, help='全局正常细胞静态 Focal Loss 权重')
 
     args = parser.parse_args()
     
@@ -515,6 +526,8 @@ def main():
         logger=logger,
         val_vis_dir=args.val_vis_dir,
         accumulation_steps=args.accumulation_steps,
+        alpha_tumor=args.alpha_tumor,
+        alpha_normal=args.alpha_normal,
     )
 
 

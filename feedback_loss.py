@@ -1,6 +1,6 @@
 """
 反馈损失模块
-核心改变：实现从 ε 还原 x0 的数学公式，并确保梯度链不断
+核心改变：引入全局静态 Alpha 权重解决单类切片梯度坍塌，引入定向熵损失压制异常反弹
 """
 import torch
 import torch.nn as nn
@@ -10,19 +10,23 @@ import torch.nn.functional as F
 class FeedbackLoss(nn.Module):
     """
     反馈损失：利用 HoVer-Net 的分类结果来引导去噪过程；
-    使用原图生成伪标签，并采用动态 Focal Loss。
+    使用原图生成伪标签，并采用静态 Focal Loss 和定向熵损失。
     """
-    def __init__(self, hovernet, noise_scheduler, gamma=2.0):
+    def __init__(self, hovernet, noise_scheduler, gamma=2.0, alpha_tumor=0.2559, alpha_normal=0.7441):
         """
         Args:
             hovernet: HoVer-Net 模型，需要冻结参数
-            noise_scheduler: DDPM 噪声调度器，需要用它的 alpha 参数来还原 x0
+            noise_scheduler: DDPM 噪声调度器
             gamma: Focal Loss 的聚焦参数，默认 2.0
+            alpha_tumor: 癌细胞的全局静态权重 (推荐值: 0.2559)
+            alpha_normal: 正常细胞的全局静态权重 (推荐值: 0.7441)
         """
         super().__init__()
         self.hovernet = hovernet
         self.scheduler = noise_scheduler
         self.gamma = gamma
+        self.alpha_tumor = alpha_tumor
+        self.alpha_normal = alpha_normal
 
         # 冻结 HoVer-Net 参数
         for param in self.hovernet.parameters():
@@ -90,7 +94,7 @@ class FeedbackLoss(nn.Module):
         clean_input = clean_images.to(hovernet_device) if clean_images.device != hovernet_device else clean_images
         clean_input = clean_input * 255.0
 
-        # 2. 生成原图的伪标签（无需梯度）并计算动态 alpha
+        # 2. 生成原图的伪标签（无需梯度）
         with torch.no_grad():
             clean_output = self.hovernet(clean_input)
             clean_probs = torch.softmax(clean_output['tp'], dim=1)
@@ -99,6 +103,7 @@ class FeedbackLoss(nn.Module):
             pseudo_target = (clean_p_neo >= 0.5).float()
 
             total_cells = mask.sum()
+            # 如果整张图没有任何细胞，直接返回 0
             if total_cells < 1:
                 return (
                     torch.tensor(0.0, device=x_t.device),
@@ -107,20 +112,7 @@ class FeedbackLoss(nn.Module):
                     torch.tensor(-1.0, device=x_t.device),
                 )
 
-            tumor_cells = (pseudo_target * mask).sum()
-            normal_cells = total_cells - tumor_cells
-
-            # ====================================================
-            # 引入平滑项 epsilon 进行反比例计算
-            # 设定 epsilon 为总细胞数的 10%，作为两类的“基础先验数量”
-            # 这样既保留了反比例动态加权的特性，又彻底杜绝了权重为 0 的情况
-            # ====================================================
-            epsilon = 0.1 * total_cells
-            smoothed_total = total_cells + 2.0 * epsilon
-
-            # 带平滑项的反比权重计算
-            alpha_tumor = ((normal_cells + epsilon) / smoothed_total).item()
-            alpha_normal = ((tumor_cells + epsilon) / smoothed_total).item()
+            # 注意：已删除原有的动态 alpha_tumor 和 alpha_normal 计算逻辑
 
         # 3. 对预测的 x0_hat 进行 HoVer-Net 推理（需要梯度）
         output = self.hovernet(x0_input)
@@ -131,11 +123,14 @@ class FeedbackLoss(nn.Module):
         # Focal Loss: FL = -alpha * (1 - pt)^gamma * log(pt)
         # =========================================================
         pt = torch.where(pseudo_target == 1.0, p_neo, 1.0 - p_neo)
+
+        # 核心修改：直接使用初始化时传入的静态参数
         alpha_matrix = torch.where(
             pseudo_target == 1.0,
-            torch.full_like(p_neo, alpha_tumor),
-            torch.full_like(p_neo, alpha_normal),
+            torch.full_like(p_neo, self.alpha_tumor),
+            torch.full_like(p_neo, self.alpha_normal),
         )
+
         pt = torch.clamp(pt, min=1e-6, max=1.0 - 1e-6)
         focal_weight = alpha_matrix * torch.pow(1.0 - pt, self.gamma)
 
