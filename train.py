@@ -81,7 +81,7 @@ def train(
         writer = csv.writer(f)
         if csv_mode == 'w':
             # 写入表头：增加了 TUM_Conf, NORM_Conf, L1_Diff
-            writer.writerow(['Epoch', 'Total_Loss', 'MSE', 'Prob_Loss', 'Entropy', 'Tumor_Conf', 'Normal_Conf', 'Conf_Gap', 'L1_Diff'])
+            writer.writerow(['Epoch', 'Total_Loss', 'MSE', 'Prob_Loss', 'Entropy', 'TV_Loss', 'Tumor_Conf', 'Normal_Conf', 'Conf_Gap', 'L1_Diff'])
     
     # 1. 初始化模型和调度器
     print("初始化模型...")
@@ -350,7 +350,7 @@ def train(
         with open(log_path, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                epoch+1, avg_loss, avg_mse, avg_prob, avg_entropy,
+                epoch+1, avg_loss, avg_mse, avg_prob, avg_entropy, avg_tv,
                 avg_tumor_conf, avg_normal_conf, avg_conf_gap, avg_l1
             ])
 
@@ -361,7 +361,7 @@ def train(
             unet.eval()
             print(f"\n--- 开始 Epoch {epoch+1} 验证集评估 ---")
 
-            val_acc = {'mse': 0.0, 'prob': 0.0, 'entropy': 0.0}
+            val_acc = {'mse': 0.0, 'prob': 0.0, 'entropy': 0.0, 'tv': 0.0}
             val_tumor_conf_sum = 0.0
             val_tumor_conf_count = 0
             val_normal_conf_sum = 0.0
@@ -389,6 +389,7 @@ def train(
                         )
                         val_acc['prob'] += val_loss_prob.item() if isinstance(val_loss_prob, torch.Tensor) else val_loss_prob
                         val_acc['entropy'] += val_loss_entropy.item() if isinstance(val_loss_entropy, torch.Tensor) else val_loss_entropy
+                        val_acc['tv'] += val_loss_tv.item() if isinstance(val_loss_tv, torch.Tensor) else val_loss_tv
 
                         v_t_conf_val = val_t_conf.item() if isinstance(val_t_conf, torch.Tensor) else val_t_conf
                         v_n_conf_val = val_n_conf.item() if isinstance(val_n_conf, torch.Tensor) else val_n_conf
@@ -406,11 +407,12 @@ def train(
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
                 val_avg_prob = val_acc['prob'] / val_steps
                 val_avg_entropy = val_acc['entropy'] / val_steps
+                val_avg_tv = val_acc['tv'] / val_steps
                 val_avg_tumor_conf = val_tumor_conf_sum / val_tumor_conf_count if val_tumor_conf_count > 0 else 0.0
                 val_avg_normal_conf = val_normal_conf_sum / val_normal_conf_count if val_normal_conf_count > 0 else 0.0
                 val_avg_conf_gap = val_avg_tumor_conf - val_avg_normal_conf
 
-                print(f"  [Val] Focal Loss: {val_avg_prob:.4f} | Entropy Loss: {val_avg_entropy:.4f}")
+                print(f"  [Val] Focal Loss: {val_avg_prob:.4f} | Entropy Loss: {val_avg_entropy:.4f} | TV Loss: {val_avg_tv:.4f}")
                 print(f"  [Val] Tumor Conf: {val_avg_tumor_conf:.4f}")
                 print(f"  [Val] Normal Conf: {val_avg_normal_conf:.4f}")
                 print(f"  [Val] Conf Gap: {val_avg_conf_gap:.4f}")
@@ -420,6 +422,7 @@ def train(
                         "MSE_Loss": val_avg_mse,
                         "Prob_Loss": val_avg_prob,
                         "Entropy_Loss": val_avg_entropy,
+                        "TV_Loss": val_avg_tv,
                         "Tumor_Conf": val_avg_tumor_conf,
                         "Normal_Conf": val_avg_normal_conf,
                         "Conf_Gap": val_avg_conf_gap,
