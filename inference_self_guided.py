@@ -565,8 +565,9 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                 break
             total_iters_done = i + 1
 
-            # 3.1 DDPM 去噪
-            t_tensor = torch.tensor([args.noise_t], device=device).long().expand(B)
+            # 3.1 DDPM 去噪（退火式步长衰减：随迭代减弱加噪强度，保护已重塑细节）
+            current_noise_t = max(20, int(args.noise_t * (0.7 ** i)))
+            t_tensor = torch.tensor([current_noise_t], device=device).long().expand(B)
             noise = torch.randn_like(current_tensor)
             x_t = scheduler.add_noise(current_tensor, noise, t_tensor)
             model_input = torch.cat([current_tensor, x_t], dim=1)
