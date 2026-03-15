@@ -189,27 +189,35 @@ class FeedbackLoss(nn.Module):
                 avg_normal_conf = torch.tensor(-1.0, device=p_neo.device)
 
         # =========================================================
-        # 6. 相对 TV Loss (Relative Total Variation)
-        # 允许保留自然生物学纹理，仅惩罚超出原图复杂度的高频对抗噪点
+        # 6. 软截断相对 TV Loss (Dual-Slope / Leaky Relative TV)
+        # 消除 0 梯度死区，保持全域连续的微弱平滑压力，逼迫特征显化
         # =========================================================
         def calc_tv(img):
-            # 计算每张图片的 TV 值
             diff_h = torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :])
             diff_w = torch.abs(img[:, :, :, 1:] - img[:, :, :, :-1])
-            # 注意：这里在空间维度上求均值，保留 batch 维度
             return diff_h.mean(dim=(1, 2, 3)) + diff_w.mean(dim=(1, 2, 3))
 
-        # 计算生成图像的 TV
         tv_hat = calc_tv(x0_input)
 
-        # 计算原始干净图像的自然 TV (不参与反向传播)
         with torch.no_grad():
             tv_clean = calc_tv(clean_input)
 
-        # 核心逻辑：引入相对松弛边界 (Margin)
-        # 允许生成的图像 TV 值比原图高出 5% (1.05)，给特征强化留出轻微空间
-        # 只有超出这个自然边界的“作弊噪点”才会被狠狠惩罚
-        loss_tv = F.relu(tv_hat - tv_clean * 1.05).mean()
+        margin = tv_clean * 1.05
+
+        # 核心逻辑：软截断 (Leaky Margin)
+        # 设定容忍区内的微弱惩罚系数 alpha
+        alpha = 0.1
+
+        # 使用 torch.where 实现双斜率惩罚
+        # 如果 tv_hat <= margin: 给予极弱的惩罚 alpha * tv_hat
+        # 如果 tv_hat > margin: 弱惩罚打底，超出部分给予 1.0 的强惩罚
+        loss_tv_batch = torch.where(
+            tv_hat <= margin,
+            alpha * tv_hat,
+            alpha * margin + (tv_hat - margin)
+        )
+
+        loss_tv = loss_tv_batch.mean()
 
         return loss_prob, loss_entropy, avg_tumor_conf, avg_normal_conf, loss_tv
 
