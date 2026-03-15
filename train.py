@@ -42,6 +42,7 @@ def train(
     accumulation_steps=1,  # 梯度累积步数，等效 batch = batch_size * accumulation_steps
     alpha_tumor=0.2559,   # 全局癌细胞静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）
     alpha_normal=0.7441,   # 全局正常细胞静态 Focal Loss 权重
+    tv_weight=0.0015,     # TV 全变分损失权重，压制高频噪点
 ):
     """
     训练 DDPM 模型
@@ -64,6 +65,7 @@ def train(
         accumulation_steps: 梯度累积步数，等效有效 batch = batch_size * accumulation_steps，不增加显存
         alpha_tumor: 癌细胞的全局静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）
         alpha_normal: 正常细胞的全局静态 Focal Loss 权重
+        tv_weight: TV 全变分损失权重，压制高频噪点
     """
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
@@ -149,7 +151,7 @@ def train(
         
         # 初始化累加器
         acc = {
-            'loss': 0.0, 'mse': 0.0, 'prob': 0.0, 'entropy': 0.0, 'l1': 0.0
+            'loss': 0.0, 'mse': 0.0, 'prob': 0.0, 'entropy': 0.0, 'tv': 0.0, 'l1': 0.0
         }
         tumor_conf_sum = 0.0
         tumor_conf_count = 0
@@ -207,7 +209,7 @@ def train(
             
             # 8. 计算反馈 Loss（使用 Focal Loss 和原图引导）
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                loss_prob, loss_entropy, tumor_conf, normal_conf = feedback_criterion(
+                loss_prob, loss_entropy, tumor_conf, normal_conf, loss_tv = feedback_criterion(
                     noisy_images, noise_pred, timesteps, clean_images
                 )
             else:
@@ -215,10 +217,16 @@ def train(
                 loss_entropy = torch.tensor(0.0, device=device)
                 tumor_conf = torch.tensor(-1.0, device=device)
                 normal_conf = torch.tensor(-1.0, device=device)
-            
-            # 9. 总 Loss
+                loss_tv = torch.tensor(0.0, device=device)
+
+            # 9. 总 Loss（含 TV Loss，压制高频噪点）
             if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                loss_total = loss_mse + feedback_weight_prob * loss_prob + feedback_weight_entropy * loss_entropy
+                loss_total = (
+                    loss_mse
+                    + feedback_weight_prob * loss_prob
+                    + feedback_weight_entropy * loss_entropy
+                    + tv_weight * loss_tv
+                )
             else:
                 loss_total = loss_mse
 
@@ -236,6 +244,7 @@ def train(
             acc['mse'] += loss_mse.item()
             acc['prob'] += loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob
             acc['entropy'] += loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy
+            acc['tv'] += loss_tv.item() if isinstance(loss_tv, torch.Tensor) else loss_tv
             acc['l1'] += l1_diff.item()
 
             t_conf_val = tumor_conf.item() if isinstance(tumor_conf, torch.Tensor) else tumor_conf
@@ -254,6 +263,7 @@ def train(
                     "MSE_Loss": loss_mse.item(),
                     "Prob_Loss": loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob,
                     "Entropy_Loss": loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy,
+                    "TV_Loss": loss_tv.item() if isinstance(loss_tv, torch.Tensor) else loss_tv,
                     "L1_Diff": l1_diff.item(),
                 }
                 if t_conf_val >= 0:
@@ -303,6 +313,7 @@ def train(
         avg_mse = acc['mse'] / len(dataloader)
         avg_prob = acc['prob'] / len(dataloader)
         avg_entropy = acc['entropy'] / len(dataloader)
+        avg_tv = acc['tv'] / len(dataloader)
         avg_l1 = acc['l1'] / len(dataloader)
         avg_tumor_conf = tumor_conf_sum / tumor_conf_count if tumor_conf_count > 0 else 0.0
         avg_normal_conf = normal_conf_sum / normal_conf_count if normal_conf_count > 0 else 0.0
@@ -316,6 +327,7 @@ def train(
         print(f"  癌细胞平均置信度 (应趋向1): {avg_tumor_conf:.4f}")
         print(f"  正常细胞平均置信度 (应趋向0): {avg_normal_conf:.4f}")
         print(f"  类别区分度 Gap (应趋向1): {avg_conf_gap:.4f}")
+        print(f"  平均TV损失: {avg_tv:.4f}")
         print(f"  L1修改幅度: {avg_l1:.4f}")
 
         # 记录 Epoch 级别的指标到 TensorBoard
@@ -325,6 +337,7 @@ def train(
                 "MSE_Loss": avg_mse,
                 "Prob_Loss": avg_prob,
                 "Entropy_Loss": avg_entropy,
+                "TV_Loss": avg_tv,
                 "Tumor_Conf": avg_tumor_conf,
                 "Normal_Conf": avg_normal_conf,
                 "Conf_Gap": avg_conf_gap,
@@ -371,7 +384,7 @@ def train(
                     val_acc['mse'] += val_loss_mse.item()
 
                     if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                        val_loss_prob, val_loss_entropy, val_t_conf, val_n_conf = feedback_criterion(
+                        val_loss_prob, val_loss_entropy, val_t_conf, val_n_conf, val_loss_tv = feedback_criterion(
                             val_noisy_images, val_noise_pred, val_timesteps, val_clean_images
                         )
                         val_acc['prob'] += val_loss_prob.item() if isinstance(val_loss_prob, torch.Tensor) else val_loss_prob
@@ -466,6 +479,7 @@ def main():
     parser.add_argument('--accumulation_steps', type=int, default=1, help='梯度累积步数，等效 batch = batch_size * accumulation_steps（默认 1 即不累积）')
     parser.add_argument('--alpha_tumor', type=float, default=0.2559, help='全局癌细胞静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）')
     parser.add_argument('--alpha_normal', type=float, default=0.7441, help='全局正常细胞静态 Focal Loss 权重')
+    parser.add_argument('--tv_weight', type=float, default=0.0015, help='TV 全变分损失权重，压制高频噪点（推荐 0.001～0.002）')
 
     args = parser.parse_args()
     
@@ -528,6 +542,7 @@ def main():
         accumulation_steps=args.accumulation_steps,
         alpha_tumor=args.alpha_tumor,
         alpha_normal=args.alpha_normal,
+        tv_weight=args.tv_weight,
     )
 
 

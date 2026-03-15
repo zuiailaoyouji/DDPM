@@ -83,6 +83,7 @@ class FeedbackLoss(nn.Module):
             loss_entropy: 熵损失
             avg_tumor_conf: 原图癌细胞区域的 p_neo 平均值（无该类时为 -1.0）
             avg_normal_conf: 原图正常细胞区域的 p_neo 平均值（无该类时为 -1.0）
+            loss_tv: 全变分损失（压制高频噪点）
         """
         # =========================================================
         # 0. 核心修正：时间步截断 (Timestep Cutoff)
@@ -95,7 +96,7 @@ class FeedbackLoss(nn.Module):
         # 如果当前 batch 里所有的图加噪都太深，直接返回 0，跳过反馈计算
         if len(valid_idx) == 0:
             zero = torch.tensor(0.0, device=x_t.device)
-            return zero, zero, torch.tensor(-1.0, device=x_t.device), torch.tensor(-1.0, device=x_t.device)
+            return zero, zero, torch.tensor(-1.0, device=x_t.device), torch.tensor(-1.0, device=x_t.device), zero
 
         # 仅截取有效的样本继续前向传播 (大幅节省 HoVer-Net 推理算力)
         x_t = x_t[valid_idx]
@@ -124,12 +125,8 @@ class FeedbackLoss(nn.Module):
             total_cells = mask.sum()
             # 如果整张图没有任何细胞，直接返回 0
             if total_cells < 1:
-                return (
-                    torch.tensor(0.0, device=x_t.device),
-                    torch.tensor(0.0, device=x_t.device),
-                    torch.tensor(-1.0, device=x_t.device),
-                    torch.tensor(-1.0, device=x_t.device),
-                )
+                zero = torch.tensor(0.0, device=x_t.device)
+                return zero, zero, torch.tensor(-1.0, device=x_t.device), torch.tensor(-1.0, device=x_t.device), zero
 
             # 注意：已删除原有的动态 alpha_tumor 和 alpha_normal 计算逻辑
 
@@ -191,5 +188,12 @@ class FeedbackLoss(nn.Module):
             else:
                 avg_normal_conf = torch.tensor(-1.0, device=p_neo.device)
 
-        return loss_prob, loss_entropy, avg_tumor_conf, avg_normal_conf
+        # =========================================================
+        # 6. 计算 TV Loss (全变分损失) - 专门用于封杀高频噪点
+        # =========================================================
+        diff_h = torch.abs(x0_input[:, :, 1:, :] - x0_input[:, :, :-1, :])
+        diff_w = torch.abs(x0_input[:, :, :, 1:] - x0_input[:, :, :, :-1])
+        loss_tv = diff_h.mean() + diff_w.mean()
+
+        return loss_prob, loss_entropy, avg_tumor_conf, avg_normal_conf, loss_tv
 
