@@ -84,6 +84,25 @@ class FeedbackLoss(nn.Module):
             avg_tumor_conf: 原图癌细胞区域的 p_neo 平均值（无该类时为 -1.0）
             avg_normal_conf: 原图正常细胞区域的 p_neo 平均值（无该类时为 -1.0）
         """
+        # =========================================================
+        # 0. 核心修正：时间步截断 (Timestep Cutoff)
+        # 只在噪声较小 (t < t_max) 时，pred_x0 才具有细胞语义意义，
+        # HoVer-Net 才能给出正确指导，防止高 t 阶段的梯度爆炸。
+        # =========================================================
+        t_max = 400
+        valid_idx = (t < t_max).nonzero(as_tuple=True)[0]
+
+        # 如果当前 batch 里所有的图加噪都太深，直接返回 0，跳过反馈计算
+        if len(valid_idx) == 0:
+            zero = torch.tensor(0.0, device=x_t.device)
+            return zero, zero, torch.tensor(-1.0, device=x_t.device), torch.tensor(-1.0, device=x_t.device)
+
+        # 仅截取有效的样本继续前向传播 (大幅节省 HoVer-Net 推理算力)
+        x_t = x_t[valid_idx]
+        noise_pred = noise_pred[valid_idx]
+        t = t[valid_idx]
+        clean_images = clean_images[valid_idx]
+
         # 1. 获取模型当前预测的 x0_hat
         x0_hat = self.predict_x0_from_noise(x_t, noise_pred, t)
         hovernet_device = next(self.hovernet.parameters()).device
