@@ -1,13 +1,13 @@
 """
-DDPM 自导向分布监控推理脚本 (Batch Inference with Distribution Convergence)
-核心特性：
-1. 自导向推理：完全信任模型 Iter 0 的判断，自动锁定方向。
-2. 双层早停：
-   - 微观：单样本达标即停 (Target Reached)。
-   - 宏观：Batch 分布稳定即停 (Distribution Convergence)。
-3. 实时监控：打印每一轮的 TUM 占比，可视化增强进程。
+DDPM 像素级自导向推理脚本 (Pixel-wise Self-Guided Inference)
+核心工作流（四阶段）：
+1. 状态初始化：原图 → HoVer-Net 得 init_p_neo、cell_mask，pixel_active_mask 全活跃。
+2. 试探与方向锁定 (Iter 0)：盲目去噪 → 读意图 Δ → 像素级锁定 Maximize(0.98) / Minimize(0.02)。
+3. 迭代演化：DDPM 去噪 + 宏观三态/跳变监控 + 像素级微观结算（失真/达标/退化/集体停机）+ 空间状态拼图。
+4. 终态输出：合成“历史最佳”图像，背景自然平滑，日志写入 CSV。
 """
 import torch
+import torch.nn.functional as F
 import cv2
 import numpy as np
 import os
@@ -94,28 +94,122 @@ def get_hovernet_confidence(hovernet, img_tensor):
 
 
 def get_hovernet_confidence_batch(hovernet, img_tensor):
-    """[Batch] 获取肿瘤置信度"""
+    """[Batch] 获取肿瘤置信度（图像级标量）"""
     with torch.no_grad():
-        # 确保输入张量在正确的设备上（与 HoVer-Net 模型一致）
         hovernet_device = next(hovernet.parameters()).device
         if img_tensor.device != hovernet_device:
             img_tensor = img_tensor.to(hovernet_device)
-        
         hover_input = img_tensor * 255.0
         output = hovernet(hover_input)
-        
         probs = torch.softmax(output['tp'], dim=1)
         mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]
         p_neo = probs[:, 1, :, :]
-        
         numerator = (p_neo * mask).sum(dim=(1, 2))
         denominator = mask.sum(dim=(1, 2)) + 1e-6
         avg_probs = numerator / denominator
     return avg_probs
 
 
+def get_hovernet_pixel_maps(hovernet, img_tensor):
+    """
+    获取 HoVer-Net 的像素级肿瘤概率图与细胞核掩膜（用于像素级自导向）。
+    HoVer-Net 输出空间尺寸可能与输入不一致，会插值到与 img_tensor 相同的 (H, W)，保证与后续 pixel_target 等张量维度一致。
+    
+    Args:
+        hovernet: HoVer-Net 模型
+        img_tensor: [B, 3, H, W]，范围 [0, 1]
+    
+    Returns:
+        p_neo: [B, H, W] 肿瘤概率图
+        cell_mask: [B, H, W] 细胞核区域掩膜（软掩膜或二值）
+    """
+    with torch.no_grad():
+        hovernet_device = next(hovernet.parameters()).device
+        if img_tensor.device != hovernet_device:
+            img_tensor = img_tensor.to(hovernet_device)
+        target_h, target_w = img_tensor.shape[2], img_tensor.shape[3]
+        hover_input = img_tensor * 255.0
+        output = hovernet(hover_input)
+        probs = torch.softmax(output['tp'], dim=1)
+        cell_mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # [B, H', W']
+        p_neo = probs[:, 1, :, :]  # [B, H', W']
+        # 若 HoVer-Net 输出尺寸与输入图像不一致，插值到 (H, W)
+        if p_neo.shape[-2] != target_h or p_neo.shape[-1] != target_w:
+            p_neo = F.interpolate(p_neo.unsqueeze(1), size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(1)
+            cell_mask = F.interpolate(cell_mask.unsqueeze(1), size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(1)
+    return p_neo, cell_mask
+
+
 # ==========================================
-# 核心组件：分布收敛监控器 (Distribution Monitor)
+# 宏观分布与跳变监控器 (三态 + 跳变率 + 收敛判定)
+# ==========================================
+
+class MacroDistributionMonitor:
+    """
+    宏观分布监控：三态占比、跨越 0.5 的跳变率、两极稳定即“分布锁死”。
+    """
+    def __init__(self, patience_rounds=3, polar_tolerance=0.005):
+        """
+        Args:
+            patience_rounds: 连续 N 轮两极占比波动 < polar_tolerance 即判定收敛
+            polar_tolerance: 两极占比允许波动（如 0.5%）
+        """
+        self.patience_rounds = patience_rounds
+        self.polar_tolerance = polar_tolerance
+        self.history_normal_ratio = deque(maxlen=patience_rounds + 1)
+        self.history_tumor_ratio = deque(maxlen=patience_rounds + 1)
+
+    def update(self, p_neo, cell_mask):
+        """
+        基于细胞区域像素概率统计三态占比。
+        p_neo: [B, H, W], cell_mask: [B, H, W]
+        """
+        valid = cell_mask > 0.5
+        if valid.sum() == 0:
+            return 0.0, 0.0, 0.0
+        p_flat = p_neo[valid].float()
+        normal_ratio = (p_flat < 0.3).float().mean().item()
+        mid_ratio = ((p_flat >= 0.3) & (p_flat <= 0.7)).float().mean().item()
+        tumor_ratio = (p_flat > 0.7).float().mean().item()
+        self.history_normal_ratio.append(normal_ratio)
+        self.history_tumor_ratio.append(tumor_ratio)
+        return normal_ratio, mid_ratio, tumor_ratio
+
+    def add_polar_ratios(self, normal_ratio, tumor_ratio):
+        """外部已算好两极占比时可直接填入（用于与 update 一致的历史）"""
+        self.history_normal_ratio.append(normal_ratio)
+        self.history_tumor_ratio.append(tumor_ratio)
+
+    def is_distribution_locked(self):
+        """最近 N 轮两极占比波动均小于阈值则判定分布锁死"""
+        if len(self.history_normal_ratio) < self.patience_rounds + 1:
+            return False
+        last_n = self.history_normal_ratio[-1]
+        last_t = self.history_tumor_ratio[-1]
+        for i in range(len(self.history_normal_ratio) - 1):
+            if abs(self.history_normal_ratio[i] - last_n) > self.polar_tolerance:
+                return False
+            if abs(self.history_tumor_ratio[i] - last_t) > self.polar_tolerance:
+                return False
+        return True
+
+
+def compute_jump_rate(init_p_neo, curr_p_neo, cell_mask):
+    """
+    对比 init_p_neo，计算跨越 0.5 中轴线的像素比例（Jump Rate）。
+    init_p_neo, curr_p_neo, cell_mask: [B, H, W]
+    """
+    with torch.no_grad():
+        init_side = (init_p_neo >= 0.5).float()
+        curr_side = (curr_p_neo >= 0.5).float()
+        crossed = (init_side != curr_side).float() * cell_mask
+        total_cell = cell_mask.sum().clamp(min=1e-6)
+        jump_rate = crossed.sum() / total_cell
+    return jump_rate.item()
+
+
+# ==========================================
+# 旧版：图像级分布收敛监控器（保留兼容）
 # ==========================================
 
 class DistributionConvergenceMonitor:
@@ -394,254 +488,163 @@ def save_batch_images(tensors, filenames, output_dir, suffix):
 
 def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
     """
-    自适应方向推理逻辑：
-    1. Iter 0: 观察模型倾向 (Observe Mode)
-    2. Iter 1+: 锁定方向并增强 (Locked Mode)
+    像素级自导向推理（四阶段）：
+    阶段一：状态初始化 → init_p_neo、cell_mask、pixel_active_mask 全活跃
+    阶段二：Iter 0 试探 → 盲目去噪，像素级方向锁定 (Maximize 0.98 / Minimize 0.02)
+    阶段三：Iter 1~Max 迭代 → DDPM 去噪 + 宏观三态/跳变监控 + 像素级微观结算 + 空间拼图
+    阶段四：终态合成 → 输出历史最佳拼图，写 CSV（跳变率、迭代数、三态比例、提升量等）
     """
-    
-    # 初始化 CSV
     csv_path = os.path.join(args.output_dir, 'batch_results.csv')
-    fieldnames = ['Filename', 'Mode', 'Original_Score', 'Best_Score', 'Improvement_Abs', 'Best_Iter', 'Stop_Reason']
+    # 像素级早停下无整图统一 Best_Iter；Total_Iters = 触发集体停机的终态轮次（分布锁死或达最大迭代）
+    fieldnames = [
+        'Filename', 'Original_Score', 'Best_Score', 'Improvement_Abs', 'Stop_Reason',
+        'Jump_Rate', 'Final_Normal_Ratio', 'Final_Mid_Ratio', 'Final_Tumor_Ratio', 'Total_Iters'
+    ]
     if not os.path.exists(csv_path):
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             csv.DictWriter(f, fieldnames=fieldnames).writeheader()
-    
+
     device = args.device
-    
+    max_distortion = getattr(args, 'max_distortion', 0.1)
+    polar_tolerance = getattr(args, 'polar_tolerance', 0.005)
+    macro_patience = getattr(args, 'macro_patience', 3)
+
     for batch_idx, (img_tensors, filenames) in enumerate(tqdm(dataloader, desc="Batch Processing")):
-        
-        # 0. 数据清洗
         valid_indices = [i for i, f in enumerate(filenames) if f != "ERROR"]
-        if not valid_indices: continue
+        if not valid_indices:
+            continue
         img_tensors = img_tensors[valid_indices].to(device)
         filenames = [filenames[i] for i in valid_indices]
-        batch_size = len(filenames)
-        
-        # ==========================================
-        # 状态初始化
-        # ==========================================
-        active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-        current_tensors = img_tensors.clone()
-        best_tensors = img_tensors.clone()
-        
-        # 1. 计算初始分数（基准线）
+        B, C, H, W = img_tensors.shape
+
+        # ========== 阶段一：状态初始化 ==========
+        init_p_neo, cell_mask = get_hovernet_pixel_maps(hovernet, img_tensors)
+        pixel_active_mask = torch.ones(B, H, W, dtype=torch.bool, device=device)
+        original_tensor = img_tensors.clone()
+        current_tensor = img_tensors.clone()
+        best_snapshot = img_tensors.clone()
+        pixel_target = torch.full((B, H, W), 0.5, device=device, dtype=img_tensors.dtype)
+        best_p_neo = init_p_neo.clone()
+        cell_binary = (cell_mask > 0.5).float()
+
+        save_batch_images(img_tensors, filenames, args.output_dir, "original")
         init_confs = get_hovernet_confidence_batch(hovernet, img_tensors)
         best_confs = init_confs.clone()
-        best_iters = torch.zeros(batch_size, dtype=torch.long, device=device)
-        stop_reasons = ["Max_Iters"] * batch_size
-        
-        # 2. 模式初始化：设为 'observe'，表示暂未决定方向
-        # 废弃基于 0.5 阈值的预设模式
-        modes = ['observe'] * batch_size
-        target_goals = torch.zeros(batch_size, device=device)  # 暂时无目标
-        
-        # 初始化分布监控器
-        dist_monitor = DistributionConvergenceMonitor(patience=2)  # 连续 2 轮比例不变即停止
-        
-        # 保存原图
-        save_batch_images(img_tensors, filenames, args.output_dir, "original")
-        
-        print(f"\n--- Batch {batch_idx+1} Start (Size: {batch_size}) ---")
-        
-        # ==========================================
-        # 迭代循环
-        # ==========================================
-        for i in range(args.iters):
-            # 如果所有样本都微观停止了，退出
-            if not active_mask.any():
+        stop_reasons = ["Max_Iters"] * B
+        macro_monitor = MacroDistributionMonitor(patience_rounds=macro_patience, polar_tolerance=polar_tolerance)
+
+        print(f"\n--- Batch {batch_idx+1} (Size: {B}) ---")
+
+        # ========== 阶段二：Iter 0 试探与方向锁定 ==========
+        t_tensor = torch.tensor([args.noise_t], device=device).long().expand(B)
+        noise = torch.randn_like(current_tensor)
+        x_t = scheduler.add_noise(current_tensor, noise, t_tensor)
+        model_input = torch.cat([current_tensor, x_t], dim=1)
+        with torch.no_grad():
+            noise_pred = unet(model_input, t_tensor).sample
+        pred_x0 = predict_x0_from_noise_shared(x_t, noise_pred, t_tensor, scheduler)
+        probe_p_neo, _ = get_hovernet_pixel_maps(hovernet, pred_x0)
+        delta = probe_p_neo - init_p_neo
+        pixel_target = torch.where(cell_binary > 0.5, torch.where(delta >= 0, torch.full_like(delta, 0.98), torch.full_like(delta, 0.02)), pixel_target)
+        current_tensor = pred_x0.clone()
+        best_p_neo = torch.where(cell_binary > 0.5, probe_p_neo, best_p_neo)
+        better_max = (cell_binary > 0.5) & (pixel_target > 0.5) & (probe_p_neo > best_p_neo)
+        better_min = (cell_binary > 0.5) & (pixel_target < 0.5) & (probe_p_neo < best_p_neo)
+        best_p_neo = torch.where(better_max | better_min, probe_p_neo, best_p_neo)
+        best_snapshot = torch.where((better_max | better_min).unsqueeze(1).expand_as(best_snapshot), pred_x0, best_snapshot)
+
+        # ========== 阶段三：Iter 1 ~ Max_Iters ==========
+        total_iters_done = 1
+        for i in range(1, args.iters):
+            if (pixel_active_mask & (cell_mask > 0.5)).sum() == 0:
                 break
-                
-            # ==========================
-            # A. 标准 DDPM 去噪步
-            # ==========================
-            t_tensor = torch.tensor([args.noise_t], device=device).long().expand(batch_size)
-            noise = torch.randn_like(current_tensors)
-            
-            # 加噪
-            x_t = scheduler.add_noise(current_tensors, noise, t_tensor)
-            
-            # 预测噪声
-            model_input = torch.cat([current_tensors, x_t], dim=1)
+            total_iters_done = i + 1
+
+            # 3.1 DDPM 去噪
+            t_tensor = torch.tensor([args.noise_t], device=device).long().expand(B)
+            noise = torch.randn_like(current_tensor)
+            x_t = scheduler.add_noise(current_tensor, noise, t_tensor)
+            model_input = torch.cat([current_tensor, x_t], dim=1)
             with torch.no_grad():
                 noise_pred = unet(model_input, t_tensor).sample
-            
-            # 还原 x0
             pred_x0 = predict_x0_from_noise_shared(x_t, noise_pred, t_tensor, scheduler)
-            
-            # ==========================
-            # B. 评分 & 决策核心
-            # ==========================
-            current_confs = get_hovernet_confidence_batch(hovernet, pred_x0)
-            
-            # ---> 关键点：在第一轮结束时(Iter 0)，定方向 <---
-            if i == 0:
-                print(f"  🔍 [Iter 0] 分析模型增强倾向...")
-                for idx in range(batch_size):
-                    if not active_mask[idx]: 
-                        continue
-                    
-                    init_s = init_confs[idx].item()
-                    curr_s = current_confs[idx].item()
-                    delta = curr_s - init_s
-                    
-                    # 策略：完全信任模型第一步的选择
-                    # 哪怕初始分是0.33，只要模型把它增强到了0.35，我们就认为它是 Tumor
-                    if delta >= 0:
-                        modes[idx] = 'maximize'
-                        target_goals[idx] = 0.98
-                        # print(f"    - {filenames[idx]}: ↗️ 涨分 ({init_s:.3f}->{curr_s:.3f})，锁定 Maximize")
-                    else:
-                        modes[idx] = 'minimize'
-                        target_goals[idx] = 0.02
-                        # print(f"    - {filenames[idx]}: ↘️ 跌分 ({init_s:.3f}->{curr_s:.3f})，锁定 Minimize")
-                    
-                    # 【可选兜底】：如果 delta 几乎为 0 (例如 < 0.001)，回退到基于 0.5 的硬判定
-                    if abs(delta) < 0.001:
-                        if init_s > 0.5:
-                            modes[idx] = 'maximize'
-                            target_goals[idx] = 0.98
-                        else:
-                            modes[idx] = 'minimize'
-                            target_goals[idx] = 0.02
-            
-            # ==========================
-            # C. 分布监控 (Distribution Check)
-            # ==========================
-            # 记录当前轮次的分布状态
-            ratio, tum_num, norm_num = dist_monitor.update(current_confs)
-            
-            print(f"  Iter {i+1}: TUM={tum_num} | NORM={norm_num} | Ratio={ratio:.2f}", end="")
-            
-            # 检查宏观收敛 (Batch Convergence)
-            # 只有在跑了几轮之后(例如 >= 2)才检查，给一点震荡空间
-            batch_converged = False
-            if i >= 2 and dist_monitor.is_converged():
-                print(" -> [稳定] 分布不再跳变，Batch 级早停触发！")
-                batch_converged = True
+            curr_p_neo, _ = get_hovernet_pixel_maps(hovernet, pred_x0)
+
+            # 3.2 宏观分布与跳变监控
+            normal_ratio, mid_ratio, tumor_ratio = macro_monitor.update(curr_p_neo, cell_mask)
+            jump_rate = compute_jump_rate(init_p_neo, curr_p_neo, cell_mask)
+            distribution_locked = macro_monitor.is_distribution_locked()
+
+            print(f"  Iter {i+1}: Normal<0.3={normal_ratio:.2%} | Mid={mid_ratio:.2%} | Tumor>0.7={tumor_ratio:.2%} | Jump={jump_rate:.2%}", end="")
+            if distribution_locked:
+                print(" [分布锁死]")
             else:
-                print(" -> [波动]" if i < 2 else " -> [未稳]")
-            
-            # ==========================
-            # D. 监控 & 早停检查（优先级：单样本 > Batch）
-            # ==========================
-            for idx in range(batch_size):
-                # 如果这个样本已经停了，就不管它
-                if not active_mask[idx]: 
-                    continue
-                
-                # 跳过还在观察期的样本（Iter 0 还未完成锁定）
-                if modes[idx] == 'observe':
-                    # Iter 0 之后应该都锁定了，但以防万一
-                    current_tensors[idx] = pred_x0[idx]
-                    continue
-                
-                # =================================================
-                # 核心调整：单样本优先结算
-                # =================================================
-                
-                # --- A. 准备数据 ---
-                curr_score = current_confs[idx].item()
-                best_score = best_confs[idx].item()
-                mode = modes[idx]
-                target = target_goals[idx].item()
-                patience = args.patience
-                
-                should_stop_individual = False
-                stop_reason = ""
-                is_new_best = False
-                
-                # --- B. 检查个人达标/退化 (最高优先级) ---
-                if mode == 'maximize':
-                    # 记录最佳 (分数更高)
-                    if curr_score > best_score:
-                        is_new_best = True
-                    
-                    # 检查是否达标
-                    if curr_score >= target:
-                        should_stop_individual = True
-                        stop_reason = "Target_Reached"
-                    # 检查是否退化 (相比最佳值跌落超过 patience)
-                    elif curr_score < (best_score - patience):
-                        should_stop_individual = True
-                        stop_reason = "Degradation"
-                
-                elif mode == 'minimize':
-                    # 记录最佳 (分数更低)
-                    if curr_score < best_score:
-                        is_new_best = True
-                    
-                    # 检查是否达标
-                    if curr_score <= target:
-                        should_stop_individual = True
-                        stop_reason = "Target_Reached"
-                    # 检查是否退化/反弹 (相比最佳值上涨超过 patience)
-                    elif curr_score > (best_score + patience):
-                        should_stop_individual = True
-                        stop_reason = "Degradation"
-                
-                # --- C. 执行个人停止 ---
-                if should_stop_individual:
-                    active_mask[idx] = False
-                    stop_reasons[idx] = stop_reason
-                    # 【关键】因为个人已经结算停止，直接 continue，不再受 Batch 影响
-                    # 但仍需要更新最佳记录（如果有的话）
-                    if is_new_best:
-                        best_confs[idx] = curr_score
-                        best_tensors[idx] = pred_x0[idx].clone()
-                        best_iters[idx] = i + 1
-                    # 更新当前图（用于后续保存）
-                    current_tensors[idx] = pred_x0[idx]
-                    continue
-                
-                # --- D. 检查集体强制停止 (低优先级) ---
-                # 只有个人没达标（还在跑），才看集体脸色
-                if batch_converged:
-                    active_mask[idx] = False
-                    stop_reasons[idx] = "Batch_Converged"
-                    # 即使 Batch 停止，也要更新最佳记录（如果有的话）
-                    if is_new_best:
-                        best_confs[idx] = curr_score
-                        best_tensors[idx] = pred_x0[idx].clone()
-                        best_iters[idx] = i + 1
-                    current_tensors[idx] = pred_x0[idx]
-                    continue
-                
-                # --- E. 如果都没停，更新最佳记录和当前状态 ---
-                if is_new_best:
-                    best_confs[idx] = curr_score
-                    best_tensors[idx] = pred_x0[idx].clone()
-                    best_iters[idx] = i + 1
-                
-                # 更新当前图，用于下一轮作为输入
-                current_tensors[idx] = pred_x0[idx]
-                
-            # 如果 Batch 收敛触发了，跳出循环
-            if batch_converged:
+                print("")
+
+            # 3.3 像素级微观结算（仅细胞区域）
+            mse_per_pixel = ((pred_x0 - original_tensor) ** 2).mean(dim=1)
+            cond_a_distortion = (mse_per_pixel > max_distortion) & (cell_mask > 0.5)
+            reached_max = (curr_p_neo >= pixel_target - 1e-4) & (pixel_target > 0.5) & (cell_mask > 0.5)
+            reached_min = (curr_p_neo <= pixel_target + 1e-4) & (pixel_target < 0.5) & (cell_mask > 0.5)
+            cond_b_target = reached_max | reached_min
+            regress_max = (curr_p_neo < best_p_neo - args.patience) & (pixel_target > 0.5) & (cell_mask > 0.5)
+            regress_min = (curr_p_neo > best_p_neo + args.patience) & (pixel_target < 0.5) & (cell_mask > 0.5)
+            cond_c_degradation = regress_max | regress_min
+            cond_d_macro = distribution_locked & (cell_mask > 0.5)
+            freeze_this = pixel_active_mask & (cell_mask > 0.5) & (cond_a_distortion | cond_b_target | cond_c_degradation | cond_d_macro)
+
+            # 3.4 空间状态更新：记录最佳、冻结剔除、拼图
+            better_max = (cell_mask > 0.5) & (pixel_target > 0.5) & (curr_p_neo > best_p_neo)
+            better_min = (cell_mask > 0.5) & (pixel_target < 0.5) & (curr_p_neo < best_p_neo)
+            improved = better_max | better_min
+            best_p_neo = torch.where(improved, curr_p_neo, best_p_neo)
+            best_snapshot = torch.where(improved.unsqueeze(1).expand_as(best_snapshot), pred_x0, best_snapshot)
+            pixel_active_mask = pixel_active_mask & ~freeze_this
+
+            current_tensor = pred_x0.clone()
+            current_tensor = torch.where(~pixel_active_mask.unsqueeze(1).expand_as(current_tensor), best_snapshot, current_tensor)
+
+            if distribution_locked:
                 break
 
-        # ==========================================
-        # Batch 结束：保存
-        # ==========================================
-        save_batch_images(best_tensors, filenames, args.output_dir, "BEST")
-        
+        # ========== 阶段四：终态输出 ==========
+        # 使用 current_tensor 而非 best_snapshot：后者仅更新细胞区，背景始终是原图；
+        # current_tensor 已是“缝合体”：冻结细胞=best_snapshot，活跃区（含背景）= 最后一轮 DDPM 结果，背景自然平滑
+        final_tensor = current_tensor
+        final_p_neo, _ = get_hovernet_pixel_maps(hovernet, final_tensor)
+        valid = cell_mask > 0.5
+        if valid.sum() > 0:
+            p_flat = final_p_neo[valid].float()
+            final_norm = (p_flat < 0.3).float().mean().item()
+            final_mid = ((p_flat >= 0.3) & (p_flat <= 0.7)).float().mean().item()
+            final_tum = (p_flat > 0.7).float().mean().item()
+        else:
+            final_norm = final_mid = final_tum = 0.0
+        final_jump = compute_jump_rate(init_p_neo, final_p_neo, cell_mask)
+        save_batch_images(final_tensor, filenames, args.output_dir, "BEST")
+        final_confs = get_hovernet_confidence_batch(hovernet, final_tensor)
+        for idx in range(B):
+            best_confs[idx] = final_confs[idx]
+
         rows = []
-        for idx in range(batch_size):
+        for idx in range(B):
             row = {
                 'Filename': filenames[idx],
-                'Mode': modes[idx],
                 'Original_Score': f"{init_confs[idx].item():.6f}",
                 'Best_Score': f"{best_confs[idx].item():.6f}",
                 'Improvement_Abs': f"{abs(best_confs[idx].item() - init_confs[idx].item()):.6f}",
-                'Best_Iter': best_iters[idx].item(),
-                'Stop_Reason': stop_reasons[idx]
+                'Stop_Reason': stop_reasons[idx],
+                'Jump_Rate': f"{final_jump:.4f}",
+                'Final_Normal_Ratio': f"{final_norm:.4f}",
+                'Final_Mid_Ratio': f"{final_mid:.4f}",
+                'Final_Tumor_Ratio': f"{final_tum:.4f}",
+                'Total_Iters': total_iters_done,
             }
             rows.append(row)
-            
         with open(csv_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writerows(rows)
-        
-        print(f"  >> Batch {batch_idx+1} 完成")
+        print(f"  >> Batch {batch_idx+1} 完成 (Jump={final_jump:.2%}, N/M/T={final_norm:.2%}/{final_mid:.2%}/{final_tum:.2%})")
 
 
 def main():
@@ -663,9 +666,15 @@ def main():
     parser.add_argument('--gpu_id', type=int, default=None,
                        help='指定使用的 GPU ID（例如：0, 1, 2），默认为 None 自动选择')
     parser.add_argument('--patience', type=float, default=0.05,
-                       help='容忍度，如果分数变化超过此值则停止（默认 0.05）')
+                       help='微观早停：概率相对历史最佳恶化超过此值则冻结该像素（默认 0.05）')
+    parser.add_argument('--max_distortion', type=float, default=0.1,
+                       help='微观早停：像素与原图 MSE 超过此阈值则冻结，防结构崩坏（默认 0.1）')
+    parser.add_argument('--polar_tolerance', type=float, default=0.005,
+                       help='宏观收敛：两极占比波动小于此值连续 N 轮即判定分布锁死（默认 0.005）')
+    parser.add_argument('--macro_patience', type=int, default=3,
+                       help='宏观收敛：连续 N 轮两极稳定即触发集体停机（默认 3）')
     parser.add_argument('--batch_size', type=int, default=None,
-                       help='批量大小，如果指定则启用批量处理模式（带分布监控），否则单样本处理')
+                       help='批量大小，若指定则启用像素级批量推理，否则单样本处理')
     
     args = parser.parse_args()
     
@@ -736,94 +745,19 @@ def main():
     if not files:
         print("❌ 错误: 未找到任何图像文件")
         return
-    
-    # 准备 CSV 文件路径
-    csv_path = os.path.join(args.output_dir, 'inference_results.csv')
-    print(f"\n数据将保存到: {csv_path}")
-    
-    # --- CSV 初始化 ---
-    # 定义表头：基础信息 + 每一轮的分数占位符
-    fieldnames = ['Filename', 'Mode', 'Original_Score', 'Best_Score', 'Improvement_Abs', 'Best_Iter', 'Stop_Reason']
-    # 动态添加 Iter_0 到 Iter_Max 列
-    score_cols = [f'Iter_{i}' for i in range(args.iters + 1)]
-    fieldnames.extend(score_cols)
-    
-    # 判断使用批量模式还是单样本模式
-    use_batch_mode = args.batch_size is not None and args.batch_size > 1
-    
-    if use_batch_mode:
-        # ==========================================
-        # 批量处理模式（带分布监控）
-        # ==========================================
-        print(f"\n🚀 启动批量推理模式 (Batch Size: {args.batch_size})")
-        print(f"迭代次数: {args.iters}, 加噪时间步: {args.noise_t}")
-        print("=" * 60)
-        
-        dataset = InferenceDataset(files)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-        
-        run_batch_inference(dataloader, unet, hovernet, scheduler, args)
-        
-        print("\n" + "=" * 60)
-        print(f"✅ 批量推理完成！结果保存在: {args.output_dir}")
-    else:
-        # ==========================================
-        # 单样本处理模式（逐个处理）
-        # ==========================================
-        print(f"\n开始推理（迭代次数: {args.iters}, 加噪时间步: {args.noise_t}）...")
-        print("=" * 60)
-        
-        # 打开 CSV 文件准备写入
-        with open(csv_path, mode='w', newline='', encoding='utf-8') as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            for img_path in tqdm(files, desc="处理图像"):
-                try:
-                    # 运行推理，获取统计数据
-                    stats = run_inference(
-                        img_path, 
-                        unet, 
-                        hovernet, 
-                        scheduler, 
-                        args.output_dir, 
-                        device, 
-                        args.iters, 
-                        args.noise_t,
-                        args.patience
-                    )
-                    
-                    if stats is not None:
-                        # 整理数据格式写入 CSV
-                        row = {
-                            'Filename': stats['Filename'],
-                            'Mode': stats['Mode'],
-                            'Original_Score': f"{stats['Original_Score']:.6f}",
-                            'Best_Score': f"{stats['Best_Score']:.6f}",
-                            'Improvement_Abs': f"{stats['Improvement_Abs']:.6f}",
-                            'Best_Iter': stats['Best_Iter'],
-                            'Stop_Reason': stats['Stop_Reason']
-                        }
-                        # 填充具体的 Iter 分数
-                        for i in range(args.iters + 1):
-                            col_name = f'Iter_{i}'
-                            if i < len(stats['Scores_History']):
-                                row[col_name] = f"{stats['Scores_History'][i]:.6f}"
-                            else:
-                                row[col_name] = ""  # 没跑到的轮次留空
-                        
-                        writer.writerow(row)
-                        # 强制刷新缓冲区，确保哪怕程序崩了数据也写进去了
-                        csv_file.flush()
-                        
-                except Exception as e:
-                    print(f"\n❌ 处理 {img_path} 时出错: {e}")
-                    import traceback
-                    traceback.print_exc()
-        
-        print("\n" + "=" * 60)
-        print(f"✅ 推理完成！结果保存在: {args.output_dir}")
-        print(f"✅ 数据表格已保存: {csv_path}")
+
+    # 统一使用像素级四阶段推理（结果与 CSV 写入 run_batch_inference 内的 batch_results.csv）（batch_size=1 即为逐张像素级推理）
+    batch_size = args.batch_size if args.batch_size is not None else 1
+    print(f"\n🚀 像素级自导向推理 (Batch Size: {batch_size})")
+    print(f"迭代: {args.iters}, 加噪步: {args.noise_t}, 失真阈值: {getattr(args, 'max_distortion', 0.1)}, 宏观稳定轮数: {getattr(args, 'macro_patience', 3)}")
+    print("=" * 60)
+
+    dataset = InferenceDataset(files)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    run_batch_inference(dataloader, unet, hovernet, scheduler, args)
+
+    print("\n" + "=" * 60)
+    print(f"✅ 推理完成！结果与 CSV 见: {args.output_dir}")
 
 
 if __name__ == '__main__':
