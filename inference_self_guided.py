@@ -113,7 +113,8 @@ def get_hovernet_confidence_batch(hovernet, img_tensor):
 def get_hovernet_pixel_maps(hovernet, img_tensor):
     """
     获取 HoVer-Net 的像素级肿瘤概率图与细胞核掩膜（用于像素级自导向）。
-    HoVer-Net 输出空间尺寸可能与输入不一致，会插值到与 img_tensor 相同的 (H, W)，保证与后续 pixel_target 等张量维度一致。
+    使用边缘零填充（Zero-Padding）对齐：HoVer-Net 输出（如 164×164）原封不动贴回输入尺寸（如 256×256）正中央，
+    边缘环形带填 0。边缘区域 cell_mask=0，不参与方向锁定，由 DDPM 自然平滑。
     
     Args:
         hovernet: HoVer-Net 模型
@@ -121,22 +122,26 @@ def get_hovernet_pixel_maps(hovernet, img_tensor):
     
     Returns:
         p_neo: [B, H, W] 肿瘤概率图
-        cell_mask: [B, H, W] 细胞核区域掩膜（软掩膜或二值）
+        cell_mask: [B, H, W] 细胞核区域掩膜（边缘为 0）
     """
     with torch.no_grad():
         hovernet_device = next(hovernet.parameters()).device
         if img_tensor.device != hovernet_device:
             img_tensor = img_tensor.to(hovernet_device)
-        target_h, target_w = img_tensor.shape[2], img_tensor.shape[3]
         hover_input = img_tensor * 255.0
         output = hovernet(hover_input)
         probs = torch.softmax(output['tp'], dim=1)
-        cell_mask = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # [B, H', W']
-        p_neo = probs[:, 1, :, :]  # [B, H', W']
-        # 若 HoVer-Net 输出尺寸与输入图像不一致，插值到 (H, W)
-        if p_neo.shape[-2] != target_h or p_neo.shape[-1] != target_w:
-            p_neo = F.interpolate(p_neo.unsqueeze(1), size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(1)
-            cell_mask = F.interpolate(cell_mask.unsqueeze(1), size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(1)
+        mask_probs = torch.softmax(output['np'], dim=1)[:, 1, :, :]  # [B, H_out, W_out]
+        p_neo_center = probs[:, 1, :, :]                             # [B, H_out, W_out]
+        H_in, W_in = img_tensor.shape[2], img_tensor.shape[3]
+        H_out, W_out = p_neo_center.shape[1], p_neo_center.shape[2]
+        pad_top = (H_in - H_out) // 2
+        pad_bottom = H_in - H_out - pad_top
+        pad_left = (W_in - W_out) // 2
+        pad_right = W_in - W_out - pad_left
+        # F.pad 对最后两维顺序为 (左, 右, 上, 下)
+        p_neo = F.pad(p_neo_center, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
+        cell_mask = F.pad(mask_probs, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
     return p_neo, cell_mask
 
 
