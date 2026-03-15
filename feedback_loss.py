@@ -189,11 +189,27 @@ class FeedbackLoss(nn.Module):
                 avg_normal_conf = torch.tensor(-1.0, device=p_neo.device)
 
         # =========================================================
-        # 6. 计算 TV Loss (全变分损失) - 专门用于封杀高频噪点
+        # 6. 相对 TV Loss (Relative Total Variation)
+        # 允许保留自然生物学纹理，仅惩罚超出原图复杂度的高频对抗噪点
         # =========================================================
-        diff_h = torch.abs(x0_input[:, :, 1:, :] - x0_input[:, :, :-1, :])
-        diff_w = torch.abs(x0_input[:, :, :, 1:] - x0_input[:, :, :, :-1])
-        loss_tv = diff_h.mean() + diff_w.mean()
+        def calc_tv(img):
+            # 计算每张图片的 TV 值
+            diff_h = torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :])
+            diff_w = torch.abs(img[:, :, :, 1:] - img[:, :, :, :-1])
+            # 注意：这里在空间维度上求均值，保留 batch 维度
+            return diff_h.mean(dim=(1, 2, 3)) + diff_w.mean(dim=(1, 2, 3))
+
+        # 计算生成图像的 TV
+        tv_hat = calc_tv(x0_input)
+
+        # 计算原始干净图像的自然 TV (不参与反向传播)
+        with torch.no_grad():
+            tv_clean = calc_tv(clean_input)
+
+        # 核心逻辑：引入相对松弛边界 (Margin)
+        # 允许生成的图像 TV 值比原图高出 5% (1.05)，给特征强化留出轻微空间
+        # 只有超出这个自然边界的“作弊噪点”才会被狠狠惩罚
+        loss_tv = F.relu(tv_hat - tv_clean * 1.05).mean()
 
         return loss_prob, loss_entropy, avg_tumor_conf, avg_normal_conf, loss_tv
 
