@@ -25,7 +25,7 @@ class TrainingConfig:
     save_interval: int = 10  # 每 N 个 epoch 保存一次
     
     # 损失权重
-    feedback_weight_prob: float = 0.03
+    feedback_weight_prob: float = 0.05
     feedback_weight_entropy: float = 0.0
     tv_weight: float = 0.001  # TV 全变分损失权重，压制高频噪点（推荐 0.001～0.002）
     use_feedback_from_epoch: int = 5  # 从第几个 epoch 开始使用反馈损失
