@@ -120,7 +120,14 @@ class FeedbackLoss(nn.Module):
             clean_probs = torch.softmax(clean_output['tp'], dim=1)
             mask = torch.softmax(clean_output['np'], dim=1)[:, 1, :, :]  # 细胞核掩膜
             clean_p_neo = clean_probs[:, 1, :, :]
+
+            # 基于原图的 HoVer-Net 预测生成伪标签
             pseudo_target = (clean_p_neo >= 0.5).float()
+
+            # 仅在高置信区域进行监督：
+            # clean_p_neo >= 0.7 视为高置信 tumor，clean_p_neo <= 0.3 视为高置信 normal
+            confident_mask = ((clean_p_neo >= 0.7) | (clean_p_neo <= 0.3)).float()
+            mask = mask * confident_mask
 
             total_cells = mask.sum()
             # 如果整张图没有任何细胞，直接返回 0
