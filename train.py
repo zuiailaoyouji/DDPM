@@ -172,7 +172,11 @@ def train(
             noise = torch.randn_like(clean_images).to(device)
             
             # 3. 采样随机时间步 (Timesteps)
-            timesteps = torch.randint(0, 1000, (bs,), device=device).long()
+            # 启用反馈后限制在 [0, 400)，与 feedback_loss 有效区间一致，避免每批有效样本数波动
+            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
+                timesteps = torch.randint(0, 400, (bs,), device=device).long()
+            else:
+                timesteps = torch.randint(0, 1000, (bs,), device=device).long()
             
             # 4. 前向加噪过程 (Forward Diffusion)
             # ---> 这里就是加噪图像的来源 <---
