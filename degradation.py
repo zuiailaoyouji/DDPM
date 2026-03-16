@@ -91,22 +91,22 @@ def _gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
     """在 [C, H, W] 张量上施加可分离高斯模糊。"""
     if sigma < 1e-3:
         return x
-    k1d = _gaussian_kernel(sigma)                       # [k]
-    k   = k1d.unsqueeze(0).unsqueeze(0)                 # [1, 1, k]
+
+    k1d = _gaussian_kernel(sigma)                   # [k]
     C   = x.shape[0]
     pad = k1d.shape[0] // 2
 
-    # 水平方向卷积
-    xh  = x.unsqueeze(0)                                # [1, C, H, W]
-    xh  = xh.view(1 * C, 1, x.shape[1], x.shape[2])
-    kh  = k.expand(C, 1, 1, k1d.shape[0])              # [C, 1, 1, k]
-    xh  = F.conv2d(xh, kh, padding=(0, pad), groups=C)
+    x4 = x.unsqueeze(0)                             # [1, C, H, W]
 
-    # 竖直方向卷积
-    kv  = k.permute(0, 1, 3, 2).expand(C, 1, k1d.shape[0], 1)
-    xv  = F.conv2d(xh, kv, padding=(pad, 0), groups=C)
+    # 水平方向 depthwise conv
+    kh = k1d.view(1, 1, 1, -1).expand(C, 1, 1, -1) # [C,1,1,k]
+    x4 = F.conv2d(x4, kh, padding=(0, pad), groups=C)
 
-    return xv.squeeze(0).clamp(0.0, 1.0)
+    # 竖直方向 depthwise conv
+    kv = k1d.view(1, 1, -1, 1).expand(C, 1, -1, 1) # [C,1,k,1]
+    x4 = F.conv2d(x4, kv, padding=(pad, 0), groups=C)
+
+    return x4.squeeze(0).clamp(0.0, 1.0)
 
 
 def _stain_jitter(x: torch.Tensor, strength: float) -> torch.Tensor:
