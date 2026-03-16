@@ -550,7 +550,11 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
         pred_x0 = predict_x0_from_noise_shared(x_t, noise_pred, t_tensor, scheduler)
         probe_p_neo, _ = get_hovernet_pixel_maps(hovernet, pred_x0)
         delta = probe_p_neo - init_p_neo
-        pixel_target = torch.where(cell_binary > 0.5, torch.where(delta >= 0, torch.full_like(delta, 0.98), torch.full_like(delta, 0.02)), pixel_target)
+        # 硬锚点 (Hard Anchor)：中间态信 Δ，极态信原图，防止 Tumor 被误判退化
+        base_target = torch.where(delta >= 0, torch.full_like(delta, 0.98), torch.full_like(delta, 0.02))
+        base_target = torch.where(init_p_neo > 0.6, torch.full_like(delta, 0.98), base_target)
+        base_target = torch.where(init_p_neo < 0.4, torch.full_like(delta, 0.02), base_target)
+        pixel_target = torch.where(cell_binary > 0.5, base_target, pixel_target)
         current_tensor = pred_x0.clone()
         best_p_neo = torch.where(cell_binary > 0.5, probe_p_neo, best_p_neo)
         better_max = (cell_binary > 0.5) & (pixel_target > 0.5) & (probe_p_neo > best_p_neo)
