@@ -1,7 +1,24 @@
 """
-训练主循环模块
-核心改变：明确 clean_images 是如何变成 noisy_images 的，并修正输入拼接逻辑
+train.py
+语义引导型 SR DDPM 的双阶段训练循环。
+
+阶段 1（epoch < semantic_start_epoch）：
+    使用 L_noise + L_rec + L_grad + L_tv，做纯 SR 重建。
+
+阶段 2（epoch >= semantic_start_epoch）：
+    额外加入 L_sem + L_dir，并在 semantic_warmup_epochs 内线性升权。
+
+与旧的极化版 train.py 的主要区别
+--------------------------------
+- 数据集返回的是 {"hr", "lr", "label"}，而不是 (image, label)
+- 模型输入为 [lr ‖ noisy_hr]，而不是 [clean ‖ noisy_clean]
+- 损失函数使用 semantic_sr_loss.py 中的 SemanticSRLoss
+- 最佳模型由 composite_score（PSNR/SSIM/Semantic_MAE/Artifact）选择，
+  不再使用 Conf_Gap
+- 记录的指标：PSNR、SSIM、L1、Masked_Semantic_MAE、Artifact_Penalty、
+  Composite_Score、sem_mae、dir_acc
 """
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -14,553 +31,443 @@ from tqdm import tqdm
 
 from ddpm_dataset import NCTDataset
 from unet_wrapper import create_model
-from feedback_loss import FeedbackLoss
+from semantic_sr_loss import SemanticSRLoss
 from ddpm_utils import load_hovernet, get_device, print_gpu_info, predict_x0_from_noise_shared
-# 新增: 导入可视化模块
-from visualization import save_training_progress_images
-# 新增: 导入日志模块
 from logger import ExperimentLogger
-# 新增: 导入验证集模块
-from validation import ValidationSet, create_val_dataloader, save_validation_debug_images
+from validation import (ValidationSet, create_val_dataloader,
+                         save_validation_debug_images)
+from metrics import (compute_psnr, compute_ssim,
+                      compute_masked_semantic_mae, compute_artifact_penalty,
+                      compute_composite_score)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 语义损失预热调度器
+# ─────────────────────────────────────────────────────────────────────────────
+
+def semantic_weight_scale(epoch, start, warmup):
+    """
+    返回一个位于 [0, 1] 的标量，在 `start` epoch 之后，
+    将 lambda_sem / lambda_dir 在线性预热的 `warmup` 个 epoch 内
+    从 0 逐步提升到 1。
+    """
+    if epoch < start:
+        return 0.0
+    return min((epoch - start) / max(warmup, 1), 1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 训练主函数
+# ─────────────────────────────────────────────────────────────────────────────
 
 def train(
-    tum_dir,
-    norm_dir,
-    hovernet,
-    epochs=100,
-    batch_size=8,
-    lr=1e-4,
-    device='cuda',
-    save_dir='./checkpoints',
-    feedback_weight_prob=0.05,
-    feedback_weight_entropy=0.01,
-    use_feedback_from_epoch=5,
-    resume_path=None,
-    logger=None,
-    val_vis_dir=None,  # 验证集目录（用于固定可视化）
-    accumulation_steps=1,  # 梯度累积步数，等效 batch = batch_size * accumulation_steps
-    alpha_tumor=0.2559,   # 全局癌细胞静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）
-    alpha_normal=0.7441,   # 全局正常细胞静态 Focal Loss 权重
-    tv_weight=0.0015,     # TV 全变分损失权重，压制高频噪点
+    tum_dir, norm_dir, hovernet,
+    epochs=100, batch_size=8, lr=1e-4,
+    device='cuda', save_dir='./checkpoints_sr',
+    # 各项损失权重
+    lambda_noise=1.0, lambda_rec=1.0, lambda_grad=0.1,
+    lambda_sem=0.05,  lambda_dir=0.02, lambda_tv=0.001,
+    # 语义软目标
+    delta_t=0.05, delta_n=0.05,
+    tau_pos=0.65, tau_neg=0.35,
+    # 双阶段训练日程
+    semantic_start_epoch=5, semantic_warmup_epochs=5,
+    # 在线退化配置
+    scale=2,
+    # 其他参数
+    accumulation_steps=1, resume_path=None,
+    logger=None, val_vis_dir=None,
+    num_train_timesteps=1000, t_max=400,
 ):
-    """
-    训练 DDPM 模型
-
-    Args:
-        tum_dir: 肿瘤图像目录
-        norm_dir: 正常图像目录
-        hovernet: HoVer-Net 模型（用于反馈损失）
-        epochs: 训练轮数
-        batch_size: 批次大小
-        lr: 学习率
-        device: 设备 ('cuda' 或 'cpu')
-        save_dir: 模型保存目录
-        feedback_weight_prob: 概率损失权重
-        feedback_weight_entropy: 熵损失权重
-        use_feedback_from_epoch: 从第几个 epoch 开始使用反馈损失
-        resume_path: 恢复训练的检查点路径（可选）
-        logger: 日志记录器（可选）
-        val_vis_dir: 验证集目录（用于固定可视化），应包含 TUM 和 NORM 子目录（可选）
-        accumulation_steps: 梯度累积步数，等效有效 batch = batch_size * accumulation_steps，不增加显存
-        alpha_tumor: 癌细胞的全局静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）
-        alpha_normal: 正常细胞的全局静态 Focal Loss 权重
-        tv_weight: TV 全变分损失权重，压制高频噪点
-    """
-    # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
-    
-    # 新增: 准备可视化目录
     vis_dir = os.path.join(save_dir, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
-    
-    # 新增: 初始化 CSV 日志
+
+    # ── CSV 日志 ────────────────────────────────────────────────────
     log_path = os.path.join(save_dir, 'training_log.csv')
     csv_mode = 'a' if os.path.exists(log_path) else 'w'
     with open(log_path, csv_mode, newline='') as f:
-        writer = csv.writer(f)
+        w = csv.writer(f)
         if csv_mode == 'w':
-            # 写入表头：增加了 TUM_Conf, NORM_Conf, L1_Diff
-            writer.writerow(['Epoch', 'Total_Loss', 'MSE', 'Prob_Loss', 'Entropy', 'TV_Loss', 'Tumor_Conf', 'Normal_Conf', 'Conf_Gap', 'L1_Diff'])
-    
-    # 1. 初始化模型和调度器
-    print("初始化模型...")
-    unet = create_model().to(device)
-    scheduler = DDPMScheduler(num_train_timesteps=1000)
-    
-    # 初始化反馈损失（仅在 hovernet 可用时）
+            w.writerow([
+                'Epoch', 'Stage',
+                'Total_Loss', 'L_noise', 'L_rec', 'L_grad',
+                'L_sem', 'L_dir', 'L_tv',
+                'Sem_MAE', 'Dir_Acc',
+                'Sem_Scale',
+            ])
+
+    # ── 模型与调度器 ────────────────────────────────────────────────
+    print("Initialising model...")
+    unet      = create_model().to(device)
+    scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps)
+
+    loss_fn = None
     if hovernet is not None:
-        feedback_criterion = FeedbackLoss(
-            hovernet,
-            scheduler,
-            alpha_tumor=alpha_tumor,
-            alpha_normal=alpha_normal,
+        loss_fn = SemanticSRLoss(
+            hovernet=hovernet,
+            noise_scheduler=scheduler,
+            delta_t=delta_t, delta_n=delta_n,
+            tau_pos=tau_pos, tau_neg=tau_neg,
+            lambda_noise=lambda_noise,
+            lambda_rec=lambda_rec,
+            lambda_grad=lambda_grad,
+            lambda_sem=lambda_sem,
+            lambda_dir=lambda_dir,
+            lambda_tv=lambda_tv,
+            t_max=t_max,
         ).to(device)
-        print("运行模式：带反馈损失的 DDPM 训练")
+        print("模式：语义引导 SR 训练")
     else:
-        feedback_criterion = None
-        print("运行模式：基础 DDPM 训练（无反馈损失）")
-    
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=lr)
-    
-    # 如果需要断点续训加载代码
+        print("模式：仅重建的 SR（不使用 HoVer-Net）")
+
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=0.01)
+
+    # ── 断点续训 ────────────────────────────────────────────────────
     start_epoch = 0
-    if resume_path is not None and os.path.exists(resume_path):
-        print(f"加载检查点: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=device)
-        unet.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0)
-        print(f"从 Epoch {start_epoch} 继续训练")
-    
-    # 2. 初始化验证集管理器
+    if resume_path and os.path.exists(resume_path):
+        print(f"Resuming from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        unet.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        start_epoch = ckpt.get('epoch', 0)
+
+    # ── 验证集（可视化）────────────────────────────────────────────
     val_set = None
-    if val_vis_dir is not None:
-        val_set = ValidationSet(
-            val_dir=val_vis_dir,
-            scheduler=scheduler,
-            device=device,
-            sample_size=256,
-            fixed_timestep=100
-        )
+    if val_vis_dir:
+        val_set = ValidationSet(val_vis_dir, scheduler, device,
+                                 scale=scale, fixed_timestep=100)
         if not val_set.load():
             val_set = None
-            print(f"⚠️ 警告: 验证集目录不存在或无法加载: {val_vis_dir}，将使用训练集图片进行可视化")
 
-    # ================= 3. 加载定量验证集 DataLoader =================
-    val_dataloader = create_val_dataloader(val_vis_dir, batch_size, device)
-    best_val_conf_gap = -float('inf')
+    val_dl = create_val_dataloader(val_vis_dir, batch_size, device, scale=scale)
+    best_composite = -float('inf')
 
-    # 4. 加载训练数据集
-    print("加载数据集...")
-    dataset = NCTDataset(tum_dir, norm_dir, oversample=True)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=4,
-        pin_memory=True if device == 'cuda' else False,
-        drop_last=True  # 确保批次大小一致
-    )
-    
-    # 5. 训练循环
-    print(f"开始训练，共 {epochs} 个 epoch...")
+    # ── 数据集 ─────────────────────────────────────────────────────
+    print("正在加载数据集...")
+    dataset = NCTDataset(tum_dir, norm_dir, oversample=True, scale=scale)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=4,
+                            pin_memory=(device == 'cuda'),
+                            drop_last=True)
+
+    print(f"总训练轮数：{epochs} 个 epoch...")
     global_step = 0
+
     for epoch in range(start_epoch, epochs):
         unet.train()
-        
-        # 初始化累加器
-        acc = {
-            'loss': 0.0, 'mse': 0.0, 'prob': 0.0, 'entropy': 0.0, 'tv': 0.0, 'l1': 0.0
-        }
-        tumor_conf_sum = 0.0
-        tumor_conf_count = 0
-        normal_conf_sum = 0.0
-        normal_conf_count = 0
 
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        sem_scale   = semantic_weight_scale(epoch, semantic_start_epoch,
+                                            semantic_warmup_epochs)
+        semantic_on = (epoch >= semantic_start_epoch) and (loss_fn is not None)
+        stage_label = f"Stage{'2' if semantic_on else '1'} sem={sem_scale:.2f}"
+
+        # 每个 epoch 的累计器
+        acc = {k: 0.0 for k in
+               ('total','noise','rec','grad','sem','dir','tv',
+                'sem_mae','dir_acc','sem_mae_n','dir_acc_n')}
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} | {stage_label}")
         optimizer.zero_grad()
 
-        for batch_idx, batch in enumerate(progress_bar):
-            # 1. 准备数据
-            clean_images, labels = batch  # clean_images 是 [0, 1] 范围
-            clean_images = clean_images.to(device)
-            labels = labels.to(device)
-            bs = clean_images.shape[0]
+        for batch_idx, batch in enumerate(pbar):
+            hr = batch['hr'].to(device)
+            lr = batch['lr'].to(device)
+            bs = hr.shape[0]
 
-            # 2. 采样随机噪声 (Gaussian Noise)
-            noise = torch.randn_like(clean_images).to(device)
-            
-            # 3. 采样随机时间步 (Timesteps)
-            # 启用反馈后限制在 [0, 400)，与 feedback_loss 有效区间一致，避免每批有效样本数波动
-            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                timesteps = torch.randint(0, 400, (bs,), device=device).long()
-            else:
-                timesteps = torch.randint(0, 1000, (bs,), device=device).long()
-            
-            # 4. 前向加噪过程 (Forward Diffusion)
-            # ---> 这里就是加噪图像的来源 <---
-            noisy_images = scheduler.add_noise(clean_images, noise, timesteps)
-            
-            # 5. 构建模型输入 (Concatenation)
-            # 维度变成 6 通道: [Batch, 6, 256, 256]
-            # clean_images 作为条件(Condition)，noisy_images 作为输入(Input)
-            model_input = torch.cat([clean_images, noisy_images], dim=1)
-            
-            # 6. U-Net 预测噪声
-            # 注意：虽然输入了 clean_images，但模型的目标是预测 noisy_images 里的 noise
-            noise_pred = unet(model_input, timesteps).sample
-            
-            # 7. 计算 MSE Loss (基础重建能力)
-            loss_mse = F.mse_loss(noise_pred, noise)
-            
-            # 关键修改: 总是计算增强图 x0_pred 以便监控 L1
-            # 即使在阶段一 (无反馈)，我们也想看看模型生成的图和原图差多少
-            with torch.no_grad():
-                if feedback_criterion is not None:
-                    x0_pred = feedback_criterion.predict_x0_from_noise(noisy_images, noise_pred, timesteps)
-                else:
-                    # 如果没有 feedback_criterion，手动计算 x0_pred（用于可视化）
-                    device_img = noisy_images.device
-                    dtype_img = noisy_images.dtype
-                    # 先把 alphas_cumprod 移动到 device，然后再用 timesteps 去取值
-                    # 这样可以避免设备不匹配的问题（timesteps 在 GPU，alphas_cumprod 在 CPU）
-                    alpha_prod_t = scheduler.alphas_cumprod.to(device_img)[timesteps].to(dtype_img).view(-1, 1, 1, 1)
-                    beta_prod_t = 1 - alpha_prod_t
-                    x0_pred = (noisy_images - beta_prod_t ** 0.5 * noise_pred) / (alpha_prod_t ** 0.5 + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
-                l1_diff = F.l1_loss(x0_pred, clean_images)
-            
-            # 8. 计算反馈 Loss（使用 Focal Loss 和原图引导）
-            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                loss_prob, loss_entropy, tumor_conf, normal_conf, loss_tv = feedback_criterion(
-                    noisy_images, noise_pred, timesteps, clean_images
+            noise     = torch.randn_like(hr)
+            timesteps = torch.randint(0, t_max, (bs,), device=device).long()
+            noisy_hr  = scheduler.add_noise(hr, noise, timesteps)
+
+            # U-Net：以 LR 为条件，对 noisy_hr 去噪
+            model_input = torch.cat([lr, noisy_hr], dim=1)   # [B, 6, H, W]
+            noise_pred  = unet(model_input, timesteps).sample
+
+            # ── 损失计算 ───────────────────────────────────────────
+            if loss_fn is not None:
+                total_loss, bd = loss_fn(
+                    noise_pred=noise_pred,
+                    noise=noise,
+                    noisy_hr=noisy_hr,
+                    hr=hr,
+                    t=timesteps,
+                    lambda_sem=lambda_sem * sem_scale,
+                    lambda_dir=lambda_dir * sem_scale,
+                    semantic_on=semantic_on,
                 )
             else:
-                loss_prob = torch.tensor(0.0, device=device)
-                loss_entropy = torch.tensor(0.0, device=device)
-                tumor_conf = torch.tensor(-1.0, device=device)
-                normal_conf = torch.tensor(-1.0, device=device)
-                loss_tv = torch.tensor(0.0, device=device)
+                # 仅重建的回退分支（不使用 HoVer-Net）
+                x0_hat     = predict_x0_from_noise_shared(
+                    noisy_hr, noise_pred, timesteps, scheduler)
+                l_noise    = F.mse_loss(noise_pred, noise)
+                l_rec      = F.l1_loss(x0_hat, hr)
+                def _grad(x):
+                    dh = x[:,:,1:,:] - x[:,:,:-1,:]
+                    dw = x[:,:,:,1:] - x[:,:,:,:-1]
+                    return dh, dw
+                ph,pw = _grad(x0_hat); th,tw = _grad(hr)
+                l_grad = (ph-th).abs().mean() + (pw-tw).abs().mean()
+                total_loss = lambda_noise*l_noise + lambda_rec*l_rec + lambda_grad*l_grad
+                bd = dict(l_noise=l_noise.detach(), l_rec=l_rec.detach(),
+                          l_grad=l_grad.detach(),
+                          l_sem=torch.zeros(()), l_dir=torch.zeros(()),
+                          l_tv=torch.zeros(()),
+                          sem_mae=torch.tensor(-1.0),
+                          dir_acc=torch.tensor(-1.0),
+                          p_hat_mean=torch.tensor(-1.0),
+                          p_tgt_mean=torch.tensor(-1.0))
 
-            # 9. 总 Loss（含 TV Loss，压制高频噪点）
-            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                loss_total = (
-                    loss_mse
-                    + feedback_weight_prob * loss_prob
-                    + feedback_weight_entropy * loss_entropy
-                    + tv_weight * loss_tv
-                )
-            else:
-                loss_total = loss_mse
-
-            # 10. 梯度累积：先缩放再反传，每 accumulation_steps 步或最后一个 batch 才更新参数
-            loss_for_log = loss_total.item()
-            loss_total = loss_total / accumulation_steps
-            loss_total.backward()
-            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+            # 梯度累积
+            loss_val = total_loss.item()
+            (total_loss / accumulation_steps).backward()
+            if (batch_idx+1) % accumulation_steps == 0 or (batch_idx+1) == len(dataloader):
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # 累加记录（用未缩放的 loss，便于与「无累积」时数值一致）
-            acc['loss'] += loss_for_log
-            acc['mse'] += loss_mse.item()
-            acc['prob'] += loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob
-            acc['entropy'] += loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy
-            acc['tv'] += loss_tv.item() if isinstance(loss_tv, torch.Tensor) else loss_tv
-            acc['l1'] += l1_diff.item()
+            # 损失累计
+            acc['total'] += loss_val
+            for k in ('noise','rec','grad','sem','dir','tv'):
+                acc[k] += bd[f'l_{k}'].item()
+            sm = bd['sem_mae'].item(); da = bd['dir_acc'].item()
+            if sm >= 0:
+                acc['sem_mae'] += sm;  acc['sem_mae_n'] += 1
+            if da >= 0:
+                acc['dir_acc'] += da;  acc['dir_acc_n'] += 1
 
-            t_conf_val = tumor_conf.item() if isinstance(tumor_conf, torch.Tensor) else tumor_conf
-            n_conf_val = normal_conf.item() if isinstance(normal_conf, torch.Tensor) else normal_conf
-            if t_conf_val >= 0:
-                tumor_conf_sum += t_conf_val
-                tumor_conf_count += 1
-            if n_conf_val >= 0:
-                normal_conf_sum += n_conf_val
-                normal_conf_count += 1
-
-            # 实时记录指标到 TensorBoard (每隔几步记录一次，避免IO过高)
-            if logger is not None and global_step % 10 == 0:
-                metrics = {
-                    "Total_Loss": loss_for_log,
-                    "MSE_Loss": loss_mse.item(),
-                    "Prob_Loss": loss_prob.item() if isinstance(loss_prob, torch.Tensor) else loss_prob,
-                    "Entropy_Loss": loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy,
-                    "TV_Loss": loss_tv.item() if isinstance(loss_tv, torch.Tensor) else loss_tv,
-                    "L1_Diff": l1_diff.item(),
-                }
-                if t_conf_val >= 0:
-                    metrics["Tumor_Conf"] = t_conf_val
-                if n_conf_val >= 0:
-                    metrics["Normal_Conf"] = n_conf_val
-                if t_conf_val >= 0 and n_conf_val >= 0:
-                    metrics["Conf_Gap"] = t_conf_val - n_conf_val
-                logger.log_metrics(metrics, step=global_step, prefix="Train")
+            # TensorBoard 步级日志
+            if logger and global_step % 10 == 0:
+                logger.log_metrics({
+                    'Total_Loss': loss_val,
+                    'L_noise': bd['l_noise'].item(),
+                    'L_rec':   bd['l_rec'].item(),
+                    'L_grad':  bd['l_grad'].item(),
+                    'L_sem':   bd['l_sem'].item(),
+                    'L_dir':   bd['l_dir'].item(),
+                    'L_tv':    bd['l_tv'].item(),
+                    'Sem_Scale': sem_scale,
+                }, step=global_step, prefix='Train')
                 logger.flush()
-            
-            # 可视化逻辑 (仅在每个 Epoch 的第一个 Batch)
-            if batch_idx == 0:
-                # 优先使用验证集进行可视化（更公平的对比）
-                if val_set is not None and val_set.is_available():
-                    # 使用验证集生成增强图像
-                    val_result = val_set.generate_enhanced_images(unet, feedback_criterion)
 
-                    if val_result is not None:
-                        vis_grid = save_validation_debug_images(
-                            original_images=val_set.images,
-                            noisy_images=val_set.noisy_images,
-                            enhanced_images=val_result['enhanced_images'],
-                            diff_vis=val_result['diff_vis'],
-                            heatmap_before=val_result['heatmap_before'],
-                            heatmap_after=val_result['heatmap_after'],
-                            tumor_conf_before=val_result['tumor_conf_before'],
-                            tumor_conf_after=val_result['tumor_conf_after'],
-                            epoch=epoch+1,
-                            save_dir=vis_dir,
-                            num_vis=8,
-                            return_tensor=True,
-                        )
-
-                        if logger is not None and vis_grid is not None:
-                            logger.log_images("Validation/Comparison_Debug", vis_grid, step=global_step, max_images=1)
-                else:
-                    # 如果没有验证集，使用训练集的当前 batch
-                    vis_grid = save_training_progress_images(
-                        clean_images, noisy_images, x0_pred, 
-                        epoch=epoch+1, save_dir=vis_dir, return_tensor=True
+            # 每个 epoch 的第一批样本可视化
+            if batch_idx == 0 and val_set and val_set.is_available():
+                result = val_set.generate_reconstructions(unet, loss_fn)
+                if result:
+                    grid = save_validation_debug_images(
+                        hr=val_set.hr, lr=val_set.lr,
+                        reconstructed=result['reconstructed'],
+                        diff_vis=result['diff_vis'],
+                        p_clean=result['p_clean'],
+                        p_pred=result['p_pred'],
+                        epoch=epoch+1, save_dir=vis_dir,
+                        num_vis=8, return_tensor=True,
                     )
-                    
-                    # 记录拼接好的对比图到 TensorBoard
-                    if logger is not None:
-                        logger.log_images("Train/Comparison", vis_grid, step=global_step, max_images=1)
-            
-            # 更新进度条
-            progress_bar.set_postfix({'Loss': f"{loss_for_log:.4f}"})
-            
+                    if logger and grid is not None:
+                        logger.log_images('Validation/SR_Comparison',
+                                          grid, step=global_step, max_images=1)
+
+            pbar.set_postfix({'L': f"{loss_val:.4f}", 'stage': stage_label[:8]})
             global_step += 1
-        
-        # Epoch 结束: 计算平均值
-        avg_loss = acc['loss'] / len(dataloader)
-        avg_mse = acc['mse'] / len(dataloader)
-        avg_prob = acc['prob'] / len(dataloader)
-        avg_entropy = acc['entropy'] / len(dataloader)
-        avg_tv = acc['tv'] / len(dataloader)
-        avg_l1 = acc['l1'] / len(dataloader)
-        avg_tumor_conf = tumor_conf_sum / tumor_conf_count if tumor_conf_count > 0 else 0.0
-        avg_normal_conf = normal_conf_sum / normal_conf_count if normal_conf_count > 0 else 0.0
-        avg_conf_gap = avg_tumor_conf - avg_normal_conf
 
-        print(f"\nEpoch {epoch+1}/{epochs} 完成:")
-        print(f"  平均总损失: {avg_loss:.4f}")
-        print(f"  平均MSE损失: {avg_mse:.4f}")
-        print(f"  平均概率损失: {avg_prob:.4f}")
-        print(f"  平均熵损失: {avg_entropy:.4f}")
-        print(f"  癌细胞平均置信度 (应趋向1): {avg_tumor_conf:.4f}")
-        print(f"  正常细胞平均置信度 (应趋向0): {avg_normal_conf:.4f}")
-        print(f"  类别区分度 Gap (应趋向1): {avg_conf_gap:.4f}")
-        print(f"  平均TV损失: {avg_tv:.4f}")
-        print(f"  L1修改幅度: {avg_l1:.4f}")
+        # ── 每个 epoch 的平均指标 ─────────────────────────────────
+        n = len(dataloader)
+        avg = {k: acc[k]/n for k in ('total','noise','rec','grad','sem','dir','tv')}
+        avg_sem_mae = acc['sem_mae']/acc['sem_mae_n'] if acc['sem_mae_n'] else -1.0
+        avg_dir_acc = acc['dir_acc']/acc['dir_acc_n'] if acc['dir_acc_n'] else -1.0
 
-        # 记录 Epoch 级别的指标到 TensorBoard
-        if logger is not None:
-            epoch_metrics = {
-                "Total_Loss": avg_loss,
-                "MSE_Loss": avg_mse,
-                "Prob_Loss": avg_prob,
-                "Entropy_Loss": avg_entropy,
-                "TV_Loss": avg_tv,
-                "Tumor_Conf": avg_tumor_conf,
-                "Normal_Conf": avg_normal_conf,
-                "Conf_Gap": avg_conf_gap,
-                "L1_Diff": avg_l1,
-            }
-            logger.log_metrics(epoch_metrics, step=epoch+1, prefix="Epoch")
+        print(f"\nEpoch {epoch+1} | {stage_label}")
+        print(f"  Total={avg['total']:.4f}  noise={avg['noise']:.4f}  "
+              f"rec={avg['rec']:.4f}  grad={avg['grad']:.4f}")
+        print(f"  sem={avg['sem']:.4f}  dir={avg['dir']:.4f}  tv={avg['tv']:.4f}")
+        if avg_sem_mae >= 0:
+            print(f"  Sem_MAE={avg_sem_mae:.4f}  Dir_Acc={avg_dir_acc:.4f}")
+
+        if logger:
+            logger.log_metrics({
+                **{f'L_{k}': v for k,v in avg.items()},
+                'Sem_MAE': avg_sem_mae, 'Dir_Acc': avg_dir_acc,
+                'Sem_Scale': sem_scale,
+            }, step=epoch+1, prefix='Epoch')
             logger.flush()
 
-        # 写入 CSV 日志
         with open(log_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                epoch+1, avg_loss, avg_mse, avg_prob, avg_entropy, avg_tv,
-                avg_tumor_conf, avg_normal_conf, avg_conf_gap, avg_l1
+            csv.writer(f).writerow([
+                epoch+1,
+                '2' if semantic_on else '1',
+                avg['total'], avg['noise'], avg['rec'], avg['grad'],
+                avg['sem'], avg['dir'], avg['tv'],
+                avg_sem_mae, avg_dir_acc, sem_scale,
             ])
 
-        # =========================================================
-        # 定量验证：在验证集上评估 MSE / Focal / 置信度 Gap
-        # =========================================================
-        if val_dataloader is not None:
+        # ── 定量验证 ───────────────────────────────────────────────
+        if val_dl is not None:
             unet.eval()
-            print(f"\n--- 开始 Epoch {epoch+1} 验证集评估 ---")
-
-            val_acc = {'mse': 0.0, 'prob': 0.0, 'entropy': 0.0, 'tv': 0.0}
-            val_tumor_conf_sum = 0.0
-            val_tumor_conf_count = 0
-            val_normal_conf_sum = 0.0
-            val_normal_conf_count = 0
+            v_psnr = v_ssim = v_l1 = v_art = v_sem_mae = 0.0
+            v_n = 0
 
             with torch.no_grad():
-                for val_batch in val_dataloader:
-                    val_clean_images, val_labels = val_batch
-                    val_clean_images = val_clean_images.to(device)
-                    bs = val_clean_images.shape[0]
+                for vb in val_dl:
+                    vhr = vb['hr'].to(device)
+                    vlr = vb['lr'].to(device)
+                    bs  = vhr.shape[0]
 
-                    val_noise = torch.randn_like(val_clean_images).to(device)
-                    val_timesteps = torch.randint(0, 1000, (bs,), device=device).long()
-                    val_noisy_images = scheduler.add_noise(val_clean_images, val_noise, val_timesteps)
+                    vnoise    = torch.randn_like(vhr)
+                    vts       = torch.randint(0, t_max, (bs,), device=device).long()
+                    vnoisy_hr = scheduler.add_noise(vhr, vnoise, vts)
+                    vinput    = torch.cat([vlr, vnoisy_hr], dim=1)
+                    vnoise_p  = unet(vinput, vts).sample
 
-                    val_model_input = torch.cat([val_clean_images, val_noisy_images], dim=1)
-                    val_noise_pred = unet(val_model_input, val_timesteps).sample
+                    vx0 = predict_x0_from_noise_shared(vnoisy_hr, vnoise_p, vts, scheduler)
 
-                    val_loss_mse = F.mse_loss(val_noise_pred, val_noise)
-                    val_acc['mse'] += val_loss_mse.item()
+                    v_psnr    += compute_psnr(vx0, vhr)
+                    v_ssim    += compute_ssim(vx0, vhr)
+                    v_l1      += F.l1_loss(vx0, vhr).item()
+                    v_art     += compute_artifact_penalty(vx0, vhr)
 
-                    if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                        val_loss_prob, val_loss_entropy, val_t_conf, val_n_conf, val_loss_tv = feedback_criterion(
-                            val_noisy_images, val_noise_pred, val_timesteps, val_clean_images
-                        )
-                        val_acc['prob'] += val_loss_prob.item() if isinstance(val_loss_prob, torch.Tensor) else val_loss_prob
-                        val_acc['entropy'] += val_loss_entropy.item() if isinstance(val_loss_entropy, torch.Tensor) else val_loss_entropy
-                        val_acc['tv'] += val_loss_tv.item() if isinstance(val_loss_tv, torch.Tensor) else val_loss_tv
+                    # 语义 MAE（仅在 HoVer-Net 可用时计算）
+                    if loss_fn is not None and semantic_on:
+                        p_c, cm = loss_fn._run_hovernet(vhr)
+                        p_p, _  = loss_fn._run_hovernet(vx0)
+                        p_tgt   = loss_fn._build_soft_target(p_c)
+                        v_sem_mae += compute_masked_semantic_mae(p_p, p_tgt, cm)
+                    v_n += 1
 
-                        v_t_conf_val = val_t_conf.item() if isinstance(val_t_conf, torch.Tensor) else val_t_conf
-                        v_n_conf_val = val_n_conf.item() if isinstance(val_n_conf, torch.Tensor) else val_n_conf
-                        if v_t_conf_val >= 0:
-                            val_tumor_conf_sum += v_t_conf_val
-                            val_tumor_conf_count += 1
-                        if v_n_conf_val >= 0:
-                            val_normal_conf_sum += v_n_conf_val
-                            val_normal_conf_count += 1
+            if v_n > 0:
+                vp  = v_psnr    / v_n
+                vs  = v_ssim    / v_n
+                vl  = v_l1      / v_n
+                va  = v_art     / v_n
+                vsm = v_sem_mae / v_n if semantic_on else -1.0
 
-            val_steps = len(val_dataloader)
-            val_avg_mse = val_acc['mse'] / val_steps
-            print(f"  [Val] MSE Loss: {val_avg_mse:.4f}")
+                comp = compute_composite_score(
+                    psnr=vp, ssim=vs,
+                    semantic_mae=vsm if vsm >= 0 else 0.0,
+                    artifact_penalty=va)
 
-            if epoch >= use_feedback_from_epoch and feedback_criterion is not None:
-                val_avg_prob = val_acc['prob'] / val_steps
-                val_avg_entropy = val_acc['entropy'] / val_steps
-                val_avg_tv = val_acc['tv'] / val_steps
-                val_avg_tumor_conf = val_tumor_conf_sum / val_tumor_conf_count if val_tumor_conf_count > 0 else 0.0
-                val_avg_normal_conf = val_normal_conf_sum / val_normal_conf_count if val_normal_conf_count > 0 else 0.0
-                val_avg_conf_gap = val_avg_tumor_conf - val_avg_normal_conf
+                print(f"  [Val] PSNR={vp:.2f}dB  SSIM={vs:.4f}  "
+                      f"L1={vl:.4f}  ArtifactRatio={va:.3f}")
+                print(f"  [Val] Semantic_MAE={vsm:.4f}  Composite={comp:.4f}")
 
-                print(f"  [Val] Focal Loss: {val_avg_prob:.4f} | Entropy Loss: {val_avg_entropy:.4f} | TV Loss: {val_avg_tv:.4f}")
-                print(f"  [Val] Tumor Conf: {val_avg_tumor_conf:.4f}")
-                print(f"  [Val] Normal Conf: {val_avg_normal_conf:.4f}")
-                print(f"  [Val] Conf Gap: {val_avg_conf_gap:.4f}")
+                if logger:
+                    logger.log_metrics(dict(
+                        PSNR=vp, SSIM=vs, L1=vl,
+                        Artifact_Penalty=va,
+                        Semantic_MAE=vsm,
+                        Composite_Score=comp,
+                    ), step=epoch+1, prefix='Val')
 
-                if logger is not None:
-                    val_metrics = {
-                        "MSE_Loss": val_avg_mse,
-                        "Prob_Loss": val_avg_prob,
-                        "Entropy_Loss": val_avg_entropy,
-                        "TV_Loss": val_avg_tv,
-                        "Tumor_Conf": val_avg_tumor_conf,
-                        "Normal_Conf": val_avg_normal_conf,
-                        "Conf_Gap": val_avg_conf_gap,
-                    }
-                    logger.log_metrics(val_metrics, step=epoch + 1, prefix="Val")
-
-                if val_avg_conf_gap > best_val_conf_gap:
-                    best_val_conf_gap = val_avg_conf_gap
-                    best_checkpoint_path = os.path.join(save_dir, 'best_unet_model.pth')
-                    torch.save({
-                        'epoch': epoch + 1,
-                        'model_state_dict': unet.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'val_conf_gap': best_val_conf_gap,
-                    }, best_checkpoint_path)
-                    print(f"  🔥 发现更优模型！验证集 Gap 达到 {best_val_conf_gap:.4f}，已保存至 {best_checkpoint_path}")
+                # 最佳模型：依据最高 composite score 选择
+                if comp > best_composite:
+                    best_composite = comp
+                    best_path = os.path.join(save_dir, 'best_unet_sr.pth')
+                    torch.save(dict(
+                        epoch=epoch+1,
+                        model_state_dict=unet.state_dict(),
+                        optimizer_state_dict=optimizer.state_dict(),
+                        val_psnr=vp, val_ssim=vs,
+                        val_semantic_mae=vsm,
+                        val_composite=comp,
+                    ), best_path)
+                    print(f"  🔥 New best model saved → {best_path}  "
+                          f"(composite={comp:.4f})")
 
             unet.train()
 
-        # 保存模型
-        if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
-            checkpoint_path = os.path.join(save_dir, f'unet_epoch_{epoch+1}.pth')
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': unet.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-            }, checkpoint_path)
-            print(f"模型已保存到: {checkpoint_path}")
-    
-    print("训练完成！")
-    
-    # 关闭日志记录器
-    if logger is not None:
+        # 周期性保存 checkpoint
+        if (epoch+1) % 10 == 0 or epoch == epochs-1:
+            ckpt_path = os.path.join(save_dir, f'unet_sr_epoch_{epoch+1}.pth')
+            torch.save(dict(
+                epoch=epoch+1,
+                model_state_dict=unet.state_dict(),
+                optimizer_state_dict=optimizer.state_dict(),
+                loss=avg['total'],
+            ), ckpt_path)
+            print(f"Checkpoint saved: {ckpt_path}")
+
+    print("Training complete.")
+    if logger:
         logger.close()
 
 
-def main():
-    parser = argparse.ArgumentParser(description='训练 DDPM 模型')
-    parser.add_argument('--tum_dir', type=str, required=True, help='肿瘤图像目录')
-    parser.add_argument('--norm_dir', type=str, required=True, help='正常图像目录')
-    parser.add_argument('--hovernet_path', type=str, default=None, help='HoVer-Net 模型路径（可选）')
-    parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=8, help='批次大小')
-    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
-    parser.add_argument('--device', type=str, default=None, help='设备 (cuda/cpu)，如果指定 gpu_id 则此参数将被忽略')
-    parser.add_argument('--gpu_id', type=int, default=None, help='指定使用的 GPU ID（例如：0, 1, 2），默认为 None 自动选择')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型保存目录')
-    parser.add_argument('--feedback_weight_prob', type=float, default=0.05, help='概率损失权重')
-    parser.add_argument('--feedback_weight_entropy', type=float, default=0.01, help='熵损失权重')
-    parser.add_argument('--use_feedback_from_epoch', type=int, default=5, help='从第几个epoch开始使用反馈损失')
-    parser.add_argument('--resume_path', type=str, default=None, help='恢复训练的检查点路径（可选）')
-    parser.add_argument('--no_tb', action='store_true', help='如果加上这个参数，则关闭 TensorBoard')
-    parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard 日志根目录')
-    parser.add_argument('--exp_name', type=str, default=None, help='实验名称（用于区分不同次运行），默认为时间戳')
-    parser.add_argument('--val_vis_dir', type=str, default=None, help='验证集目录（用于固定可视化），应包含 tumor 和 normal 子目录')
-    parser.add_argument('--accumulation_steps', type=int, default=1, help='梯度累积步数，等效 batch = batch_size * accumulation_steps（默认 1 即不累积）')
-    parser.add_argument('--alpha_tumor', type=float, default=0.2559, help='全局癌细胞静态 Focal Loss 权重（可用 compute_cell_priors.py 估计）')
-    parser.add_argument('--alpha_normal', type=float, default=0.7441, help='全局正常细胞静态 Focal Loss 权重')
-    parser.add_argument('--tv_weight', type=float, default=0.0015, help='TV 全变分损失权重，压制高频噪点（推荐 0.001～0.002）')
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
-    args = parser.parse_args()
-    
-    # 打印 GPU 信息
+def main():
+    p = argparse.ArgumentParser(description='Semantic-guided SR DDPM training')
+    p.add_argument('--tum_dir',  required=True)
+    p.add_argument('--norm_dir', required=True)
+    p.add_argument('--hovernet_path', default=None)
+    p.add_argument('--epochs',     type=int,   default=100)
+    p.add_argument('--batch_size', type=int,   default=8)
+    p.add_argument('--lr',         type=float, default=1e-4)
+    p.add_argument('--device',     type=str,   default=None)
+    p.add_argument('--gpu_id',     type=int,   default=None)
+    p.add_argument('--save_dir',   default='./checkpoints_sr')
+    # Loss weights
+    p.add_argument('--lambda_noise', type=float, default=1.0)
+    p.add_argument('--lambda_rec',   type=float, default=1.0)
+    p.add_argument('--lambda_grad',  type=float, default=0.1)
+    p.add_argument('--lambda_sem',   type=float, default=0.05)
+    p.add_argument('--lambda_dir',   type=float, default=0.02)
+    p.add_argument('--lambda_tv',    type=float, default=0.001)
+    # Semantic
+    p.add_argument('--delta_t',  type=float, default=0.05)
+    p.add_argument('--delta_n',  type=float, default=0.05)
+    p.add_argument('--tau_pos',  type=float, default=0.65)
+    p.add_argument('--tau_neg',  type=float, default=0.35)
+    p.add_argument('--semantic_start_epoch',  type=int, default=5)
+    p.add_argument('--semantic_warmup_epochs',type=int, default=5)
+    # Degradation
+    p.add_argument('--scale', type=int, default=2)
+    # Misc
+    p.add_argument('--accumulation_steps', type=int, default=1)
+    p.add_argument('--resume_path', default=None)
+    p.add_argument('--no_tb',     action='store_true')
+    p.add_argument('--log_dir',   default='./logs')
+    p.add_argument('--exp_name',  default=None)
+    p.add_argument('--val_vis_dir', default=None)
+    p.add_argument('--t_max',     type=int, default=400)
+
+    args = p.parse_args()
     print_gpu_info()
-    
-    # 确定实验名称（如果没有指定，使用时间戳）
-    import datetime
+
     if args.exp_name is None:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.exp_name = f"DDPM_{timestamp}"
-    
-    # 初始化日志记录器
+        args.exp_name = 'SR_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
     logger = ExperimentLogger(
         use_tensorboard=not args.no_tb,
         log_dir=args.log_dir,
-        experiment_name=args.exp_name
+        experiment_name=args.exp_name,
     )
-    
-    # 确定使用的设备
-    if args.gpu_id is not None:
-        # 如果指定了 gpu_id，使用指定的 GPU
-        device = get_device(gpu_id=args.gpu_id)
-    elif args.device is not None:
-        # 如果指定了 device 字符串（兼容旧代码）
-        device = args.device
-        if device.startswith('cuda'):
-            print(f"使用设备: {device}")
-    else:
-        # 默认自动检测
-        device = get_device()
-        print(f"自动检测设备: {device}")
-    
-    # 加载 HoVer-Net 模型（使用确定的设备）
+
+    device = (get_device(gpu_id=args.gpu_id) if args.gpu_id is not None
+              else args.device or get_device())
+
     hovernet = None
     if args.hovernet_path:
-        print(f"加载 HoVer-Net 模型: {args.hovernet_path}")
+        from ddpm_utils import load_hovernet
         hovernet = load_hovernet(args.hovernet_path, device=device)
-        
-        if hovernet is None:
-            print("警告: HoVer-Net 模型未加载，反馈损失将无法使用")
-    else:
-        print("警告: 未提供 HoVer-Net 模型路径，反馈损失将无法使用")
-    
+
     train(
-        tum_dir=args.tum_dir,
-        norm_dir=args.norm_dir,
+        tum_dir=args.tum_dir, norm_dir=args.norm_dir,
         hovernet=hovernet,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        device=device,
-        save_dir=args.save_dir,
-        feedback_weight_prob=args.feedback_weight_prob,
-        feedback_weight_entropy=args.feedback_weight_entropy,
-        use_feedback_from_epoch=args.use_feedback_from_epoch,
-        resume_path=args.resume_path,
-        logger=logger,
-        val_vis_dir=args.val_vis_dir,
+        epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, device=device, save_dir=args.save_dir,
+        lambda_noise=args.lambda_noise, lambda_rec=args.lambda_rec,
+        lambda_grad=args.lambda_grad, lambda_sem=args.lambda_sem,
+        lambda_dir=args.lambda_dir, lambda_tv=args.lambda_tv,
+        delta_t=args.delta_t, delta_n=args.delta_n,
+        tau_pos=args.tau_pos, tau_neg=args.tau_neg,
+        semantic_start_epoch=args.semantic_start_epoch,
+        semantic_warmup_epochs=args.semantic_warmup_epochs,
+        scale=args.scale,
         accumulation_steps=args.accumulation_steps,
-        alpha_tumor=args.alpha_tumor,
-        alpha_normal=args.alpha_normal,
-        tv_weight=args.tv_weight,
+        resume_path=args.resume_path,
+        logger=logger, val_vis_dir=args.val_vis_dir,
+        t_max=args.t_max,
     )
 
 
 if __name__ == '__main__':
     main()
-

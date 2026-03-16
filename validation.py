@@ -1,352 +1,248 @@
 """
-验证集模块
-用于加载和管理固定验证集（定性可视化），以及定量验证集的创建与加载。
+validation.py
+语义引导型 SR DDPM 的验证集管理。
+
+与旧版本的差异
+----------------
+旧流程：固定 TUM/NORM 图像 → 加噪 → 增强 → 对比肿瘤热力图，
+       指标为：tumer_conf_before / after / gap。
+
+新流程：固定 HR 图像 → 合成 LR → 重建 → 与 HR 对比，
+       可视化内容：HR / LR / Reconstructed / Residual / p_clean / p_pred，
+       度量指标：PSNR、SSIM、Masked_Semantic_MAE、Artifact_Penalty、
+                 Composite_Score（用于选择最佳模型）。
 """
+
 import os
-import math
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
-from diffusers import DDPMScheduler
 import matplotlib.pyplot as plt
-from ddpm_utils import predict_x0_from_noise_shared
+
 from ddpm_dataset import NCTDataset
+from ddpm_utils import predict_x0_from_noise_shared
+from degradation import degrade
+from metrics import (compute_psnr, compute_ssim,
+                     compute_masked_semantic_mae, compute_artifact_penalty,
+                     compute_composite_score)
 
 
-def load_fixed_validation_batch(val_dir, sample_size=256, device='cuda'):
+# ─────────────────────────────────────────────────────────────────────────────
+# 工具函数：加载一小批固定验证样本用于可视化
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_fixed_validation_batch(val_dir, sample_size=256, device='cuda',
+                                 scale=2, n_per_class=4):
     """
-    从验证目录加载固定的图片用于可视化 (4 TUM + 4 NORM)
-    
-    Args:
-        val_dir: 验证集目录，应包含 'TUM' 和 'NORM' 子目录
-        sample_size: 图像尺寸，默认 256
-        device: 设备类型
-    
-    Returns:
-        batch_tensor: [B, 3, H, W] 的 Tensor，B=8 (4 TUM + 4 NORM)
-        labels_tensor: [B] 的 Tensor，标签 (1=TUM, 0=NORM)
+    从 TUM 和 NORM 中各加载 n_per_class 张图像作为 HR tensor。
+    同时合成一份固定的 LR 版本（每个 epoch 使用相同随机种子，方便公平对比）。
+
+    返回
+    -------
+    hr_tensor  : [B, 3, H, W]
+    lr_tensor  : [B, 3, H, W]
+    labels     : [B]
     """
-    images = []
-    labels = []
-    
-    # 1. 读取 Tumor (前4张)
-    tum_path = os.path.join(val_dir, 'TUM')
-    if os.path.exists(tum_path):
-        files = sorted([f for f in os.listdir(tum_path) 
-                         if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))])[:4]
-        for f in files:
-            img = cv2.imread(os.path.join(tum_path, f))
-            if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                images.append(img)
-                labels.append(1)  # TUM 标签
-    
-    # 2. 读取 Normal (前4张)
-    norm_path = os.path.join(val_dir, 'NORM')
-    if os.path.exists(norm_path):
-        files = sorted([f for f in os.listdir(norm_path) 
-                       if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))])[:4]
-        for f in files:
-            img = cv2.imread(os.path.join(norm_path, f))
-            if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                images.append(img)
-                labels.append(0)  # NORM 标签
-    
+    images, labels = [], []
+    for subdir, lbl in [('TUM', 1), ('NORM', 0)]:
+        path = os.path.join(val_dir, subdir)
+        if not os.path.exists(path):
+            continue
+        files = sorted([f for f in os.listdir(path)
+                         if f.lower().endswith(('.png','.jpg','.jpeg','.tif','.tiff'))])
+        for f in files[:n_per_class]:
+            img = cv2.imread(os.path.join(path, f))
+            if img is None:
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (sample_size, sample_size),
+                             interpolation=cv2.INTER_LANCZOS4)
+            images.append(img)
+            labels.append(lbl)
+
     if not images:
-        return None, None
-    
-    # 3. 预处理 (归一化 + Tensor转换)
-    # Resize 并堆叠
-    batch_resized = []
-    for img in images:
-        batch_resized.append(cv2.resize(img, (sample_size, sample_size)))
-    batch_np = np.array(batch_resized)  # [B, H, W, C]
-    
-    # 归一化 / 255.0 -> permute -> tensor
-    batch_tensor = torch.from_numpy(batch_np).float() / 255.0
-    batch_tensor = batch_tensor.permute(0, 3, 1, 2).to(device)  # [B, 3, H, W]
-    
-    labels_tensor = torch.tensor(labels, dtype=torch.long, device=device)
-    
-    return batch_tensor, labels_tensor
+        return None, None, None
 
+    hr_np   = np.stack(images, axis=0).astype(np.float32) / 255.0
+    hr      = torch.from_numpy(hr_np).permute(0, 3, 1, 2).to(device)  # [B,3,H,W]
+
+    # 固定的 LR（使用固定种子 42，保证可复现）
+    torch.manual_seed(42)
+    lr = torch.stack([degrade(hr[i].cpu(), scale=scale) for i in range(len(hr))]).to(device)
+    torch.manual_seed(torch.initial_seed())   # 恢复原始随机状态
+
+    labels_t = torch.tensor(labels, dtype=torch.long, device=device)
+    return hr, lr, labels_t
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ValidationSet：用于可视化的一小批固定验证样本
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ValidationSet:
     """
-    验证集管理器
-    封装验证集的加载、加噪和可视化逻辑
+    管理一小批固定的验证样本，用于主观可视化。
+    在 load() 之后固定 LR、噪声和时间步，以保证不同 epoch 之间的公平对比。
     """
-    def __init__(self, val_dir, scheduler, device='cuda', sample_size=256, fixed_timestep=100):
-        """
-        初始化验证集管理器
-        
-        Args:
-            val_dir: 验证集目录，应包含 'TUM' 和 'NORM' 子目录
-            scheduler: DDPMScheduler 实例
-            device: 设备类型
-            sample_size: 图像尺寸
-            fixed_timestep: 固定的时间步（用于加噪），默认 100
-        """
-        self.val_dir = val_dir
-        self.scheduler = scheduler
-        self.device = device
-        self.sample_size = sample_size
+
+    def __init__(self, val_dir, scheduler, device='cuda',
+                 sample_size=256, fixed_timestep=100, scale=2):
+        self.val_dir        = val_dir
+        self.scheduler      = scheduler
+        self.device         = device
+        self.sample_size    = sample_size
         self.fixed_timestep = fixed_timestep
-        
-        self.images = None
-        self.labels = None
-        self.noisy_images = None
-        self.timesteps = None
-        self.noise = None
-        
-    def load(self):
-        """
-        加载验证集图片
-        
-        Returns:
-            bool: 是否成功加载
-        """
-        if self.val_dir is None or not os.path.exists(self.val_dir):
+        self.scale          = scale
+
+        self.hr = self.lr = self.noisy_hr = None
+        self.labels = self.noise = self.timesteps = None
+
+    def load(self) -> bool:
+        if not self.val_dir or not os.path.exists(self.val_dir):
             return False
-        
-        print(f"加载固定验证集用于可视化: {self.val_dir}")
-        self.images, self.labels = load_fixed_validation_batch(
-            self.val_dir, 
-            sample_size=self.sample_size, 
-            device=self.device
-        )
-        
-        if self.images is not None:
-            print(f"✓ 验证集加载成功，Shape: {self.images.shape}")
-            # 生成固定的噪声和时间步
-            self._prepare_noise()
-            return True
-        else:
-            print("⚠️ 警告: 未找到验证集图片")
+        print(f"Loading fixed validation batch: {self.val_dir}")
+        self.hr, self.lr, self.labels = load_fixed_validation_batch(
+            self.val_dir, self.sample_size, self.device, self.scale)
+        if self.hr is None:
             return False
-    
+        print(f"  ✓ {self.hr.shape[0]} validation images loaded")
+        self._prepare_noise()
+        return True
+
     def _prepare_noise(self):
-        """准备固定的噪声和时间步（用于公平对比）"""
-        # 固定随机种子以确保每次使用相同的噪声
-        original_seed = torch.initial_seed()
         torch.manual_seed(42)
-        
-        self.noise = torch.randn_like(self.images).to(self.device)
-        # 固定时间步 t=fixed_timestep (轻微增强，便于观察效果)
+        self.noise = torch.randn_like(self.hr)
         self.timesteps = torch.full(
-            (self.images.shape[0],), 
-            self.fixed_timestep, 
-            device=self.device, 
-            dtype=torch.long
-        )
-        self.noisy_images = self.scheduler.add_noise(self.images, self.noise, self.timesteps)
-        
-        # 恢复随机种子
-        torch.manual_seed(original_seed)
-    
-    def generate_enhanced_images(self, unet, feedback_criterion=None):
-        """
-        使用模型生成增强后的图像，并返回可视化所需的附加信息
+            (self.hr.shape[0],), self.fixed_timestep,
+            device=self.device, dtype=torch.long)
+        self.noisy_hr = self.scheduler.add_noise(self.hr, self.noise, self.timesteps)
+        torch.manual_seed(torch.initial_seed())
 
-        Returns:
-            result: dict, 包含
-                - enhanced_images: [B, 3, H, W]
-                - diff_vis: [B, 3, H, W]   增强显示后的差分图
-                - tumor_conf_before: [B]
-                - tumor_conf_after: [B]
-                - heatmap_before: [B, 1, H, W]
-                - heatmap_after: [B, 1, H, W]
-        """
-        if self.images is None:
-            return None
-
-        with torch.no_grad():
-            # 1. DDPM 一步重建
-            model_input = torch.cat([self.images, self.noisy_images], dim=1)
-            pred_noise = unet(model_input, self.timesteps).sample
-
-            if feedback_criterion is not None:
-                enhanced = feedback_criterion.predict_x0_from_noise(
-                    self.noisy_images, pred_noise, self.timesteps
-                )
-                hovernet = feedback_criterion.hovernet
-            else:
-                enhanced = predict_x0_from_noise_shared(
-                    self.noisy_images, pred_noise, self.timesteps, self.scheduler
-                )
-                hovernet = None
-
-            # 2. 差分图（增强显示）
-            diff = torch.abs(enhanced - self.images)
-            diff_vis = torch.clamp(diff * 10.0, 0.0, 1.0)
-
-            # 3. 默认占位（当没有 hovernet / feedback_criterion 时）
-            b = self.images.shape[0]
-            tumor_conf_before = torch.full((b,), -1.0, device=self.device)
-            tumor_conf_after = torch.full((b,), -1.0, device=self.device)
-            heatmap_before = torch.zeros((b, 1, self.images.shape[2], self.images.shape[3]), device=self.device)
-            heatmap_after = torch.zeros((b, 1, self.images.shape[2], self.images.shape[3]), device=self.device)
-
-            # 4. 计算 HoVer-Net tumor heatmap + before/after tumor conf
-            if hovernet is not None:
-                clean_input = self.images * 255.0
-                enhanced_input = enhanced * 255.0
-
-                out_before = hovernet(clean_input)
-                out_after = hovernet(enhanced_input)
-
-                probs_before = torch.softmax(out_before['tp'], dim=1)
-                probs_after = torch.softmax(out_after['tp'], dim=1)
-
-                p_neo_before = probs_before[:, 1:2, :, :]
-                p_neo_after = probs_after[:, 1:2, :, :]
-
-                heatmap_before = p_neo_before
-                heatmap_after = p_neo_after
-
-                tumor_conf_before = p_neo_before.mean(dim=(1, 2, 3))
-                tumor_conf_after = p_neo_after.mean(dim=(1, 2, 3))
-
-            return {
-                'enhanced_images': enhanced,
-                'diff_vis': diff_vis,
-                'tumor_conf_before': tumor_conf_before,
-                'tumor_conf_after': tumor_conf_after,
-                'heatmap_before': heatmap_before,
-                'heatmap_after': heatmap_after,
-            }
-    
     def is_available(self):
-        """检查验证集是否可用"""
-        return self.images is not None
+        return self.hr is not None
 
+    def generate_reconstructions(self, unet, loss_module=None):
+        """
+        在固定的验证 LR / noisy-HR 上运行一次 DDPM 前向。
+
+        返回的字典包含：
+          reconstructed : [B,3,H,W]  重建结果
+          diff_vis      : [B,3,H,W]  |reconstructed - hr| × 5，可视化残差
+          p_clean       : [B,1,H,W]  HoVer-Net 在 HR 上的概率图
+          p_pred        : [B,1,H,W]  HoVer-Net 在重建结果上的概率图
+        """
+        if self.hr is None:
+            return None
+        with torch.no_grad():
+            model_input = torch.cat([self.lr, self.noisy_hr], dim=1)
+            noise_pred  = unet(model_input, self.timesteps).sample
+            recon = predict_x0_from_noise_shared(
+                self.noisy_hr, noise_pred, self.timesteps, self.scheduler)
+
+            diff_vis = (recon - self.hr).abs().clamp(0, 1) * 5
+
+            p_clean = p_pred = torch.zeros(
+                self.hr.shape[0], 1, self.hr.shape[2], self.hr.shape[3],
+                device=self.device)
+
+            if loss_module is not None and hasattr(loss_module, '_run_hovernet'):
+                p_c_map, _  = loss_module._run_hovernet(self.hr)
+                p_p_map, _  = loss_module._run_hovernet(recon)
+                p_clean = p_c_map.unsqueeze(1)
+                p_pred  = p_p_map.unsqueeze(1)
+
+        return dict(reconstructed=recon, diff_vis=diff_vis,
+                    p_clean=p_clean, p_pred=p_pred)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 可视化
+# ─────────────────────────────────────────────────────────────────────────────
 
 def save_validation_debug_images(
-    original_images,
-    noisy_images,
-    enhanced_images,
-    diff_vis,
-    heatmap_before,
-    heatmap_after,
-    tumor_conf_before,
-    tumor_conf_after,
-    epoch,
-    save_dir,
-    num_vis=8,
-    return_tensor=False,
+    hr, lr, reconstructed, diff_vis, p_clean, p_pred,
+    epoch, save_dir, num_vis=8, return_tensor=False,
 ):
     """
-    保存增强版验证可视化：
-    第1行 原图
-    第2行 加噪图
-    第3行 增强图（标题打印 before/after tumor conf）
-    第4行 差分图（增强显示）
-    第5行 HoVer-Net tumor heatmap before
-    第6行 HoVer-Net tumor heatmap after
+    保存 6 行图像的网格：
+      第 1 行：HR（真值）
+      第 2 行：LR 输入
+      第 3 行：重建结果
+      第 4 行：绝对残差 ×5
+      第 5 行：p_clean 热力图
+      第 6 行：p_pred 热力图
     """
     os.makedirs(save_dir, exist_ok=True)
+    num_vis = min(num_vis, hr.shape[0])
 
-    num_vis = min(num_vis, original_images.shape[0])
+    def _rgb(t):
+        return t[:num_vis].detach().cpu().clamp(0,1).permute(0,2,3,1).numpy()
 
-    def to_rgb_numpy(x):
-        x = x[:num_vis].detach().cpu().clamp(0, 1)
-        return x.permute(0, 2, 3, 1).numpy()
+    def _gray(t):
+        return t[:num_vis, 0].detach().cpu().clamp(0,1).numpy()
 
-    def to_gray_numpy(x):
-        x = x[:num_vis].detach().cpu().clamp(0, 1)
-        return x[:, 0].numpy()
-
-    orig_np = to_rgb_numpy(original_images)
-    noisy_np = to_rgb_numpy(noisy_images)
-    enh_np = to_rgb_numpy(enhanced_images)
-    diff_np = to_rgb_numpy(diff_vis)
-    heat_before_np = to_gray_numpy(heatmap_before)
-    heat_after_np = to_gray_numpy(heatmap_after)
-
-    conf_b = tumor_conf_before[:num_vis].detach().cpu().numpy()
-    conf_a = tumor_conf_after[:num_vis].detach().cpu().numpy()
-
-    rows = 6
-    cols = num_vis
-    fig, axes = plt.subplots(rows, cols, figsize=(2.8 * cols, 2.6 * rows), squeeze=False)
-
-    row_titles = [
-        "Original",
-        "Noisy",
-        "Enhanced",
-        "Abs Diff x10",
-        "Tumor Heatmap Before",
-        "Tumor Heatmap After",
+    rows_data = [
+        (_rgb(hr),            'HR (ground truth)'),
+        (_rgb(lr),            'LR input'),
+        (_rgb(reconstructed), 'Reconstructed'),
+        (_rgb(diff_vis),      'Residual ×5'),
+        (_gray(p_clean),      'p_clean (HoVer-Net on HR)'),
+        (_gray(p_pred),       'p_pred  (HoVer-Net on recon)'),
     ]
 
-    for c in range(cols):
-        axes[0, c].imshow(orig_np[c])
-        axes[1, c].imshow(noisy_np[c])
-        axes[2, c].imshow(enh_np[c])
-        axes[3, c].imshow(diff_np[c])
-        axes[4, c].imshow(heat_before_np[c], cmap='jet', vmin=0.0, vmax=1.0)
-        axes[5, c].imshow(heat_after_np[c], cmap='jet', vmin=0.0, vmax=1.0)
+    n_rows, n_cols = len(rows_data), num_vis
+    fig, axes = plt.subplots(n_rows, n_cols,
+                              figsize=(2.8 * n_cols, 2.6 * n_rows),
+                              squeeze=False)
 
-        axes[2, c].set_title(
-            f"before={conf_b[c]:.3f}\nafter={conf_a[c]:.3f}",
-            fontsize=9
-        )
-
-        for r in range(rows):
-            axes[r, c].axis("off")
-
-    for r in range(rows):
-        axes[r, 0].set_ylabel(row_titles[r], fontsize=11)
+    for r, (data, title) in enumerate(rows_data):
+        axes[r, 0].set_ylabel(title, fontsize=10)
+        for c in range(n_cols):
+            ax = axes[r, c]
+            if data.ndim == 3:             # RGB 图像
+                ax.imshow(data[c])
+            else:                          # 灰度热力图
+                ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
+            ax.axis('off')
 
     plt.tight_layout()
-    save_path = os.path.join(save_dir, f"epoch_{epoch}_vis_debug.png")
+    save_path = os.path.join(save_dir, f'epoch_{epoch:03d}_val.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
     if not return_tensor:
         return None
 
-    grid_images = torch.cat([
-        original_images[:num_vis],
-        noisy_images[:num_vis],
-        enhanced_images[:num_vis],
-        diff_vis[:num_vis],
-    ], dim=0)
-
-    grid = make_grid(grid_images.detach().cpu(), nrow=num_vis, padding=2)
+    grid = make_grid(
+        torch.cat([hr[:num_vis], lr[:num_vis],
+                   reconstructed[:num_vis], diff_vis[:num_vis]]).detach().cpu(),
+        nrow=num_vis, padding=2)
     return grid
 
 
-def create_val_dataloader(val_vis_dir, batch_size, device='cuda'):
+# ─────────────────────────────────────────────────────────────────────────────
+# 定量验证用 DataLoader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_val_dataloader(val_vis_dir, batch_size, device='cuda',
+                           scale=2, oversample=False):
     """
-    创建定量验证集 DataLoader（TUM + NORM 子目录）。
-
-    Args:
-        val_vis_dir: 验证集根目录，需包含 TUM 与 NORM 子目录
-        batch_size: 批次大小
-        device: 设备
-
-    Returns:
-        val_dataloader: DataLoader 或 None（目录不存在时）
+    基于 TUM/NORM 验证划分构建一个 DataLoader。
+    如果 val_vis_dir 缺失或不完整，则返回 None。
     """
-    if val_vis_dir is None or not os.path.exists(val_vis_dir):
+    if not val_vis_dir or not os.path.exists(val_vis_dir):
         return None
-    val_tum_dir = os.path.join(val_vis_dir, 'TUM')
-    val_norm_dir = os.path.join(val_vis_dir, 'NORM')
-    if not os.path.exists(val_tum_dir) or not os.path.exists(val_norm_dir):
-        print("⚠️ 警告: 未找到验证集的 TUM/NORM 子目录，跳过定量验证环节。")
+    tum_dir  = os.path.join(val_vis_dir, 'TUM')
+    norm_dir = os.path.join(val_vis_dir, 'NORM')
+    if not os.path.exists(tum_dir) or not os.path.exists(norm_dir):
+        print("⚠️  验证目录缺少 TUM/NORM 子目录 —— 跳过定量验证。")
         return None
-    val_dataset = NCTDataset(val_tum_dir, val_norm_dir, oversample=False)
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=(device == 'cuda'),
-    )
-    print(f"验证集加载成功，共 {len(val_dataset)} 张图片。")
-    return val_dataloader
 
+    val_ds = NCTDataset(tum_dir, norm_dir, oversample=oversample, scale=scale)
+    dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                    num_workers=4, pin_memory=(device == 'cuda'))
+    print(f"定量验证集：{len(val_ds)} 张图像")
+    return dl
