@@ -3,11 +3,14 @@
 用于加载和管理固定验证集（定性可视化），以及定量验证集的创建与加载。
 """
 import os
+import math
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
 from diffusers import DDPMScheduler
+import matplotlib.pyplot as plt
 from ddpm_utils import predict_x0_from_noise_shared
 from ddpm_dataset import NCTDataset
 
@@ -146,40 +149,175 @@ class ValidationSet:
     
     def generate_enhanced_images(self, unet, feedback_criterion=None):
         """
-        使用模型生成增强后的图像
-        
-        Args:
-            unet: U-Net 模型
-            feedback_criterion: FeedbackLoss 实例（可选，用于还原 x0）
-        
+        使用模型生成增强后的图像，并返回可视化所需的附加信息
+
         Returns:
-            enhanced_images: 增强后的图像 [B, 3, H, W]
+            result: dict, 包含
+                - enhanced_images: [B, 3, H, W]
+                - diff_vis: [B, 3, H, W]   增强显示后的差分图
+                - tumor_conf_before: [B]
+                - tumor_conf_after: [B]
+                - heatmap_before: [B, 1, H, W]
+                - heatmap_after: [B, 1, H, W]
         """
         if self.images is None:
             return None
-        
+
         with torch.no_grad():
-            # 构建模型输入
+            # 1. DDPM 一步重建
             model_input = torch.cat([self.images, self.noisy_images], dim=1)
-            # 预测噪声
             pred_noise = unet(model_input, self.timesteps).sample
-            
-            # 还原图像
+
             if feedback_criterion is not None:
                 enhanced = feedback_criterion.predict_x0_from_noise(
                     self.noisy_images, pred_noise, self.timesteps
                 )
+                hovernet = feedback_criterion.hovernet
             else:
-                # 使用共享的 x0 还原函数
                 enhanced = predict_x0_from_noise_shared(
                     self.noisy_images, pred_noise, self.timesteps, self.scheduler
                 )
-            
-            return enhanced
+                hovernet = None
+
+            # 2. 差分图（增强显示）
+            diff = torch.abs(enhanced - self.images)
+            diff_vis = torch.clamp(diff * 10.0, 0.0, 1.0)
+
+            # 3. 默认占位（当没有 hovernet / feedback_criterion 时）
+            b = self.images.shape[0]
+            tumor_conf_before = torch.full((b,), -1.0, device=self.device)
+            tumor_conf_after = torch.full((b,), -1.0, device=self.device)
+            heatmap_before = torch.zeros((b, 1, self.images.shape[2], self.images.shape[3]), device=self.device)
+            heatmap_after = torch.zeros((b, 1, self.images.shape[2], self.images.shape[3]), device=self.device)
+
+            # 4. 计算 HoVer-Net tumor heatmap + before/after tumor conf
+            if hovernet is not None:
+                clean_input = self.images * 255.0
+                enhanced_input = enhanced * 255.0
+
+                out_before = hovernet(clean_input)
+                out_after = hovernet(enhanced_input)
+
+                probs_before = torch.softmax(out_before['tp'], dim=1)
+                probs_after = torch.softmax(out_after['tp'], dim=1)
+
+                p_neo_before = probs_before[:, 1:2, :, :]
+                p_neo_after = probs_after[:, 1:2, :, :]
+
+                heatmap_before = p_neo_before
+                heatmap_after = p_neo_after
+
+                tumor_conf_before = p_neo_before.mean(dim=(1, 2, 3))
+                tumor_conf_after = p_neo_after.mean(dim=(1, 2, 3))
+
+            return {
+                'enhanced_images': enhanced,
+                'diff_vis': diff_vis,
+                'tumor_conf_before': tumor_conf_before,
+                'tumor_conf_after': tumor_conf_after,
+                'heatmap_before': heatmap_before,
+                'heatmap_after': heatmap_after,
+            }
     
     def is_available(self):
         """检查验证集是否可用"""
         return self.images is not None
+
+
+def save_validation_debug_images(
+    original_images,
+    noisy_images,
+    enhanced_images,
+    diff_vis,
+    heatmap_before,
+    heatmap_after,
+    tumor_conf_before,
+    tumor_conf_after,
+    epoch,
+    save_dir,
+    num_vis=8,
+    return_tensor=False,
+):
+    """
+    保存增强版验证可视化：
+    第1行 原图
+    第2行 加噪图
+    第3行 增强图（标题打印 before/after tumor conf）
+    第4行 差分图（增强显示）
+    第5行 HoVer-Net tumor heatmap before
+    第6行 HoVer-Net tumor heatmap after
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    num_vis = min(num_vis, original_images.shape[0])
+
+    def to_rgb_numpy(x):
+        x = x[:num_vis].detach().cpu().clamp(0, 1)
+        return x.permute(0, 2, 3, 1).numpy()
+
+    def to_gray_numpy(x):
+        x = x[:num_vis].detach().cpu().clamp(0, 1)
+        return x[:, 0].numpy()
+
+    orig_np = to_rgb_numpy(original_images)
+    noisy_np = to_rgb_numpy(noisy_images)
+    enh_np = to_rgb_numpy(enhanced_images)
+    diff_np = to_rgb_numpy(diff_vis)
+    heat_before_np = to_gray_numpy(heatmap_before)
+    heat_after_np = to_gray_numpy(heatmap_after)
+
+    conf_b = tumor_conf_before[:num_vis].detach().cpu().numpy()
+    conf_a = tumor_conf_after[:num_vis].detach().cpu().numpy()
+
+    rows = 6
+    cols = num_vis
+    fig, axes = plt.subplots(rows, cols, figsize=(2.8 * cols, 2.6 * rows), squeeze=False)
+
+    row_titles = [
+        "Original",
+        "Noisy",
+        "Enhanced",
+        "Abs Diff x10",
+        "Tumor Heatmap Before",
+        "Tumor Heatmap After",
+    ]
+
+    for c in range(cols):
+        axes[0, c].imshow(orig_np[c])
+        axes[1, c].imshow(noisy_np[c])
+        axes[2, c].imshow(enh_np[c])
+        axes[3, c].imshow(diff_np[c])
+        axes[4, c].imshow(heat_before_np[c], cmap='jet', vmin=0.0, vmax=1.0)
+        axes[5, c].imshow(heat_after_np[c], cmap='jet', vmin=0.0, vmax=1.0)
+
+        axes[2, c].set_title(
+            f"before={conf_b[c]:.3f}\nafter={conf_a[c]:.3f}",
+            fontsize=9
+        )
+
+        for r in range(rows):
+            axes[r, c].axis("off")
+
+    for r in range(rows):
+        axes[r, 0].set_ylabel(row_titles[r], fontsize=11)
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, f"epoch_{epoch}_vis_debug.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    if not return_tensor:
+        return None
+
+    grid_images = torch.cat([
+        original_images[:num_vis],
+        noisy_images[:num_vis],
+        enhanced_images[:num_vis],
+        diff_vis[:num_vis],
+    ], dim=0)
+
+    grid = make_grid(grid_images.detach().cpu(), nrow=num_vis, padding=2)
+    return grid
 
 
 def create_val_dataloader(val_vis_dir, batch_size, device='cuda'):

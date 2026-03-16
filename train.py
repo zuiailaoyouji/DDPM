@@ -21,7 +21,7 @@ from visualization import save_training_progress_images
 # 新增: 导入日志模块
 from logger import ExperimentLogger
 # 新增: 导入验证集模块
-from validation import ValidationSet, create_val_dataloader
+from validation import ValidationSet, create_val_dataloader, save_validation_debug_images
 
 
 def train(
@@ -284,18 +284,26 @@ def train(
                 # 优先使用验证集进行可视化（更公平的对比）
                 if val_set is not None and val_set.is_available():
                     # 使用验证集生成增强图像
-                    val_enhanced = val_set.generate_enhanced_images(unet, feedback_criterion)
-                    
-                    if val_enhanced is not None:
-                        # 保存验证集可视化图片（用于论文插图），并获取拼接好的 tensor
-                        vis_grid = save_training_progress_images(
-                            val_set.images, val_set.noisy_images, val_enhanced, 
-                            epoch=epoch+1, save_dir=vis_dir, num_vis=8, return_tensor=True
+                    val_result = val_set.generate_enhanced_images(unet, feedback_criterion)
+
+                    if val_result is not None:
+                        vis_grid = save_validation_debug_images(
+                            original_images=val_set.images,
+                            noisy_images=val_set.noisy_images,
+                            enhanced_images=val_result['enhanced_images'],
+                            diff_vis=val_result['diff_vis'],
+                            heatmap_before=val_result['heatmap_before'],
+                            heatmap_after=val_result['heatmap_after'],
+                            tumor_conf_before=val_result['tumor_conf_before'],
+                            tumor_conf_after=val_result['tumor_conf_after'],
+                            epoch=epoch+1,
+                            save_dir=vis_dir,
+                            num_vis=8,
+                            return_tensor=True,
                         )
-                        
-                        # 记录拼接好的对比图到 TensorBoard（替代原来的三张分开的图）
-                        if logger is not None:
-                            logger.log_images("Validation/Comparison", vis_grid, step=global_step, max_images=1)
+
+                        if logger is not None and vis_grid is not None:
+                            logger.log_images("Validation/Comparison_Debug", vis_grid, step=global_step, max_images=1)
                 else:
                     # 如果没有验证集，使用训练集的当前 batch
                     vis_grid = save_training_progress_images(
