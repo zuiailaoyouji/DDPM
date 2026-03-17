@@ -11,15 +11,15 @@ semantic_sr_loss.py
   - 指标：Conf_Gap（肿瘤置信度 − 正常置信度，越大越好）
 
 新方案（SR 保真度 + 软语义引导）：
-  - p_target = p_clean  （连续值，无需阈值）
+  - p_target = p_clean（连续值，无需阈值；不再使用 delta 偏移）
   - L_sem = SmoothL1(p_neo_hat, p_target)，只在高置信细胞区域内计算
-  - L_dir = hinge 损失，用于约束概率变化方向
+  - L_dir = hinge 方向约束（可选的小权重辅助项，用于抑制方向错误的像素）
   - L_rec = L1(x0_hat, hr)
   - L_grad = L1(∇x0_hat, ∇hr)
   - L_tv  = 漏斗型相对 TV（与旧代码一致）
   - 指标：PSNR / SSIM / Masked_Semantic_MAE
 
-新的语义引导损失函数，不再使用 delta 和方向约束。
+主语义目标不再使用 delta；方向约束仅保留为可选的辅助项（由 lambda_dir 控制）。
 """
 
 import torch
@@ -44,9 +44,7 @@ class SemanticSRLoss(nn.Module):
         self,
         hovernet,
         noise_scheduler,
-        # 语义软目标参数
-        delta_t: float = 0.05,       # 肿瘤区域的偏移尺度
-        delta_n: float = 0.05,       # 正常区域的偏移尺度
+        # 语义监督掩膜参数
         tau_pos: float = 0.65,       # p_clean >= tau_pos → 高置信肿瘤
         tau_neg: float = 0.35,       # p_clean <= tau_neg → 高置信正常
         # 各项损失权重（可在 forward 中按 batch 覆盖）
@@ -65,8 +63,6 @@ class SemanticSRLoss(nn.Module):
         self.hovernet  = hovernet
         self.scheduler = noise_scheduler
 
-        self.delta_t  = delta_t
-        self.delta_n  = delta_n
         self.tau_pos  = tau_pos
         self.tau_neg  = tau_neg
 

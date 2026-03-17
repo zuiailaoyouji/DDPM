@@ -51,12 +51,8 @@ class TrainingConfig:
     lambda_dir:   float = 0.005   # 方向约束 hinge
     lambda_tv:    float = 0.001  # 漏斗型相对 TV
 
-    # ── 语义软目标参数 ─────────────────────────────────────────────
-    # 动态 delta：肿瘤像素偏移 = delta_t * (1 - p_clean)
-    #             正常像素偏移 = delta_n * p_clean
-    # 在置信度已较高的像素处减小扰动。
-    delta_t: float = 0.05   # 肿瘤区域 delta 缩放（0.03 ~ 0.08）
-    delta_n: float = 0.05   # 正常区域 delta 缩放（0.03 ~ 0.08）
+    # ── 语义目标参数 ───────────────────────────────────────────────
+    # 当前语义目标为 p_target = p_clean（不再使用 delta 偏移）。
 
     # 语义监督掩膜的高置信度阈值
     tau_pos: float = 0.65   # p_clean >= tau_pos → 高置信肿瘤像素

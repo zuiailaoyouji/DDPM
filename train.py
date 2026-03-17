@@ -74,8 +74,7 @@ def train(
     # 各项损失权重
     lambda_noise=1.0, lambda_rec=1.0, lambda_grad=0.1,
     lambda_sem=0.05,  lambda_dir=0.02, lambda_tv=0.001,
-    # 语义软目标
-    delta_t=0.05, delta_n=0.05,
+    # 语义监督阈值
     tau_pos=0.65, tau_neg=0.35,
     # 双阶段训练日程
     semantic_start_epoch=5, semantic_warmup_epochs=5,
@@ -120,7 +119,6 @@ def train(
         loss_fn = SemanticSRLoss(
             hovernet=hovernet,
             noise_scheduler=scheduler,
-            delta_t=delta_t, delta_n=delta_n,
             tau_pos=tau_pos, tau_neg=tau_neg,
             lambda_noise=lambda_noise,
             lambda_rec=lambda_rec,
@@ -501,8 +499,6 @@ def main():
     p.add_argument('--lambda_dir',   type=float, default=0.02)
     p.add_argument('--lambda_tv',    type=float, default=0.001)
     # Semantic
-    p.add_argument('--delta_t',  type=float, default=0.05)
-    p.add_argument('--delta_n',  type=float, default=0.05)
     p.add_argument('--tau_pos',  type=float, default=0.65)
     p.add_argument('--tau_neg',  type=float, default=0.35)
     p.add_argument('--semantic_start_epoch',  type=int, default=5)
@@ -546,7 +542,6 @@ def main():
         lambda_noise=args.lambda_noise, lambda_rec=args.lambda_rec,
         lambda_grad=args.lambda_grad, lambda_sem=args.lambda_sem,
         lambda_dir=args.lambda_dir, lambda_tv=args.lambda_tv,
-        delta_t=args.delta_t, delta_n=args.delta_n,
         tau_pos=args.tau_pos, tau_neg=args.tau_neg,
         semantic_start_epoch=args.semantic_start_epoch,
         semantic_warmup_epochs=args.semantic_warmup_epochs,
