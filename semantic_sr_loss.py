@@ -11,7 +11,7 @@ semantic_sr_loss.py
   - 指标：Conf_Gap（肿瘤置信度 − 正常置信度，越大越好）
 
 新方案（SR 保真度 + 软语义引导）：
-  - p_target = p_clean ± dynamic_delta  （连续值，无需阈值）
+  - p_target = p_clean  （连续值，无需阈值）
   - L_sem = SmoothL1(p_neo_hat, p_target)，只在高置信细胞区域内计算
   - L_dir = hinge 损失，用于约束概率变化方向
   - L_rec = L1(x0_hat, hr)
@@ -19,11 +19,7 @@ semantic_sr_loss.py
   - L_tv  = 漏斗型相对 TV（与旧代码一致）
   - 指标：PSNR / SSIM / Masked_Semantic_MAE
 
-动态 delta
------------
-  肿瘤区域：  δ_t * (1 - p_clean)   — 在 p_clean 较低处给更大的推动
-  正常区域： δ_n * p_clean          — 在 p_clean 较高处给更大的抑制
-这会在置信度已经较高的像素处收缩扰动，从而降低在细胞边界处产生幻觉的风险。
+新的语义引导损失函数，不再使用 delta 和方向约束。
 """
 
 import torch
