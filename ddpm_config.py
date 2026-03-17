@@ -48,7 +48,7 @@ class TrainingConfig:
     lambda_rec:   float = 1.0    # 像素级 L1 重建
     lambda_grad:  float = 0.1    # 边缘 / 梯度 L1
     lambda_sem:   float = 0.05   # 语义 SmoothL1（软目标）
-    lambda_dir:   float = 0.02   # 方向约束 hinge
+    lambda_dir:   float = 0.005   # 方向约束 hinge
     lambda_tv:    float = 0.001  # 漏斗型相对 TV
 
     # ── 语义软目标参数 ─────────────────────────────────────────────
