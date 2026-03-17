@@ -1,22 +1,29 @@
 """
 train.py
-语义引导型 SR DDPM 的双阶段训练循环。
+SPM-UNet（语义先验调制 U-Net）的双阶段训练循环。
+
+架构层语义注入（相较旧版训练代码的新增点）
+------------------------------------------
+SPMUNet 在扩散骨干 UNet2DModel 之上新增了 SemanticEncoder + 两个 SemanticModBlock，
+把 `[p_clean, nuc_mask, conf_mask]` 注入到解码器的两个层级（64×64 与 128×128）。
+每个 batch 都会基于 HR 真值图通过 HoVer-Net 构造语义先验张量 `S`，并作为
+`semantic=S` 传入模型前向（Stage-2 才启用）。
 
 阶段 1（epoch < semantic_start_epoch）：
-    使用 L_noise + L_rec + L_grad + L_tv，做纯 SR 重建。
+    - 骨干重建预训练（Backbone Reconstruction Pretraining）
+    - 不启用语义调制（semantic=None）
+    - 不使用 L_sem / L_dir
+    - 损失：L_noise + L_rec + L_grad + L_tv
+    - 目标：先学到稳定的保真 SR 重建主干
 
 阶段 2（epoch >= semantic_start_epoch）：
-    额外加入 L_sem + L_dir，并在 semantic_warmup_epochs 内线性升权。
+    - 解冻全模型
+    - 加入 L_sem + L_dir，并在 semantic_warmup_epochs 内线性升权
+    - 传入 semantic=S → 启用结构注入（架构层语义调制）
 
-与旧的极化版 train.py 的主要区别
---------------------------------
-- 数据集返回的是 {"hr", "lr", "label"}，而不是 (image, label)
-- 模型输入为 [lr ‖ noisy_hr]，而不是 [clean ‖ noisy_clean]
-- 损失函数使用 semantic_sr_loss.py 中的 SemanticSRLoss
-- 最佳模型由 composite_score（PSNR/SSIM/Semantic_MAE/Artifact）选择，
-  不再使用 Conf_Gap
-- 记录的指标：PSNR、SSIM、L1、Masked_Semantic_MAE、Artifact_Penalty、
-  Composite_Score、sem_mae、dir_acc
+这实现了：
+  - 损失层语义引导（SemanticSRLoss）
+  - 架构层语义调制（SPMUNet 解码器注入）
 """
 
 import torch
@@ -30,7 +37,7 @@ import datetime
 from tqdm import tqdm
 
 from ddpm_dataset import NCTDataset
-from unet_wrapper import create_model
+from unet_wrapper import create_model, count_parameters
 from semantic_sr_loss import SemanticSRLoss
 from ddpm_utils import load_hovernet, get_device, print_gpu_info, predict_x0_from_noise_shared
 from logger import ExperimentLogger
@@ -98,9 +105,15 @@ def train(
             ])
 
     # ── 模型与调度器 ────────────────────────────────────────────────
-    print("Initialising model...")
-    unet      = create_model().to(device)
+    print("初始化 SPM-UNet...")
+    unet      = create_model(use_semantic=(hovernet is not None)).to(device)
     scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps)
+
+    # 参数量拆分（便于确认语义分支是否足够轻量）
+    param_info = count_parameters(unet)
+    bb = param_info.get('backbone', param_info['total'])
+    sem = param_info.get('semantic', 0)
+    print(f"  参数量：bone={bb:,}  semantic={sem:,}  total={param_info['total']:,}")
 
     loss_fn = None
     if hovernet is not None:
@@ -117,20 +130,63 @@ def train(
             lambda_tv=lambda_tv,
             t_max=t_max,
         ).to(device)
-        print("模式：语义引导 SR 训练")
+        print("模式：SPM-UNet 语义引导 SR（架构注入 + 损失约束）")
     else:
-        print("模式：仅重建的 SR（不使用 HoVer-Net）")
+        print("模式：仅重建 SR（不使用 HoVer-Net，语义分支关闭）")
 
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=0.01)
+    # 优化器策略（更严格两阶段）：
+    # - Stage-1：优化器只包含 backbone 参数（更省 optimizer state 内存）
+    # - Stage-2：重建优化器加入全部参数（backbone + 语义分支），并把 backbone 的 state 迁移过去
+    wd = 0.01
+    def _make_adamw(params):
+        return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+
+    def _transfer_adamw_state(old_opt, new_opt):
+        """
+        将 old_opt 中与 new_opt 共享的参数 state（如 Adam 的动量）迁移到 new_opt。
+        依赖参数对象 identity（同一 Parameter 对象在新旧优化器中一致）。
+        """
+        old_state = old_opt.state
+        for group in new_opt.param_groups:
+            for p in group["params"]:
+                if p in old_state:
+                    new_opt.state[p] = old_state[p]
+
+    def _backbone_params():
+        return list(unet.backbone_parameters()) if hasattr(unet, "backbone_parameters") else list(unet.parameters())
 
     # ── 断点续训 ────────────────────────────────────────────────────
     start_epoch = 0
+    ckpt_opt_loaded = False
+    ckpt_optimizer_state = None
     if resume_path and os.path.exists(resume_path):
         print(f"Resuming from: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
         unet.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        ckpt_optimizer_state = ckpt.get('optimizer_state_dict', None)
         start_epoch = ckpt.get('epoch', 0)
+
+    # 根据 start_epoch 决定从哪一阶段开始
+    start_in_stage2 = (loss_fn is not None) and (start_epoch >= semantic_start_epoch)
+
+    # 先构建一个“全参数”优化器用于兼容加载 Stage-2 的 checkpoint state（若有）
+    optimizer_full = _make_adamw(unet.parameters())
+    if ckpt_optimizer_state is not None:
+        try:
+            optimizer_full.load_state_dict(ckpt_optimizer_state)
+            ckpt_opt_loaded = True
+        except Exception as e:
+            print(f"⚠️  优化器状态加载失败，将从头初始化优化器 state：{e}")
+
+    # Stage-1 严格：只用 backbone 参数；Stage-2：用全参数
+    if start_in_stage2:
+        optimizer = optimizer_full
+        optimizer_is_full = True
+    else:
+        optimizer = _make_adamw(_backbone_params())
+        optimizer_is_full = False
+        if ckpt_opt_loaded:
+            _transfer_adamw_state(optimizer_full, optimizer)
 
     # ── 验证集（可视化）────────────────────────────────────────────
     val_set = None
@@ -154,6 +210,11 @@ def train(
     print(f"总训练轮数：{epochs} 个 epoch...")
     global_step = 0
 
+    # Stage-1 更严格：完全关闭语义注入 hooks，避免任何 hook 开销
+    # 到 Stage-2 再重新启用。
+    if loss_fn is not None and hasattr(unet, "disable_semantic_modulation") and semantic_start_epoch > 0 and (not start_in_stage2):
+        unet.disable_semantic_modulation()
+
     for epoch in range(start_epoch, epochs):
         unet.train()
 
@@ -161,6 +222,16 @@ def train(
                                             semantic_warmup_epochs)
         semantic_on = (epoch >= semantic_start_epoch) and (loss_fn is not None)
         stage_label = f"Stage{'2' if semantic_on else '1'} sem={sem_scale:.2f}"
+
+        # 进入 Stage-2：开启语义调制（注册 hooks）并扩展优化器到“全参数”
+        if semantic_on:
+            if hasattr(unet, "enable_semantic_modulation") and (getattr(unet, "use_semantic", False) is False):
+                unet.enable_semantic_modulation()
+            if not optimizer_is_full:
+                new_opt = _make_adamw(unet.parameters())
+                _transfer_adamw_state(optimizer, new_opt)
+                optimizer = new_opt
+                optimizer_is_full = True
 
         # 每个 epoch 的累计器
         acc = {k: 0.0 for k in
@@ -179,9 +250,27 @@ def train(
             timesteps = torch.randint(0, t_max, (bs,), device=device).long()
             noisy_hr  = scheduler.add_noise(hr, noise, timesteps)
 
-            # U-Net：以 LR 为条件，对 noisy_hr 去噪
+            # ── 构造语义先验张量 S = [p_clean, nuc_mask, conf_mask]
+            # 仅在 Stage-2（semantic_on=True）时需要（用于架构注入）。
+            sem_tensor = None
+            if semantic_on and loss_fn is not None and getattr(unet, "use_semantic", False):
+                with torch.no_grad():
+                    hn_dev = next(loss_fn.hovernet.parameters()).device
+                    hn_out = loss_fn.hovernet(hr.to(hn_dev) * 255.0)
+                    p_clean  = torch.softmax(hn_out['tp'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
+                    nuc_mask = torch.softmax(hn_out['np'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
+                    tau_p = torch.tensor(tau_pos, device=hn_dev)
+                    tau_n = torch.tensor(tau_neg, device=hn_dev)
+                    conf_mask = ((p_clean >= tau_p) | (p_clean <= tau_n)).float()  # [B,1,H,W]
+                    sem_tensor = torch.cat([p_clean, nuc_mask, conf_mask], dim=1).to(device)  # [B,3,H,W]
+
+            # U-Net：以 LR 为条件，对 noisy_hr 去噪（Stage-2 才启用语义注入）
             model_input = torch.cat([lr, noisy_hr], dim=1)   # [B, 6, H, W]
-            noise_pred  = unet(model_input, timesteps).sample
+            noise_pred  = unet(
+                model_input,
+                timesteps,
+                semantic=(sem_tensor if semantic_on else None),
+            ).sample
 
             # ── 损失计算 ───────────────────────────────────────────
             if loss_fn is not None:
@@ -394,7 +483,7 @@ def train(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description='Semantic-guided SR DDPM training')
+    p = argparse.ArgumentParser(description='SPM-UNet 语义引导 SR DDPM 训练')
     p.add_argument('--tum_dir',  required=True)
     p.add_argument('--norm_dir', required=True)
     p.add_argument('--hovernet_path', default=None)

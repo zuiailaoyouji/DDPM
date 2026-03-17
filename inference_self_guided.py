@@ -65,6 +65,27 @@ def get_hovernet_maps(hovernet, img_01):
     return p.cpu(), m.cpu()
 
 
+def build_semantic_tensor(hovernet, img_01: torch.Tensor,
+                          tau_pos: float = 0.65, tau_neg: float = 0.35,
+                          device: str | torch.device | None = None) -> torch.Tensor:
+    """
+    构造 SPM-UNet 所需语义先验张量 S = [p_clean, nuc_mask, conf_mask]。
+
+    - img_01 : [B,3,H,W]，取值范围 [0,1]
+    - 输出  : [B,3,H,W]，在 `device` 上（若 device=None 则保持在 img_01.device）
+    """
+    with torch.no_grad():
+        dev = next(hovernet.parameters()).device
+        out = hovernet(img_01.to(dev) * 255.0)
+        p_clean  = torch.softmax(out['tp'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
+        nuc_mask = torch.softmax(out['np'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
+        conf_mask = ((p_clean >= tau_pos) | (p_clean <= tau_neg)).float()
+        sem = torch.cat([p_clean, nuc_mask, conf_mask], dim=1)    # [B,3,H,W]
+        if device is None:
+            device = img_01.device
+        return sem.to(device)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 单张图像推理
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,6 +97,9 @@ def run_single_inference(
     max_l1_distortion=0.08,
     max_artifact_ratio=1.5,
     scale=2,
+    use_semantic_injection: bool = False,
+    tau_pos: float = 0.65,
+    tau_neg: float = 0.35,
 ):
     """
     对单张图像进行 SR 推理。
@@ -112,6 +136,13 @@ def run_single_inference(
     baseline_ssim = compute_ssim(bicubic_up.cpu(), hr.cpu())
     print(f"\n{fname}  |  Bicubic baseline: PSNR={baseline_psnr:.2f}dB  SSIM={baseline_ssim:.4f}")
 
+    # 语义先验（可选）：推理阶段没有真实 HR 时应使用输入/基线作为 proxy。
+    # 本脚本把输入图当作参考 HR，因此这里直接用 hr 构造 p_clean。
+    sem_tensor = None
+    if use_semantic_injection and (hovernet is not None) and getattr(unet, "use_semantic", False):
+        sem_tensor = build_semantic_tensor(
+            hovernet, hr, tau_pos=tau_pos, tau_neg=tau_neg, device=device)
+
     current = lr.clone()
     best_tensor   = lr.clone()
     best_score    = -float('inf')
@@ -127,7 +158,7 @@ def run_single_inference(
 
         model_input = torch.cat([lr, x_t], dim=1)
         with torch.no_grad():
-            noise_pred = unet(model_input, t_ten).sample
+            noise_pred = unet(model_input, t_ten, semantic=sem_tensor).sample
         pred = predict_x0_from_noise_shared(x_t, noise_pred, t_ten, scheduler)
 
         # 相对于 HR 参考的评价指标
@@ -141,11 +172,8 @@ def run_single_inference(
         if hovernet is not None:
             p_c, cm = get_hovernet_maps(hovernet, hr)
             p_p, _  = get_hovernet_maps(hovernet, pred)
-            # 简单的 p_target：p_clean ± 0.05 动态扰动
-            is_t    = (p_c > 0.5).float()
-            delta_m = is_t * 0.05 * (1 - p_c) + (1-is_t) * 0.05 * p_c
-            p_tgt   = (p_c + (2*is_t-1) * delta_m).clamp(0,1)
-            sem_mae = compute_masked_semantic_mae(p_p, p_tgt, cm)
+            # 与当前训练目标一致：希望 p_pred ≈ p_clean
+            sem_mae = compute_masked_semantic_mae(p_p, p_c, cm)
 
         score = compute_composite_score(psnr, ssim, sem_mae, art)
         score_history.append(score)
@@ -270,6 +298,12 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
         total_iters  = 1
         active       = [True] * B
 
+        # 可选：批量语义先验（来自 HR 参考图）
+        sem_tensor = None
+        if args.use_semantic_injection and (hovernet is not None) and getattr(unet, "use_semantic", False):
+            sem_tensor = build_semantic_tensor(
+                hovernet, hr_batch, tau_pos=args.tau_pos, tau_neg=args.tau_neg, device=device)
+
         for i in range(args.iters):
             if not any(active):
                 break
@@ -282,7 +316,7 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
 
             model_input = torch.cat([lr_batch, x_t], dim=1)
             with torch.no_grad():
-                noise_pred = unet(model_input, t_ten).sample
+                noise_pred = unet(model_input, t_ten, semantic=sem_tensor).sample
             pred = predict_x0_from_noise_shared(x_t, noise_pred, t_ten, scheduler)
 
             for idx in range(B):
@@ -299,10 +333,7 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                 if hovernet is not None:
                     pc, cm = get_hovernet_maps(hovernet, hr_batch[idx:idx+1])
                     pp, _  = get_hovernet_maps(hovernet, pred[idx:idx+1])
-                    is_t   = (pc > 0.5).float()
-                    dm     = is_t*0.05*(1-pc) + (1-is_t)*0.05*pc
-                    pt     = (pc + (2*is_t-1)*dm).clamp(0,1)
-                    sem    = compute_masked_semantic_mae(pp, pt, cm)
+                    sem    = compute_masked_semantic_mae(pp, pc, cm)
 
                 score = compute_composite_score(psnr, ssim, sem, art)
                 if score > best_scores[idx]:
@@ -332,10 +363,7 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
             if hovernet:
                 pc,cm = get_hovernet_maps(hovernet, hr_batch[idx:idx+1])
                 pp,_  = get_hovernet_maps(hovernet, best_tensor[idx:idx+1])
-                is_t  = (pc>0.5).float()
-                dm    = is_t*0.05*(1-pc)+(1-is_t)*0.05*pc
-                pt    = (pc+(2*is_t-1)*dm).clamp(0,1)
-                fsm   = compute_masked_semantic_mae(pp, pt, cm)
+                fsm   = compute_masked_semantic_mae(pp, pc, cm)
             fc = compute_composite_score(fp, fs, fsm, fa)
 
             rows.append(dict(
@@ -363,7 +391,7 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description='Semantic-guided SR DDPM inference')
+    p = argparse.ArgumentParser(description='SPM-UNet 语义注入 SR 推理')
     p.add_argument('--input_path',    required=True)
     p.add_argument('--output_dir',    default='./results/sr')
     p.add_argument('--unet_path',     required=True)
@@ -377,6 +405,12 @@ def main():
     p.add_argument('--batch_size',    type=int,   default=None)
     p.add_argument('--device',        default=None)
     p.add_argument('--gpu_id',        type=int,   default=None)
+    p.add_argument('--use_semantic_injection', action='store_true',
+                   help='启用 SPM-UNet 架构层语义注入（需要提供 hovernet_path）')
+    p.add_argument('--tau_pos', type=float, default=0.65,
+                   help='conf_mask 正类高置信阈值（与训练保持一致）')
+    p.add_argument('--tau_neg', type=float, default=0.35,
+                   help='conf_mask 负类高置信阈值（与训练保持一致）')
     args = p.parse_args()
 
     print_gpu_info()
@@ -386,7 +420,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    unet = create_model().to(args.device)
+    # 只有在启用语义注入且 hovernet 可用时才创建带语义分支的模型
+    unet = create_model(use_semantic=(args.use_semantic_injection and args.hovernet_path is not None)).to(args.device)
     ckpt = torch.load(args.unet_path, map_location=args.device)
     unet.load_state_dict(ckpt.get('model_state_dict', ckpt))
     unet.eval()
@@ -396,6 +431,11 @@ def main():
     if args.hovernet_path:
         hovernet = load_hovernet(args.hovernet_path, device=args.device)
         print("✓ HoVer-Net loaded")
+    if args.use_semantic_injection and hovernet is None:
+        print("⚠️  已指定 --use_semantic_injection 但未加载 HoVer-Net，语义注入将被忽略。")
+    if args.use_semantic_injection and hasattr(unet, "enable_semantic_modulation") and (hovernet is not None):
+        # 推理阶段确保 hooks 启用
+        unet.enable_semantic_modulation()
 
     scheduler = DDPMScheduler(num_train_timesteps=1000)
 

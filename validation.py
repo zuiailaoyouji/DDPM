@@ -124,7 +124,7 @@ class ValidationSet:
     def is_available(self):
         return self.hr is not None
 
-    def generate_reconstructions(self, unet, loss_module=None):
+    def generate_reconstructions(self, unet, loss_module=None, use_semantic_injection: bool = False):
         """
         在固定的验证 LR / noisy-HR 上运行一次 DDPM 前向。
 
@@ -138,7 +138,19 @@ class ValidationSet:
             return None
         with torch.no_grad():
             model_input = torch.cat([self.lr, self.noisy_hr], dim=1)
-            noise_pred  = unet(model_input, self.timesteps).sample
+
+            # 可选：SPM-UNet 架构层语义注入（semantic modulation）
+            # 语义先验 S = [p_clean, nuc_mask, conf_mask]，由 HR 真值图通过 HoVer-Net 得到
+            sem_tensor = None
+            if use_semantic_injection and (loss_module is not None) and hasattr(loss_module, '_run_hovernet'):
+                p_clean_map, nuc_mask = loss_module._run_hovernet(self.hr)  # [B,H,W], [B,H,W]
+                tau_pos = getattr(loss_module, 'tau_pos', 0.65)
+                tau_neg = getattr(loss_module, 'tau_neg', 0.35)
+                conf_mask = ((p_clean_map >= tau_pos) | (p_clean_map <= tau_neg)).float()
+                sem_tensor = torch.stack([p_clean_map, nuc_mask, conf_mask], dim=1)  # [B,3,H,W]
+
+            # 若 unet 是 SPMUNet 且当前阶段 hooks 已关闭，则 semantic 会被忽略/走直通路径
+            noise_pred = unet(model_input, self.timesteps, semantic=sem_tensor).sample
             recon = predict_x0_from_noise_shared(
                 self.noisy_hr, noise_pred, self.timesteps, self.scheduler)
 
