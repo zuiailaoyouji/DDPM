@@ -196,28 +196,21 @@ class SemanticSRLoss(nn.Module):
 
     def _build_soft_target(self, p_clean):
         """
-        构建动态 delta 的软目标图。
-        肿瘤像素： p_target = clip(p_clean + delta_t*(1-p_clean), 0, 1)
-        正常像素： p_target = clip(p_clean - delta_n*p_clean,     0, 1)
+        构建语义目标图。
+        对于语义引导 SR，希望 p_pred ≈ p_clean，不再人为加减 delta。
         """
-        is_tumor  = (p_clean > 0.5).float()
-        delta_map = (is_tumor       * self.delta_t * (1.0 - p_clean)
-                     + (1-is_tumor) * self.delta_n * p_clean)
-        direction = 2.0 * is_tumor - 1.0          # +1 for tumour, -1 for normal
-        p_target  = (p_clean + direction * delta_map).clamp(0.0, 1.0)
+        p_target = p_clean.detach()  # 直接用原始 HoVer-Net 概率图作为目标
         return p_target
 
     def _semantic_losses(self, x0_hat, hr):
         """
-        对有效子 batch 计算 L_sem 与 L_dir。
-        返回 (l_sem, l_dir, monitoring_dict)。
+        计算 L_sem 与 L_dir。
+        L_sem: 使 p_pred ≈ p_clean；L_dir: 可选方向约束 hinge。
         """
-        # --- 计算真实 p_clean（不回传梯度）---
         with torch.no_grad():
             p_clean, cell_mask = self._run_hovernet(hr)
 
-            conf_mask = ((p_clean >= self.tau_pos) |
-                         (p_clean <= self.tau_neg)).float()
+            conf_mask = ((p_clean >= self.tau_pos) | (p_clean <= self.tau_neg)).float()
             eff_mask  = cell_mask * conf_mask          # [B,H,W]
 
             if eff_mask.sum() < 1:
@@ -226,12 +219,12 @@ class SemanticSRLoss(nn.Module):
                     sem_mae=-1.0, dir_acc=-1.0,
                     p_hat_mean=-1.0, p_tgt_mean=-1.0)
 
-            p_target = self._build_soft_target(p_clean)
+            p_target = self._build_soft_target(p_clean)  # 纯 p_clean 目标，无 delta
 
-        # --- 预测的 p_neo（梯度通过 x0_hat 传回 U-Net）---
-        p_hat, _ = self._run_hovernet(x0_hat)        # [B,H,W], with grad
+        # 预测的 p_neo（梯度通过 x0_hat 传回 U-Net）
+        p_hat, _ = self._run_hovernet(x0_hat)
 
-        # 若 HoVer-Net 输出的空间尺寸更小，则在空间维度对齐
+        # 若 HoVer-Net 输出的空间尺寸更小，则对齐
         if p_hat.shape != eff_mask.shape:
             def _resize(t):
                 return F.interpolate(t.unsqueeze(1),
@@ -242,22 +235,18 @@ class SemanticSRLoss(nn.Module):
             p_target = _resize(p_target)
             p_clean  = _resize(p_clean)
 
-        # SmoothL1 语义回归损失
-        raw_sem      = F.smooth_l1_loss(p_hat,
-                                        p_target.detach(),
-                                        reduction='none')  # [B,H,W]
-        denom_sem    = eff_mask.sum().clamp(min=1.0)
-        l_sem        = (raw_sem * eff_mask).sum() / denom_sem
+        # SmoothL1 语义回归损失：p_pred ≈ p_clean
+        raw_sem   = F.smooth_l1_loss(p_hat, p_target, reduction='none')
+        denom_sem = eff_mask.sum().clamp(min=1.0)
+        l_sem     = (raw_sem * eff_mask).sum() / denom_sem
 
-        # 方向性 hinge：只惩罚方向错误的像素
+        # 可选方向约束 hinge
         is_tumor = (p_clean > 0.5).float()
-        # 肿瘤像素：希望 p_hat >= p_clean，若 p_hat < p_clean 则产生 hinge 损失
-        # 正常像素：希望 p_hat <= p_clean，若 p_hat > p_clean 则产生 hinge 损失
         dir_violation = (is_tumor       * F.relu(p_clean.detach() - p_hat)
                          + (1-is_tumor) * F.relu(p_hat - p_clean.detach()))
         l_dir         = (dir_violation * eff_mask).sum() / denom_sem
 
-        # 监控指标（不回传梯度）
+        # 监控指标
         with torch.no_grad():
             sem_mae    = ((p_hat - p_target).abs() * eff_mask).sum() / denom_sem
             is_t_f     = (p_clean > 0.5).float() * eff_mask
