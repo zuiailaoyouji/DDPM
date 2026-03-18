@@ -84,6 +84,7 @@ def train(
     accumulation_steps=1, resume_path=None,
     logger=None, val_vis_dir=None,
     num_train_timesteps=1000, t_max=400,
+    create_semantic_branch: bool = False,
 ):
     os.makedirs(save_dir, exist_ok=True)
     vis_dir = os.path.join(save_dir, 'visualizations')
@@ -105,7 +106,10 @@ def train(
 
     # ── 模型与调度器 ────────────────────────────────────────────────
     print("初始化 SPM-UNet...")
-    unet      = create_model(use_semantic=(hovernet is not None)).to(device)
+    # 允许 Stage-1 也创建语义分支但不使用：
+    # - create_semantic_branch=True：即使 hovernet=None 也创建 sem_encoder/mod_B
+    # - Stage-1 会关闭 hooks 且传 semantic=None，因此语义分支不会参与前向/训练
+    unet      = create_model(use_semantic=(create_semantic_branch or (hovernet is not None))).to(device)
     scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps)
 
     # 参数量拆分（便于确认语义分支是否足够轻量）
@@ -130,7 +134,10 @@ def train(
         ).to(device)
         print("模式：SPM-UNet 语义引导 SR（架构注入 + 损失约束）")
     else:
-        print("模式：仅重建 SR（不使用 HoVer-Net，语义分支关闭）")
+        if create_semantic_branch:
+            print("模式：仅重建 SR（未使用 HoVer-Net；已创建语义分支但阶段一不启用）")
+        else:
+            print("模式：仅重建 SR（不使用 HoVer-Net，语义分支关闭）")
 
     # 优化器策略（更严格两阶段）：
     # - Stage-1：优化器只包含 backbone 参数（更省 optimizer state 内存）
@@ -513,6 +520,8 @@ def main():
     p.add_argument('--exp_name',  default=None)
     p.add_argument('--val_vis_dir', default=None)
     p.add_argument('--t_max',     type=int, default=400)
+    p.add_argument('--create_semantic_branch', action='store_true',
+                   help='即使不传 hovernet_path，也创建 SPM-UNet 语义分支（Stage-1 默认不启用注入，用于与 Stage-2 架构对齐）')
 
     args = p.parse_args()
     print_gpu_info()
@@ -550,6 +559,7 @@ def main():
         resume_path=args.resume_path,
         logger=logger, val_vis_dir=args.val_vis_dir,
         t_max=args.t_max,
+        create_semantic_branch=args.create_semantic_branch,
     )
 
 
