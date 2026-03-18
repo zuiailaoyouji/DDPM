@@ -200,12 +200,12 @@ def save_validation_debug_images(
 
     # 行标签（左侧）
     rows_data = [
-        (_rgb(hr),            'HR (ground truth)'),
-        (_rgb(lr),            'LR input'),
-        (_rgb(reconstructed), 'Reconstructed'),
+        (_rgb(hr),            'HR'),
+        (_rgb(lr),            'LR'),
+        (_rgb(reconstructed), 'Recon'),
         (_rgb(diff_vis),      'Residual ×5'),
-        (_gray(p_clean),      'p_clean (HoVer-Net on HR)'),
-        (_gray(p_pred),       'p_pred  (HoVer-Net on recon)'),
+        (_gray(p_clean),      'p_clean'),
+        (_gray(p_pred),       'p_pred'),
     ]
 
     n_rows, n_cols = len(rows_data), num_vis
@@ -215,7 +215,8 @@ def save_validation_debug_images(
 
     # 总标题：用于展示 epoch / checkpoint 指标等
     if suptitle:
-        fig.suptitle(suptitle, fontsize=12, y=0.995)
+        # 标题字体更大，并贴近图像区域
+        fig.suptitle(suptitle, fontsize=16, y=0.99)
 
     # 列标题：Sample 1 / TUM-1 / NORM-1 等
     if col_titles is not None:
@@ -223,7 +224,6 @@ def save_validation_debug_images(
             axes[0, c].set_title(str(col_titles[c]), fontsize=10, pad=8)
 
     for r, (data, title) in enumerate(rows_data):
-        axes[r, 0].set_ylabel(title, fontsize=10)
         for c in range(n_cols):
             ax = axes[r, c]
             if data.ndim == 3:             # RGB 图像
@@ -232,8 +232,21 @@ def save_validation_debug_images(
                 ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
             ax.axis('off')
 
-    # 留出 suptitle 空间
-    plt.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1))
+        # 用文本绘制行标题（比 set_ylabel 更不容易被 tight_layout/axis off 吃掉）
+        axes[r, 0].text(
+            -0.06, 0.5, title,
+            transform=axes[r, 0].transAxes,
+            ha='right', va='center',
+            fontsize=12,
+        )
+
+    # 调整边距：给左侧行标题留空间，并给 suptitle 留更小的顶部空隙
+    if suptitle:
+        plt.subplots_adjust(left=0.12, right=0.99, top=0.93, bottom=0.02,
+                            wspace=0.02, hspace=0.02)
+    else:
+        plt.subplots_adjust(left=0.12, right=0.99, top=0.98, bottom=0.02,
+                            wspace=0.02, hspace=0.02)
     save_path = os.path.join(save_dir, f'epoch_{epoch:03d}_val.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
