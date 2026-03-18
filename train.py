@@ -345,8 +345,46 @@ def train(
 
             # 每个 epoch 的第一批样本可视化
             if batch_idx == 0 and val_set and val_set.is_available():
-                result = val_set.generate_reconstructions(unet, loss_fn)
+                # Stage-2 才启用结构注入的验证可视化；Stage-1 默认走 plain 路径
+                result = val_set.generate_reconstructions(
+                    unet, loss_fn, use_semantic_injection=semantic_on)
                 if result:
+                    # 生成列标题（TUM-1 / NORM-1 / Sample-i）
+                    col_titles = None
+                    try:
+                        if val_set.labels is not None:
+                            t_i = n_i = 0
+                            col_titles = []
+                            for lbl in val_set.labels[:min(8, val_set.labels.shape[0])].detach().cpu().tolist():
+                                if int(lbl) == 1:
+                                    t_i += 1
+                                    col_titles.append(f"TUM-{t_i}")
+                                else:
+                                    n_i += 1
+                                    col_titles.append(f"NORM-{n_i}")
+                    except Exception:
+                        col_titles = [f"Sample {i+1}" for i in range(min(8, val_set.hr.shape[0]))]
+
+                    # 计算并拼接总标题指标（整图顶部）
+                    try:
+                        v_psnr = compute_psnr(result['reconstructed'].cpu(), val_set.hr.cpu())
+                        v_ssim = compute_ssim(result['reconstructed'].cpu(), val_set.hr.cpu())
+                        v_l1   = F.l1_loss(result['reconstructed'], val_set.hr).item()
+                        v_art  = compute_artifact_penalty(result['reconstructed'].cpu(), val_set.hr.cpu())
+                        v_sem  = None
+                        if loss_fn is not None and semantic_on:
+                            # 与训练一致：p_pred ≈ p_clean（在 cell_mask 内）
+                            p_c, cm = loss_fn._run_hovernet(val_set.hr)
+                            p_p, _  = loss_fn._run_hovernet(result['reconstructed'])
+                            v_sem = compute_masked_semantic_mae(p_p, p_c, cm)
+
+                        suptitle = (f"Epoch {epoch+1} | {stage_label} | "
+                                    f"PSNR={v_psnr:.2f}dB  SSIM={v_ssim:.4f}  L1={v_l1:.4f}  Art={v_art:.3f}")
+                        if v_sem is not None:
+                            suptitle += f"  SemMAE={v_sem:.4f}"
+                    except Exception:
+                        suptitle = f"Epoch {epoch+1} | {stage_label}"
+
                     grid = save_validation_debug_images(
                         hr=val_set.hr, lr=val_set.lr,
                         reconstructed=result['reconstructed'],
@@ -355,6 +393,8 @@ def train(
                         p_pred=result['p_pred'],
                         epoch=epoch+1, save_dir=vis_dir,
                         num_vis=8, return_tensor=True,
+                        col_titles=col_titles,
+                        suptitle=suptitle,
                     )
                     if logger and grid is not None:
                         logger.log_images('Validation/SR_Comparison',

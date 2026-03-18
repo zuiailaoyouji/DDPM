@@ -177,6 +177,8 @@ class ValidationSet:
 def save_validation_debug_images(
     hr, lr, reconstructed, diff_vis, p_clean, p_pred,
     epoch, save_dir, num_vis=8, return_tensor=False,
+    col_titles=None,
+    suptitle: str = None,
 ):
     """
     保存 6 行图像的网格：
@@ -196,6 +198,7 @@ def save_validation_debug_images(
     def _gray(t):
         return t[:num_vis, 0].detach().cpu().clamp(0,1).numpy()
 
+    # 行标签（左侧）
     rows_data = [
         (_rgb(hr),            'HR (ground truth)'),
         (_rgb(lr),            'LR input'),
@@ -210,6 +213,15 @@ def save_validation_debug_images(
                               figsize=(2.8 * n_cols, 2.6 * n_rows),
                               squeeze=False)
 
+    # 总标题：用于展示 epoch / checkpoint 指标等
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=12, y=0.995)
+
+    # 列标题：Sample 1 / TUM-1 / NORM-1 等
+    if col_titles is not None:
+        for c in range(min(n_cols, len(col_titles))):
+            axes[0, c].set_title(str(col_titles[c]), fontsize=10, pad=8)
+
     for r, (data, title) in enumerate(rows_data):
         axes[r, 0].set_ylabel(title, fontsize=10)
         for c in range(n_cols):
@@ -220,7 +232,8 @@ def save_validation_debug_images(
                 ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
             ax.axis('off')
 
-    plt.tight_layout()
+    # 留出 suptitle 空间
+    plt.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1))
     save_path = os.path.join(save_dir, f'epoch_{epoch:03d}_val.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
