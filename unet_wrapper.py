@@ -163,17 +163,17 @@ class SemanticModBlock(nn.Module):
 # block_out_channels = (128, 128, 256, 256, 512, 512)
 # up_blocks 的通道是“倒序”生成：
 #   up_block[0] → 512  (32×32,  bottleneck)
-#   up_block[1] → 512  (64×64,  ← 注入点 A)
-#   up_block[2] → 256  (128×128,← 注入点 B)
+#   up_block[1] → 512  (64×64,  ← 低分辨率注入点 A，当前已停用，仅保留注释)
+#   up_block[2] → 256  (128×128,← 高分辨率注入点 B，当前唯一启用的注入点)
 #   up_block[3] → 256  (256×256)
 #   up_block[4] → 128  (256×256)
 #   up_block[5] → 128  (256×256)
-_INJECT_A = 1
-_INJECT_B = 2
-_CHAN_A   = 512
-_CHAN_B   = 256
-_SEM_A    = 64   # quarter-res 语义特征通道数
-_SEM_B    = 16   # half-res    语义特征通道数
+# _INJECT_A = 1                # 低分辨率注入点 A（64×64）—— 已注释，仅保留作参考
+_INJECT_B = 2                  # 高分辨率注入点 B（128×128）
+# _CHAN_A   = 512              # 注入点 A 的通道数
+_CHAN_B   = 256                # 注入点 B 的通道数
+# _SEM_A    = 64               # quarter-res 语义特征通道数（对应注入点 A）
+_SEM_B    = 16                 # half-res    语义特征通道数（对应注入点 B）
 
 
 class SPMUNet(nn.Module):
@@ -213,15 +213,15 @@ class SPMUNet(nn.Module):
         )
 
         self.sem_encoder: SemanticEncoder | None = None
-        self.mod_A: SemanticModBlock | None = None
-        self.mod_B: SemanticModBlock | None = None
+        # self.mod_A: SemanticModBlock | None = None   # 低分辨率注入块 A（64×64），当前停用
+        self.mod_B: SemanticModBlock | None = None     # 高分辨率注入块 B（128×128）
 
         self._sem_feats: dict[str, torch.Tensor] = {}
         self._hooks: list = []
 
         if self.use_semantic:
             self.sem_encoder = SemanticEncoder(in_channels=sem_channels)
-            self.mod_A = SemanticModBlock(feat_channels=_CHAN_A, sem_channels=_SEM_A)
+            # self.mod_A = SemanticModBlock(feat_channels=_CHAN_A, sem_channels=_SEM_A)
             self.mod_B = SemanticModBlock(feat_channels=_CHAN_B, sem_channels=_SEM_B)
             self._register_hooks()
 
@@ -245,10 +245,12 @@ class SPMUNet(nn.Module):
                 return mod_block(output, sem)
             return hook
 
-        assert self.mod_A is not None and self.mod_B is not None
-        h_A = self.unet.up_blocks[_INJECT_A].register_forward_hook(make_hook(self.mod_A, "sem_A"))
+        # 仅保留高分辨率注入点 B 的 hook；
+        # 低分辨率注入点 A 的 hook 暂时停用，仅保留作注释参考。
+        assert self.mod_B is not None
+        # h_A = self.unet.up_blocks[_INJECT_A].register_forward_hook(make_hook(self.mod_A, "sem_A"))
         h_B = self.unet.up_blocks[_INJECT_B].register_forward_hook(make_hook(self.mod_B, "sem_B"))
-        self._hooks = [h_A, h_B]
+        self._hooks = [h_B]
 
     def remove_hooks(self):
         """如需在保存前移除 hook，可调用该函数。"""
@@ -282,7 +284,7 @@ class SPMUNet(nn.Module):
         注意：只有在 forward 时传入 semantic!=None 才会真正注入语义特征。
         """
         self.use_semantic = True
-        if self.sem_encoder is None or self.mod_A is None or self.mod_B is None:
+        if self.sem_encoder is None or self.mod_B is None:
             # 理论上不会发生：构造时 use_semantic=True 才会创建语义分支
             return
         if not self._hooks:
@@ -301,8 +303,8 @@ class SPMUNet(nn.Module):
     ) -> UNet2DOutput:
         if self.use_semantic and (semantic is not None) and (self.sem_encoder is not None):
             s_quarter, s_half = self.sem_encoder(semantic)
-            self._sem_feats["sem_A"] = s_quarter
-            self._sem_feats["sem_B"] = s_half
+            # self._sem_feats["sem_A"] = s_quarter    # 注入点 A（64×64）当前停用
+            self._sem_feats["sem_B"] = s_half         # 仅使用高分辨率注入点 B（128×128）
         else:
             self._sem_feats.clear()
 
@@ -322,9 +324,10 @@ class SPMUNet(nn.Module):
 
     def semantic_parameters(self):
         """仅返回新增语义分支参数（可用于 Stage-1 冻结骨干时训练）。"""
-        if not self.use_semantic or self.sem_encoder is None or self.mod_A is None or self.mod_B is None:
+        if (not self.use_semantic) or self.sem_encoder is None or self.mod_B is None:
             return iter([])
-        return iter(list(self.sem_encoder.parameters()) + list(self.mod_A.parameters()) + list(self.mod_B.parameters()))
+        # 仅返回当前启用的高分辨率注入分支参数；低分辨率注入块 A 已停用。
+        return iter(list(self.sem_encoder.parameters()) + list(self.mod_B.parameters()))
 
     def backbone_parameters(self):
         """返回原始 UNet2DModel 的参数。"""
