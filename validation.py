@@ -130,9 +130,12 @@ class ValidationSet:
 
         返回的字典包含：
           reconstructed : [B,3,H,W]  重建结果
-          diff_vis      : [B,3,H,W]  |reconstructed - hr| × 5，可视化残差
-          p_clean       : [B,1,H,W]  HoVer-Net 在 HR 上的概率图
-          p_pred        : [B,1,H,W]  HoVer-Net 在重建结果上的概率图
+          diff_vis      : [B,3,H,W]  |reconstructed - hr| × 5
+          cls_clean     : [B,1,H,W]  clean 的 tp argmax 类别图（归一化到 0~1）
+          cls_pred      : [B,1,H,W]  pred  的 tp argmax 类别图（归一化到 0~1）
+          conf_clean    : [B,1,H,W]  clean 的 tp top1 置信度
+          conf_pred     : [B,1,H,W]  pred  的 tp top1 置信度
+          nuc_mask      : [B,1,H,W]  nuclei mask（np[:,1]）
         """
         if self.hr is None:
             return None
@@ -140,14 +143,15 @@ class ValidationSet:
             model_input = torch.cat([self.lr, self.noisy_hr], dim=1)
 
             # 可选：SPM-UNet 架构层语义注入（semantic modulation）
-            # 语义先验 S = [p_clean, nuc_mask, conf_mask]，由 HR 真值图通过 HoVer-Net 得到
+            # 语义先验 S = [tp_prob(6), nuc_mask, tp_conf]
             sem_tensor = None
             if use_semantic_injection and (loss_module is not None) and hasattr(loss_module, '_run_hovernet'):
-                p_clean_map, nuc_mask = loss_module._run_hovernet(self.hr)  # [B,H,W], [B,H,W]
-                tau_pos = getattr(loss_module, 'tau_pos', 0.65)
-                tau_neg = getattr(loss_module, 'tau_neg', 0.35)
-                conf_mask = ((p_clean_map >= tau_pos) | (p_clean_map <= tau_neg)).float()
-                sem_tensor = torch.stack([p_clean_map, nuc_mask, conf_mask], dim=1)  # [B,3,H,W]
+                c = loss_module._run_hovernet(self.hr)
+                sem_tensor = torch.cat([
+                    c['tp_prob'],
+                    c['nuc_mask'].unsqueeze(1),
+                    c['tp_conf'].unsqueeze(1),
+                ], dim=1)  # [B,8,H,W]
 
             # 若 unet 是 SPMUNet 且当前阶段 hooks 已关闭，则 semantic 会被忽略/走直通路径
             noise_pred = unet(model_input, self.timesteps, semantic=sem_tensor).sample
@@ -156,18 +160,27 @@ class ValidationSet:
 
             diff_vis = (recon - self.hr).abs().clamp(0, 1) * 5
 
-            p_clean = p_pred = torch.zeros(
-                self.hr.shape[0], 1, self.hr.shape[2], self.hr.shape[3],
-                device=self.device)
-
+            B, _, H, W = self.hr.shape
+            cls_clean = cls_pred = conf_clean = conf_pred = nuc_mask = torch.zeros(B, 1, H, W, device=self.device)
             if loss_module is not None and hasattr(loss_module, '_run_hovernet'):
-                p_c_map, _  = loss_module._run_hovernet(self.hr)
-                p_p_map, _  = loss_module._run_hovernet(recon)
-                p_clean = p_c_map.unsqueeze(1)
-                p_pred  = p_p_map.unsqueeze(1)
+                c = loss_module._run_hovernet(self.hr)
+                p = loss_module._run_hovernet(recon)
+                nr_types = c['tp_prob'].shape[1]
+                cls_clean = (c['tp_label'].float() / max(nr_types - 1, 1)).unsqueeze(1)
+                cls_pred  = (p['tp_label'].float() / max(nr_types - 1, 1)).unsqueeze(1)
+                conf_clean = c['tp_conf'].unsqueeze(1)
+                conf_pred  = p['tp_conf'].unsqueeze(1)
+                nuc_mask   = c['nuc_mask'].unsqueeze(1)
 
-        return dict(reconstructed=recon, diff_vis=diff_vis,
-                    p_clean=p_clean, p_pred=p_pred)
+        return dict(
+            reconstructed=recon,
+            diff_vis=diff_vis,
+            cls_clean=cls_clean,
+            cls_pred=cls_pred,
+            conf_clean=conf_clean,
+            conf_pred=conf_pred,
+            nuc_mask=nuc_mask,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,7 +188,7 @@ class ValidationSet:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_validation_debug_images(
-    hr, lr, reconstructed, diff_vis, p_clean, p_pred,
+    hr, lr, reconstructed, diff_vis, cls_clean, cls_pred, conf_clean, conf_pred, nuc_mask,
     epoch, save_dir, num_vis=8, return_tensor=False,
     col_titles=None,
     suptitle: str = None,
@@ -186,8 +199,11 @@ def save_validation_debug_images(
       第 2 行：LR 输入
       第 3 行：重建结果
       第 4 行：绝对残差 ×5
-      第 5 行：p_clean 热力图
-      第 6 行：p_pred 热力图
+      第 5 行：clean tp 类别图（argmax）
+      第 6 行：pred tp 类别图（argmax）
+      第 7 行：clean tp 置信度
+      第 8 行：pred tp 置信度
+      第 9 行：nuclei mask
     """
     os.makedirs(save_dir, exist_ok=True)
     num_vis = min(num_vis, hr.shape[0])
@@ -200,12 +216,15 @@ def save_validation_debug_images(
 
     # 行标签（左侧）
     rows_data = [
-        (_rgb(hr),            'HR (ground truth)'),
-        (_rgb(lr),            'LR input'),
-        (_rgb(reconstructed), 'Reconstructed'),
+        (_rgb(hr),            'HR'),
+        (_rgb(lr),            'LR'),
+        (_rgb(reconstructed), 'Recon'),
         (_rgb(diff_vis),      'Residual ×5'),
-        (_gray(p_clean),      'p_clean (HoVer-Net on HR)'),
-        (_gray(p_pred),       'p_pred  (HoVer-Net on recon)'),
+        (_gray(cls_clean),    'tp_label clean'),
+        (_gray(cls_pred),     'tp_label pred'),
+        (_gray(conf_clean),   'tp_conf clean'),
+        (_gray(conf_pred),    'tp_conf pred'),
+        (_gray(nuc_mask),     'nuc_mask'),
     ]
 
     n_rows, n_cols = len(rows_data), num_vis

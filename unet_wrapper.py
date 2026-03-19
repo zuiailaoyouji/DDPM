@@ -8,7 +8,7 @@ unet_wrapper.py
 在其上新增两类模块，用“辅助”的方式把语义先验注入到解码器特征中：
 
 - **SemanticEncoder（语义编码器）**
-  输入：`S = [p_clean, nuc_mask, conf_mask]`（3 通道语义先验）
+  输入：`S = [tp_prob(6), nuc_mask(1), tp_conf(1)]`（8 通道语义先验）
   输出：多尺度语义特征（1/4 与 1/2 分辨率）
 
 - **SemanticModBlock（语义调制块）**
@@ -30,7 +30,7 @@ API 兼容性
 
   `noise_pred = model(model_input, timestep, semantic=S).sample`
 
-其中 `model_input` 仍为 `[B,6,H,W]`；`semantic` 可选，为 `[B,3,H,W]`。
+其中 `model_input` 仍为 `[B,6,H,W]`；`semantic` 可选，为 `[B,8,H,W]`。
 当 `semantic=None` 或 `use_semantic=False` 时，模型行为等价于普通 `UNet2DModel`。
 """
 
@@ -49,10 +49,10 @@ from diffusers.models.unet_2d import UNet2DOutput
 
 class SemanticEncoder(nn.Module):
     """
-    轻量级 CNN：把 3 通道语义先验映射为多尺度特征，供语义调制块使用。
+    轻量级 CNN：把多通道语义先验映射为多尺度特征，供语义调制块使用。
 
     输入：
-      s : [B, 3, H, W]，通道含义为 (p_clean, nuc_mask, conf_mask)，取值范围 [0,1]
+      s : [B, 8, H, W]，通道含义为 (tp_prob(6), nuc_mask, tp_conf)，取值范围 [0,1]
 
     输出：
       s_quarter : [B, 64, H/4, W/4]  （用于 64×64 注入点）
@@ -61,7 +61,7 @@ class SemanticEncoder(nn.Module):
     该分支刻意做得很小，避免参数量与计算量显著增加。
     """
 
-    def __init__(self, in_channels: int = 3):
+    def __init__(self, in_channels: int = 8):
         super().__init__()
 
         self.enc1 = nn.Sequential(
@@ -181,7 +181,7 @@ class SPMUNet(nn.Module):
     语义先验调制 U-Net（SPM-UNet）。
 
     - 输入：sample=[B,6,H,W]（[LR ‖ noisy_HR]）
-    - 可选语义先验：semantic=[B,3,H,W]（[p_clean, nuc_mask, conf_mask]）
+    - 可选语义先验：semantic=[B,8,H,W]（[tp_prob(6), nuc_mask, tp_conf]）
     - 输出：UNet2DOutput，其中 `.sample` 为 [B,3,H,W] 的噪声预测
     """
 
@@ -190,7 +190,7 @@ class SPMUNet(nn.Module):
         sample_size: int = 256,
         in_channels: int = 6,
         out_channels: int = 3,
-        sem_channels: int = 3,
+        sem_channels: int = 8,
         use_semantic: bool = True,
     ):
         super().__init__()
@@ -298,7 +298,7 @@ class SPMUNet(nn.Module):
         self,
         sample: torch.Tensor,                # [B, 6, H, W]
         timestep: torch.Tensor | int,
-        semantic: torch.Tensor | None = None,  # [B, 3, H, W]
+        semantic: torch.Tensor | None = None,  # [B, 8, H, W]
         **kwargs,
     ) -> UNet2DOutput:
         if self.use_semantic and (semantic is not None) and (self.sem_encoder is not None):

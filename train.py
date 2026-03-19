@@ -4,8 +4,8 @@ SPM-UNet（语义先验调制 U-Net）的双阶段训练循环。
 
 架构层语义注入（相较旧版训练代码的新增点）
 ------------------------------------------
-SPMUNet 在扩散骨干 UNet2DModel 之上新增了 SemanticEncoder + 两个 SemanticModBlock，
-把 `[p_clean, nuc_mask, conf_mask]` 注入到解码器的两个层级（64×64 与 128×128）。
+SPMUNet 在扩散骨干 UNet2DModel 之上新增了 SemanticEncoder + SemanticModBlock，
+把 `[tp_prob(6), nuc_mask, tp_conf]` 注入到解码器高分辨率层（128×128）。
 每个 batch 都会基于 HR 真值图通过 HoVer-Net 构造语义先验张量 `S`，并作为
 `semantic=S` 传入模型前向（Stage-2 才启用）。
 
@@ -44,7 +44,7 @@ from logger import ExperimentLogger
 from validation import (ValidationSet, create_val_dataloader,
                          save_validation_debug_images)
 from metrics import (compute_psnr, compute_ssim,
-                      compute_masked_semantic_mae, compute_artifact_penalty,
+                      compute_artifact_penalty,
                       compute_composite_score)
 
 
@@ -74,8 +74,10 @@ def train(
     # 各项损失权重
     lambda_noise=1.0, lambda_rec=1.0, lambda_grad=0.1,
     lambda_sem=0.05,  lambda_dir=0.02, lambda_tv=0.001,
-    # 语义监督阈值
-    tau_pos=0.65, tau_neg=0.35,
+    # 多类别语义监督阈值
+    tau_nuc=0.5, tau_conf=0.7,
+    # 语义子项内部权重
+    lambda_sem_dist=1.0, lambda_sem_cls=0.3, lambda_sem_conf=0.1,
     # 双阶段训练日程
     semantic_start_epoch=5, semantic_warmup_epochs=5,
     # 在线退化配置
@@ -100,6 +102,7 @@ def train(
                 'Epoch', 'Stage',
                 'Total_Loss', 'L_noise', 'L_rec', 'L_grad',
                 'L_sem', 'L_dir', 'L_tv',
+                'L_sem_dist', 'L_sem_cls', 'L_sem_conf',
                 'Sem_MAE', 'Dir_Acc',
                 'Sem_Scale',
             ])
@@ -123,7 +126,10 @@ def train(
         loss_fn = SemanticSRLoss(
             hovernet=hovernet,
             noise_scheduler=scheduler,
-            tau_pos=tau_pos, tau_neg=tau_neg,
+            tau_nuc=tau_nuc, tau_conf=tau_conf,
+            lambda_sem_dist=lambda_sem_dist,
+            lambda_sem_cls=lambda_sem_cls,
+            lambda_sem_conf=lambda_sem_conf,
             lambda_noise=lambda_noise,
             lambda_rec=lambda_rec,
             lambda_grad=lambda_grad,
@@ -241,6 +247,7 @@ def train(
         # 每个 epoch 的累计器
         acc = {k: 0.0 for k in
                ('total','noise','rec','grad','sem','dir','tv',
+                'sem_dist','sem_cls','sem_conf',
                 'sem_mae','dir_acc','sem_mae_n','dir_acc_n')}
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} | {stage_label}")
@@ -255,19 +262,17 @@ def train(
             timesteps = torch.randint(0, t_max, (bs,), device=device).long()
             noisy_hr  = scheduler.add_noise(hr, noise, timesteps)
 
-            # ── 构造语义先验张量 S = [p_clean, nuc_mask, conf_mask]
+            # ── 构造语义先验张量 S = [tp_prob(6), nuc_mask, tp_conf]
             # 仅在 Stage-2（semantic_on=True）时需要（用于架构注入）。
             sem_tensor = None
             if semantic_on and loss_fn is not None and getattr(unet, "use_semantic", False):
                 with torch.no_grad():
                     hn_dev = next(loss_fn.hovernet.parameters()).device
                     hn_out = loss_fn.hovernet(hr.to(hn_dev) * 255.0)
-                    p_clean  = torch.softmax(hn_out['tp'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
-                    nuc_mask = torch.softmax(hn_out['np'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
-                    tau_p = torch.tensor(tau_pos, device=hn_dev)
-                    tau_n = torch.tensor(tau_neg, device=hn_dev)
-                    conf_mask = ((p_clean >= tau_p) | (p_clean <= tau_n)).float()  # [B,1,H,W]
-                    sem_tensor = torch.cat([p_clean, nuc_mask, conf_mask], dim=1).to(device)  # [B,3,H,W]
+                    tp_prob  = torch.softmax(hn_out['tp'], dim=1)                 # [B,6,H,W]
+                    nuc_mask = torch.softmax(hn_out['np'], dim=1)[:, 1:2, :, :]   # [B,1,H,W]
+                    tp_conf, _ = torch.max(tp_prob, dim=1, keepdim=True)          # [B,1,H,W]
+                    sem_tensor = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1).to(device)  # [B,8,H,W]
 
             # U-Net：以 LR 为条件，对 noisy_hr 去噪（Stage-2 才启用语义注入）
             model_input = torch.cat([lr, noisy_hr], dim=1)   # [B, 6, H, W]
@@ -306,6 +311,7 @@ def train(
                           l_grad=l_grad.detach(),
                           l_sem=torch.zeros(()), l_dir=torch.zeros(()),
                           l_tv=torch.zeros(()),
+                          l_sem_dist=torch.zeros(()), l_sem_cls=torch.zeros(()), l_sem_conf=torch.zeros(()),
                           sem_mae=torch.tensor(-1.0),
                           dir_acc=torch.tensor(-1.0),
                           p_hat_mean=torch.tensor(-1.0),
@@ -323,6 +329,9 @@ def train(
             acc['total'] += loss_val
             for k in ('noise','rec','grad','sem','dir','tv'):
                 acc[k] += bd[f'l_{k}'].item()
+            acc['sem_dist'] += bd['l_sem_dist'].item()
+            acc['sem_cls']  += bd['l_sem_cls'].item()
+            acc['sem_conf'] += bd['l_sem_conf'].item()
             sm = bd['sem_mae'].item(); da = bd['dir_acc'].item()
             if sm >= 0:
                 acc['sem_mae'] += sm;  acc['sem_mae_n'] += 1
@@ -339,6 +348,9 @@ def train(
                     'L_sem':   bd['l_sem'].item(),
                     'L_dir':   bd['l_dir'].item(),
                     'L_tv':    bd['l_tv'].item(),
+                    'L_sem_dist': bd['l_sem_dist'].item(),
+                    'L_sem_cls':  bd['l_sem_cls'].item(),
+                    'L_sem_conf': bd['l_sem_conf'].item(),
                     'Sem_Scale': sem_scale,
                 }, step=global_step, prefix='Train')
                 logger.flush()
@@ -373,10 +385,13 @@ def train(
                         v_art  = compute_artifact_penalty(result['reconstructed'].cpu(), val_set.hr.cpu())
                         v_sem  = None
                         if loss_fn is not None and semantic_on:
-                            # 与训练一致：p_pred ≈ p_clean（在 cell_mask 内）
-                            p_c, cm = loss_fn._run_hovernet(val_set.hr)
-                            p_p, _  = loss_fn._run_hovernet(result['reconstructed'])
-                            v_sem = compute_masked_semantic_mae(p_p, p_c, cm)
+                            c = loss_fn._run_hovernet(val_set.hr)
+                            p = loss_fn._run_hovernet(result['reconstructed'])
+                            cm = c['nuc_mask']
+                            valid_mask = ((cm > loss_fn.tau_nuc) & (c['tp_conf'] > loss_fn.tau_conf)).float()
+                            denom = valid_mask.sum().clamp(min=1.0)
+                            mae_map = (p['tp_prob'] - c['tp_prob']).abs().mean(dim=1)
+                            v_sem = ((mae_map * valid_mask).sum() / denom).item()
 
                         suptitle = (f"Epoch {epoch+1} | {stage_label} | "
                                     f"PSNR={v_psnr:.2f}dB  SSIM={v_ssim:.4f}  L1={v_l1:.4f}  Art={v_art:.3f}")
@@ -389,8 +404,11 @@ def train(
                         hr=val_set.hr, lr=val_set.lr,
                         reconstructed=result['reconstructed'],
                         diff_vis=result['diff_vis'],
-                        p_clean=result['p_clean'],
-                        p_pred=result['p_pred'],
+                        cls_clean=result['cls_clean'],
+                        cls_pred=result['cls_pred'],
+                        conf_clean=result['conf_clean'],
+                        conf_pred=result['conf_pred'],
+                        nuc_mask=result['nuc_mask'],
                         epoch=epoch+1, save_dir=vis_dir,
                         num_vis=8, return_tensor=True,
                         col_titles=col_titles,
@@ -406,6 +424,9 @@ def train(
         # ── 每个 epoch 的平均指标 ─────────────────────────────────
         n = len(dataloader)
         avg = {k: acc[k]/n for k in ('total','noise','rec','grad','sem','dir','tv')}
+        avg_sem_dist = acc['sem_dist'] / n
+        avg_sem_cls  = acc['sem_cls'] / n
+        avg_sem_conf = acc['sem_conf'] / n
         avg_sem_mae = acc['sem_mae']/acc['sem_mae_n'] if acc['sem_mae_n'] else -1.0
         avg_dir_acc = acc['dir_acc']/acc['dir_acc_n'] if acc['dir_acc_n'] else -1.0
 
@@ -413,12 +434,16 @@ def train(
         print(f"  Total={avg['total']:.4f}  noise={avg['noise']:.4f}  "
               f"rec={avg['rec']:.4f}  grad={avg['grad']:.4f}")
         print(f"  sem={avg['sem']:.4f}  dir={avg['dir']:.4f}  tv={avg['tv']:.4f}")
+        print(f"  sem_dist={avg_sem_dist:.4f}  sem_cls={avg_sem_cls:.4f}  sem_conf={avg_sem_conf:.4f}")
         if avg_sem_mae >= 0:
             print(f"  Sem_MAE={avg_sem_mae:.4f}  Dir_Acc={avg_dir_acc:.4f}")
 
         if logger:
             logger.log_metrics({
                 **{f'L_{k}': v for k,v in avg.items()},
+                'L_sem_dist': avg_sem_dist,
+                'L_sem_cls': avg_sem_cls,
+                'L_sem_conf': avg_sem_conf,
                 'Sem_MAE': avg_sem_mae, 'Dir_Acc': avg_dir_acc,
                 'Sem_Scale': sem_scale,
             }, step=epoch+1, prefix='Epoch')
@@ -430,6 +455,7 @@ def train(
                 '2' if semantic_on else '1',
                 avg['total'], avg['noise'], avg['rec'], avg['grad'],
                 avg['sem'], avg['dir'], avg['tv'],
+                avg_sem_dist, avg_sem_cls, avg_sem_conf,
                 avg_sem_mae, avg_dir_acc, sem_scale,
             ])
 
@@ -460,10 +486,12 @@ def train(
 
                     # 语义 MAE（仅在 HoVer-Net 可用时计算）
                     if loss_fn is not None and semantic_on:
-                        p_c, cm = loss_fn._run_hovernet(vhr)
-                        p_p, _  = loss_fn._run_hovernet(vx0)
-                        p_tgt   = loss_fn._build_soft_target(p_c)
-                        v_sem_mae += compute_masked_semantic_mae(p_p, p_tgt, cm)
+                        c = loss_fn._run_hovernet(vhr)
+                        p = loss_fn._run_hovernet(vx0)
+                        valid_mask = ((c['nuc_mask'] > loss_fn.tau_nuc) & (c['tp_conf'] > loss_fn.tau_conf)).float()
+                        denom = valid_mask.sum().clamp(min=1.0)
+                        mae_map = (p['tp_prob'] - c['tp_prob']).abs().mean(dim=1)
+                        v_sem_mae += ((mae_map * valid_mask).sum() / denom).item()
                     v_n += 1
 
             if v_n > 0:
@@ -546,8 +574,11 @@ def main():
     p.add_argument('--lambda_dir',   type=float, default=0.02)
     p.add_argument('--lambda_tv',    type=float, default=0.001)
     # Semantic
-    p.add_argument('--tau_pos',  type=float, default=0.65)
-    p.add_argument('--tau_neg',  type=float, default=0.35)
+    p.add_argument('--tau_nuc',   type=float, default=0.5)
+    p.add_argument('--tau_conf',  type=float, default=0.7)
+    p.add_argument('--lambda_sem_dist', type=float, default=1.0)
+    p.add_argument('--lambda_sem_cls',  type=float, default=0.3)
+    p.add_argument('--lambda_sem_conf', type=float, default=0.1)
     p.add_argument('--semantic_start_epoch',  type=int, default=5)
     p.add_argument('--semantic_warmup_epochs',type=int, default=5)
     # Degradation
@@ -591,7 +622,10 @@ def main():
         lambda_noise=args.lambda_noise, lambda_rec=args.lambda_rec,
         lambda_grad=args.lambda_grad, lambda_sem=args.lambda_sem,
         lambda_dir=args.lambda_dir, lambda_tv=args.lambda_tv,
-        tau_pos=args.tau_pos, tau_neg=args.tau_neg,
+        tau_nuc=args.tau_nuc, tau_conf=args.tau_conf,
+        lambda_sem_dist=args.lambda_sem_dist,
+        lambda_sem_cls=args.lambda_sem_cls,
+        lambda_sem_conf=args.lambda_sem_conf,
         semantic_start_epoch=args.semantic_start_epoch,
         semantic_warmup_epochs=args.semantic_warmup_epochs,
         scale=args.scale,

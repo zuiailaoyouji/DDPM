@@ -66,10 +66,9 @@ def get_hovernet_maps(hovernet, img_01):
 
 
 def build_semantic_tensor(hovernet, img_01: torch.Tensor,
-                          tau_pos: float = 0.65, tau_neg: float = 0.35,
                           device: str | torch.device | None = None) -> torch.Tensor:
     """
-    构造 SPM-UNet 所需语义先验张量 S = [p_clean, nuc_mask, conf_mask]。
+    构造 SPM-UNet 所需语义先验张量 S = [tp_prob(6), nuc_mask, tp_conf]。
 
     - img_01 : [B,3,H,W]，取值范围 [0,1]
     - 输出  : [B,3,H,W]，在 `device` 上（若 device=None 则保持在 img_01.device）
@@ -77,10 +76,10 @@ def build_semantic_tensor(hovernet, img_01: torch.Tensor,
     with torch.no_grad():
         dev = next(hovernet.parameters()).device
         out = hovernet(img_01.to(dev) * 255.0)
-        p_clean  = torch.softmax(out['tp'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
+        tp_prob  = torch.softmax(out['tp'], dim=1)                 # [B,6,H,W]
         nuc_mask = torch.softmax(out['np'], dim=1)[:, 1:2, :, :]  # [B,1,H,W]
-        conf_mask = ((p_clean >= tau_pos) | (p_clean <= tau_neg)).float()
-        sem = torch.cat([p_clean, nuc_mask, conf_mask], dim=1)    # [B,3,H,W]
+        tp_conf, _ = torch.max(tp_prob, dim=1, keepdim=True)      # [B,1,H,W]
+        sem = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1)      # [B,8,H,W]
         if device is None:
             device = img_01.device
         return sem.to(device)
@@ -98,8 +97,6 @@ def run_single_inference(
     max_artifact_ratio=1.5,
     scale=2,
     use_semantic_injection: bool = False,
-    tau_pos: float = 0.65,
-    tau_neg: float = 0.35,
 ):
     """
     对单张图像进行 SR 推理。
@@ -140,8 +137,7 @@ def run_single_inference(
     # 本脚本把输入图当作参考 HR，因此这里直接用 hr 构造 p_clean。
     sem_tensor = None
     if use_semantic_injection and (hovernet is not None) and getattr(unet, "use_semantic", False):
-        sem_tensor = build_semantic_tensor(
-            hovernet, hr, tau_pos=tau_pos, tau_neg=tau_neg, device=device)
+        sem_tensor = build_semantic_tensor(hovernet, hr, device=device)
 
     current = lr.clone()
     best_tensor   = lr.clone()
@@ -301,8 +297,7 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
         # 可选：批量语义先验（来自 HR 参考图）
         sem_tensor = None
         if args.use_semantic_injection and (hovernet is not None) and getattr(unet, "use_semantic", False):
-            sem_tensor = build_semantic_tensor(
-                hovernet, hr_batch, tau_pos=args.tau_pos, tau_neg=args.tau_neg, device=device)
+            sem_tensor = build_semantic_tensor(hovernet, hr_batch, device=device)
 
         for i in range(args.iters):
             if not any(active):
@@ -407,10 +402,6 @@ def main():
     p.add_argument('--gpu_id',        type=int,   default=None)
     p.add_argument('--use_semantic_injection', action='store_true',
                    help='启用 SPM-UNet 架构层语义注入（需要提供 hovernet_path）')
-    p.add_argument('--tau_pos', type=float, default=0.65,
-                   help='conf_mask 正类高置信阈值（与训练保持一致）')
-    p.add_argument('--tau_neg', type=float, default=0.35,
-                   help='conf_mask 负类高置信阈值（与训练保持一致）')
     args = p.parse_args()
 
     print_gpu_info()

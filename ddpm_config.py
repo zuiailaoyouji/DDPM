@@ -47,16 +47,19 @@ class TrainingConfig:
     lambda_noise: float = 1.0    # 扩散噪声 MSE
     lambda_rec:   float = 1.0    # 像素级 L1 重建
     lambda_grad:  float = 0.15    # 边缘 / 梯度 L1
-    lambda_sem:   float = 0.05   # 语义 SmoothL1（软目标）
-    lambda_dir:   float = 0.005   # 方向约束 hinge
+    lambda_sem:   float = 0.05   # 语义总权重（主项）
+    lambda_dir:   float = 0.005  # 语义辅助权重（兼容旧字段名）
     lambda_tv:    float = 0.001  # 漏斗型相对 TV
 
     # ── 语义目标参数 ───────────────────────────────────────────────
-    # 当前语义目标为 p_target = p_clean（不再使用 delta 偏移）。
-
-    # 语义监督掩膜的高置信度阈值
-    tau_pos: float = 0.65   # p_clean >= tau_pos → 高置信肿瘤像素
-    tau_neg: float = 0.35   # p_clean <= tau_neg → 高置信正常像素
+    # 多类别核语义监督区域：
+    # valid_mask = (nuc_mask > tau_nuc) & (tp_conf > tau_conf)
+    tau_nuc:  float = 0.5
+    tau_conf: float = 0.7
+    # 语义子项权重（loss 内部组合）
+    lambda_sem_dist: float = 1.0
+    lambda_sem_cls:  float = 0.3
+    lambda_sem_conf: float = 0.1
 
     # ── 双阶段训练策略 ─────────────────────────────────────────────
     # 阶段 1（epoch < semantic_start_epoch）：
