@@ -46,6 +46,7 @@ from validation import (ValidationSet, create_val_dataloader,
 from metrics import (compute_psnr, compute_ssim,
                       compute_artifact_penalty,
                       compute_composite_score)
+from ddpm_config import get_default_config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,41 +564,42 @@ def train(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    cfg = get_default_config()
     p = argparse.ArgumentParser(description='SPM-UNet 语义引导 SR DDPM 训练')
-    p.add_argument('--tum_dir',  required=True)
-    p.add_argument('--norm_dir', required=True)
-    p.add_argument('--hovernet_path', default=None)
-    p.add_argument('--epochs',     type=int,   default=100)
-    p.add_argument('--batch_size', type=int,   default=8)
-    p.add_argument('--lr',         type=float, default=1e-4)
-    p.add_argument('--device',     type=str,   default=None)
+    p.add_argument('--tum_dir',  default=cfg.tum_dir)
+    p.add_argument('--norm_dir', default=cfg.norm_dir)
+    p.add_argument('--hovernet_path', default=cfg.hovernet_path)
+    p.add_argument('--epochs',     type=int,   default=cfg.epochs)
+    p.add_argument('--batch_size', type=int,   default=cfg.batch_size)
+    p.add_argument('--lr',         type=float, default=cfg.lr)
+    p.add_argument('--device',     type=str,   default=cfg.device)
     p.add_argument('--gpu_id',     type=int,   default=None)
-    p.add_argument('--save_dir',   default='./checkpoints_sr')
+    p.add_argument('--save_dir',   default=cfg.save_dir)
     # Loss weights
-    p.add_argument('--lambda_noise', type=float, default=1.0)
-    p.add_argument('--lambda_rec',   type=float, default=1.0)
-    p.add_argument('--lambda_grad',  type=float, default=0.1)
-    p.add_argument('--lambda_sem',   type=float, default=0.05)
-    p.add_argument('--lambda_dir',   type=float, default=0.02)
-    p.add_argument('--lambda_tv',    type=float, default=0.001)
+    p.add_argument('--lambda_noise', type=float, default=cfg.lambda_noise)
+    p.add_argument('--lambda_rec',   type=float, default=cfg.lambda_rec)
+    p.add_argument('--lambda_grad',  type=float, default=cfg.lambda_grad)
+    p.add_argument('--lambda_sem',   type=float, default=cfg.lambda_sem)
+    p.add_argument('--lambda_dir',   type=float, default=cfg.lambda_dir)
+    p.add_argument('--lambda_tv',    type=float, default=cfg.lambda_tv)
     # Semantic
-    p.add_argument('--tau_nuc',   type=float, default=0.5)
-    p.add_argument('--tau_conf',  type=float, default=0.7)
-    p.add_argument('--lambda_sem_dist', type=float, default=1.0)
-    p.add_argument('--lambda_sem_cls',  type=float, default=0.3)
-    p.add_argument('--lambda_sem_conf', type=float, default=0.1)
-    p.add_argument('--semantic_start_epoch',  type=int, default=5)
-    p.add_argument('--semantic_warmup_epochs',type=int, default=5)
+    p.add_argument('--tau_nuc',   type=float, default=cfg.tau_nuc)
+    p.add_argument('--tau_conf',  type=float, default=cfg.tau_conf)
+    p.add_argument('--lambda_sem_dist', type=float, default=cfg.lambda_sem_dist)
+    p.add_argument('--lambda_sem_cls',  type=float, default=cfg.lambda_sem_cls)
+    p.add_argument('--lambda_sem_conf', type=float, default=cfg.lambda_sem_conf)
+    p.add_argument('--semantic_start_epoch',  type=int, default=cfg.semantic_start_epoch)
+    p.add_argument('--semantic_warmup_epochs',type=int, default=cfg.semantic_warmup_epochs)
     # Degradation
-    p.add_argument('--scale', type=int, default=2)
+    p.add_argument('--scale', type=int, default=cfg.scale)
     # Misc
-    p.add_argument('--accumulation_steps', type=int, default=1)
+    p.add_argument('--accumulation_steps', type=int, default=cfg.accumulation_steps)
     p.add_argument('--resume_path', default=None)
     p.add_argument('--no_tb',     action='store_true')
     p.add_argument('--log_dir',   default='./logs')
     p.add_argument('--exp_name',  default=None)
-    p.add_argument('--val_vis_dir', default=None)
-    p.add_argument('--t_max',     type=int, default=400)
+    p.add_argument('--val_vis_dir', default=cfg.val_vis_dir)
+    p.add_argument('--t_max',     type=int, default=cfg.t_max)
     p.add_argument('--create_semantic_branch', action='store_true',
                    help='即使不传 hovernet_path，也创建 SPM-UNet 语义分支（Stage-1 默认不启用注入，用于与 Stage-2 架构对齐）')
 
