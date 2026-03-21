@@ -138,7 +138,14 @@ def train(
             lambda_tv=lambda_tv,
             t_max=t_max,
         ).to(device)
-        print("模式：SPM-UNet 语义引导 SR（架构注入 + 损失约束）")
+        # 注意：只要加载了 HoVer-Net 就会构造 SemanticSRLoss，但真正是否启用语义
+        # 由 epoch 与 semantic_start_epoch 决定（semantic_on）；下面避免误以为一上来就在训语义。
+        print(
+            "模式：已加载 HoVer-Net（冻结）并构建 SemanticSRLoss；"
+            f"当 epoch < {semantic_start_epoch} 时为 Stage-1："
+            "仅主干损失（L_noise/L_rec/L_grad/L_tv），无 L_sem/L_dir、不传 semantic、关闭注入；"
+            f"当 epoch ≥ {semantic_start_epoch} 时为 Stage-2：语义损失 + 架构注入。"
+        )
     else:
         if create_semantic_branch:
             print("模式：仅重建 SR（未使用 HoVer-Net；已创建语义分支但阶段一不启用）")
