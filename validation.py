@@ -150,7 +150,7 @@ class ValidationSet:
 
         返回的字典包含：
           reconstructed : [B,3,H,W]  重建结果
-          diff_vis      : [B,3,H,W]  |reconstructed - hr| × 5
+          diff_vis      : [B,3,H,W]  |reconstructed - hr|，已 clamp 到 [0,1]
           cls_clean     : [B,1,H,W]  clean 的 tp argmax 类别图（归一化到 0~1）
           cls_pred      : [B,1,H,W]  pred  的 tp argmax 类别图（归一化到 0~1）
           conf_clean    : [B,1,H,W]  clean 的 tp top1 置信度
@@ -178,7 +178,7 @@ class ValidationSet:
             recon = predict_x0_from_noise_shared(
                 self.noisy_hr, noise_pred, self.timesteps, self.scheduler)
 
-            diff_vis = (recon - self.hr).abs().clamp(0, 1) * 5
+            diff_vis = (recon - self.hr).abs().clamp(0, 1)
 
             B, _, H, W = self.hr.shape
             cls_clean = cls_pred = conf_clean = conf_pred = nuc_mask = torch.zeros(B, 1, H, W, device=self.device)
@@ -218,7 +218,7 @@ def save_validation_debug_images(
       第 1 行：HR（真值）
       第 2 行：LR 输入
       第 3 行：重建结果
-      第 4 行：绝对残差 ×5
+      第 4 行：绝对残差 |Recon - HR|
       第 5 行：clean tp 类别图（argmax）
       第 6 行：pred tp 类别图（argmax）
       第 7 行：clean tp 置信度
@@ -239,7 +239,7 @@ def save_validation_debug_images(
         (_rgb(hr),            'HR'),
         (_rgb(lr),            'LR'),
         (_rgb(reconstructed), 'Recon'),
-        (_rgb(diff_vis),      'Residual ×5'),
+        (_rgb(diff_vis),      'Residual'),
         (_gray(cls_clean),    'tp_label clean'),
         (_gray(cls_pred),     'tp_label pred'),
         (_gray(conf_clean),   'tp_conf clean'),

@@ -30,11 +30,8 @@ def save_training_progress_images(clean_images, noisy_images, x0_pred, epoch, sa
         noisy = noisy_images[:n].cpu()
         enhanced = x0_pred[:n].cpu()
         
-        # 2. 计算差异热力图 (Difference Map)
-        # 逻辑: |增强 - 原始|，并放大亮度以便观察
-        # 这里的 5.0 是亮度放大系数，可以根据实际效果调整
-        diff = torch.abs(enhanced - clean) * 5.0
-        diff = torch.clamp(diff, 0, 1)  # 限制在 [0, 1]
+        # 2. 差异图：|增强 - 原始|，clamp 到 [0, 1]
+        diff = torch.abs(enhanced - clean).clamp(0, 1)
         
         # 为了让差异图更酷炫，可以只取单通道亮度和伪彩色 (这里为了简单先保持 RGB 灰度风格)
         # 如果想变成热力图风格，通常需要 matplotlib，但为了 tensor 拼接方便，直接存亮度即可
