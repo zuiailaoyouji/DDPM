@@ -97,6 +97,9 @@ def train(
     if semantic_end_epoch is None:
         semantic_end_epoch = epochs
 
+    # 学习率超参；循环内低分辨率图用 lr_img，避免覆盖本参数导致 AdamW 把 Tensor 当 lr
+    base_lr = lr
+
     os.makedirs(save_dir, exist_ok=True)
     vis_dir = os.path.join(save_dir, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
@@ -166,7 +169,7 @@ def train(
     # - Stage 1：仅 backbone 参数
     # - Stage 2 / 3：全参数（Stage 3 仍 fine-tune 全量权重，仅关掉语义损失与注入）
     def _make_adamw(params):
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(params, lr=base_lr, weight_decay=weight_decay)
 
     def _transfer_adamw_state(old_opt, new_opt):
         """
@@ -327,7 +330,7 @@ def train(
 
         for batch_idx, batch in enumerate(pbar):
             hr = batch['hr'].to(device)
-            lr = batch['lr'].to(device)
+            lr_img = batch['lr'].to(device)
             bs = hr.shape[0]
 
             noise     = torch.randn_like(hr)
@@ -347,7 +350,7 @@ def train(
                     sem_tensor = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1).to(device)  # [B,8,H,W]
 
             # U-Net：以 LR 为条件，对 noisy_hr 去噪（Stage-2 才启用语义注入）
-            model_input = torch.cat([lr, noisy_hr], dim=1)   # [B, 6, H, W]
+            model_input = torch.cat([lr_img, noisy_hr], dim=1)   # [B, 6, H, W]
             noise_pred  = unet(
                 model_input,
                 timesteps,
@@ -627,6 +630,23 @@ def train(
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _add_bool_mutex(parser, dest: str, default: bool, opt_name: str, help_on: str = None):
+    """
+    生成 --<opt_name> / --no-<opt_name>，行为类似 Py3.9+ 的 BooleanOptionalAction，
+    以便在 Python 3.8 及以下环境使用。
+    """
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument(
+        f'--{opt_name}', dest=dest, action='store_true',
+        help=help_on or f'启用 {dest}',
+    )
+    g.add_argument(
+        f'--no-{opt_name}', dest=dest, action='store_false',
+        help=f'关闭 {dest}（覆盖默认 {default}）',
+    )
+    parser.set_defaults(**{dest: default})
+
+
 def main():
     cfg = get_default_config()
     p = argparse.ArgumentParser(description='SPM-UNet 语义引导 SR DDPM 训练')
@@ -669,22 +689,17 @@ def main():
     p.add_argument('--weight_decay', type=float, default=cfg.weight_decay)
     p.add_argument('--max_grad_norm', type=float, default=cfg.max_grad_norm)
     p.add_argument('--num_workers', type=int, default=cfg.num_workers)
-    p.add_argument(
-        '--pin-memory', dest='pin_memory',
-        action=argparse.BooleanOptionalAction,
-        default=cfg.pin_memory,
-        help='DataLoader pin_memory（非 CUDA 时 train/val 内仍会关闭）',
+    _add_bool_mutex(
+        p, 'pin_memory', cfg.pin_memory, 'pin-memory',
+        help_on='DataLoader pin_memory（非 CUDA 时 train/val 内仍会关闭）',
     )
-    p.add_argument(
-        '--oversample', action=argparse.BooleanOptionalAction,
-        default=cfg.oversample,
-        help='训练集 NCTDataset 是否过采样平衡类别',
+    _add_bool_mutex(
+        p, 'oversample', cfg.oversample, 'oversample',
+        help_on='训练集 NCTDataset 过采样平衡类别',
     )
-    p.add_argument(
-        '--train-drop-last', dest='train_drop_last',
-        action=argparse.BooleanOptionalAction,
-        default=cfg.train_drop_last,
-        help='训练 DataLoader 是否丢弃最后不完整 batch',
+    _add_bool_mutex(
+        p, 'train_drop_last', cfg.train_drop_last, 'train-drop-last',
+        help_on='训练 DataLoader 丢弃最后不完整 batch',
     )
     # Misc
     p.add_argument('--accumulation_steps', type=int, default=cfg.accumulation_steps)
