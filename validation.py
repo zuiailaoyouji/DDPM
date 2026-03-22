@@ -34,8 +34,11 @@ from metrics import (compute_psnr, compute_ssim,
 # 工具函数：加载一小批固定验证样本用于可视化
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_fixed_validation_batch(val_dir, sample_size=256, device='cuda',
-                                 scale=2, n_per_class=4):
+def load_fixed_validation_batch(
+    val_dir, sample_size=256, device='cuda',
+    scale=2, n_per_class=4,
+    blur_sigma_range=(0.5, 1.5), noise_std_range=(0.0, 0.02), stain_jitter=0.05,
+):
     """
     从 TUM 和 NORM 中各加载 n_per_class 张图像作为 HR tensor。
     同时合成一份固定的 LR 版本（每个 epoch 使用相同随机种子，方便公平对比）。
@@ -71,7 +74,15 @@ def load_fixed_validation_batch(val_dir, sample_size=256, device='cuda',
 
     # 固定的 LR（使用固定种子 42，保证可复现）
     torch.manual_seed(42)
-    lr = torch.stack([degrade(hr[i].cpu(), scale=scale) for i in range(len(hr))]).to(device)
+    lr = torch.stack([
+        degrade(
+            hr[i].cpu(), scale=scale,
+            blur_sigma_range=blur_sigma_range,
+            noise_std_range=noise_std_range,
+            stain_jitter_strength=stain_jitter,
+        )
+        for i in range(len(hr))
+    ]).to(device)
     torch.manual_seed(torch.initial_seed())   # 恢复原始随机状态
 
     labels_t = torch.tensor(labels, dtype=torch.long, device=device)
@@ -89,13 +100,18 @@ class ValidationSet:
     """
 
     def __init__(self, val_dir, scheduler, device='cuda',
-                 sample_size=256, fixed_timestep=100, scale=2):
+                 sample_size=256, fixed_timestep=100, scale=2,
+                 blur_sigma_range=(0.5, 1.5), noise_std_range=(0.0, 0.02),
+                 stain_jitter=0.05):
         self.val_dir        = val_dir
         self.scheduler      = scheduler
         self.device         = device
         self.sample_size    = sample_size
         self.fixed_timestep = fixed_timestep
         self.scale          = scale
+        self.blur_sigma_range = blur_sigma_range
+        self.noise_std_range  = noise_std_range
+        self.stain_jitter     = stain_jitter
 
         self.hr = self.lr = self.noisy_hr = None
         self.labels = self.noise = self.timesteps = None
@@ -105,7 +121,11 @@ class ValidationSet:
             return False
         print(f"Loading fixed validation batch: {self.val_dir}")
         self.hr, self.lr, self.labels = load_fixed_validation_batch(
-            self.val_dir, self.sample_size, self.device, self.scale)
+            self.val_dir, self.sample_size, self.device, self.scale,
+            blur_sigma_range=self.blur_sigma_range,
+            noise_std_range=self.noise_std_range,
+            stain_jitter=self.stain_jitter,
+        )
         if self.hr is None:
             return False
         print(f"  ✓ {self.hr.shape[0]} validation images loaded")
@@ -271,8 +291,11 @@ def save_validation_debug_images(
 # 定量验证用 DataLoader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def create_val_dataloader(val_vis_dir, batch_size, device='cuda',
-                           scale=2, oversample=False):
+def create_val_dataloader(
+    val_vis_dir, batch_size, device='cuda',
+    scale=2, oversample=False,
+    blur_sigma_range=(0.5, 1.5), noise_std_range=(0.0, 0.02), stain_jitter=0.05,
+):
     """
     基于 TUM/NORM 验证划分构建一个 DataLoader。
     如果 val_vis_dir 缺失或不完整，则返回 None。
@@ -285,7 +308,12 @@ def create_val_dataloader(val_vis_dir, batch_size, device='cuda',
         print("⚠️  验证目录缺少 TUM/NORM 子目录 —— 跳过定量验证。")
         return None
 
-    val_ds = NCTDataset(tum_dir, norm_dir, oversample=oversample, scale=scale)
+    val_ds = NCTDataset(
+        tum_dir, norm_dir, oversample=oversample, scale=scale,
+        blur_sigma_range=blur_sigma_range,
+        noise_std_range=noise_std_range,
+        stain_jitter=stain_jitter,
+    )
     dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                     num_workers=4, pin_memory=(device == 'cuda'))
     print(f"定量验证集：{len(val_ds)} 张图像")

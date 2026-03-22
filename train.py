@@ -81,8 +81,11 @@ def train(
     lambda_sem_dist=1.0, lambda_sem_cls=0.3, lambda_sem_conf=0.1,
     # 双阶段训练日程
     semantic_start_epoch=5, semantic_warmup_epochs=5,
-    # 在线退化配置
+    # 在线退化配置（与 ddpm_config / degradation.degrade 一致）
     scale=2,
+    blur_sigma_range=(0.5, 1.5),
+    noise_std_range=(0.0, 0.02),
+    stain_jitter=0.05,
     # 其他参数
     accumulation_steps=1, resume_path=None,
     logger=None, val_vis_dir=None,
@@ -210,17 +213,36 @@ def train(
     # ── 验证集（可视化）────────────────────────────────────────────
     val_set = None
     if val_vis_dir:
-        val_set = ValidationSet(val_vis_dir, scheduler, device,
-                                 scale=scale, fixed_timestep=100)
+        val_set = ValidationSet(
+            val_vis_dir, scheduler, device,
+            scale=scale, fixed_timestep=100,
+            blur_sigma_range=blur_sigma_range,
+            noise_std_range=noise_std_range,
+            stain_jitter=stain_jitter,
+        )
         if not val_set.load():
             val_set = None
 
-    val_dl = create_val_dataloader(val_vis_dir, batch_size, device, scale=scale)
+    val_dl = create_val_dataloader(
+        val_vis_dir, batch_size, device, scale=scale,
+        blur_sigma_range=blur_sigma_range,
+        noise_std_range=noise_std_range,
+        stain_jitter=stain_jitter,
+    )
     best_composite = -float('inf')
 
     # ── 数据集 ─────────────────────────────────────────────────────
     print("正在加载数据集...")
-    dataset = NCTDataset(tum_dir, norm_dir, oversample=True, scale=scale)
+    print(
+        f"  在线退化: scale={scale}, blur_sigma_range={blur_sigma_range}, "
+        f"noise_std_range={noise_std_range}, stain_jitter={stain_jitter}"
+    )
+    dataset = NCTDataset(
+        tum_dir, norm_dir, oversample=True, scale=scale,
+        blur_sigma_range=blur_sigma_range,
+        noise_std_range=noise_std_range,
+        stain_jitter=stain_jitter,
+    )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                             num_workers=4,
                             pin_memory=(device == 'cuda'),
@@ -590,8 +612,16 @@ def main():
     p.add_argument('--lambda_sem_conf', type=float, default=cfg.lambda_sem_conf)
     p.add_argument('--semantic_start_epoch',  type=int, default=cfg.semantic_start_epoch)
     p.add_argument('--semantic_warmup_epochs',type=int, default=cfg.semantic_warmup_epochs)
-    # Degradation
+    # Degradation（与 degradation.degrade / NCTDataset 对齐）
     p.add_argument('--scale', type=int, default=cfg.scale)
+    p.add_argument('--blur_sigma_range', type=float, nargs=2, metavar=('MIN', 'MAX'),
+                   default=list(cfg.blur_sigma_range),
+                   help='高斯模糊 sigma 采样区间 [min, max]')
+    p.add_argument('--noise_std_range', type=float, nargs=2, metavar=('MIN', 'MAX'),
+                   default=list(cfg.noise_std_range),
+                   help='加性高斯噪声标准差采样区间 [min, max]')
+    p.add_argument('--stain_jitter', type=float, default=cfg.stain_jitter,
+                   help='H&E 染色扰动强度（0 关闭）')
     # Misc
     p.add_argument('--accumulation_steps', type=int, default=cfg.accumulation_steps)
     p.add_argument('--resume_path', default=None)
@@ -638,6 +668,9 @@ def main():
         semantic_start_epoch=args.semantic_start_epoch,
         semantic_warmup_epochs=args.semantic_warmup_epochs,
         scale=args.scale,
+        blur_sigma_range=tuple(args.blur_sigma_range),
+        noise_std_range=tuple(args.noise_std_range),
+        stain_jitter=args.stain_jitter,
         accumulation_steps=args.accumulation_steps,
         resume_path=args.resume_path,
         logger=logger, val_vis_dir=args.val_vis_dir,
