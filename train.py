@@ -1,29 +1,24 @@
 """
 train.py
-SPM-UNet（语义先验调制 U-Net）的双阶段训练循环。
+SPM-UNet（语义先验调制 U-Net）的三阶段训练循环。
 
 架构层语义注入（相较旧版训练代码的新增点）
 ------------------------------------------
 SPMUNet 在扩散骨干 UNet2DModel 之上新增了 SemanticEncoder + SemanticModBlock，
 把 `[tp_prob(6), nuc_mask, tp_conf]` 注入到解码器高分辨率层（128×128）。
 每个 batch 都会基于 HR 真值图通过 HoVer-Net 构造语义先验张量 `S`，并作为
-`semantic=S` 传入模型前向（Stage-2 才启用）。
+`semantic=S` 传入模型前向（仅 Stage 2 启用）。
 
 阶段 1（epoch < semantic_start_epoch）：
-    - 骨干重建预训练（Backbone Reconstruction Pretraining）
-    - 不启用语义调制（semantic=None）
-    - 不使用 L_sem / L_dir
-    - 损失：L_noise + L_rec + L_grad + L_tv
-    - 目标：先学到稳定的保真 SR 重建主干
+    - 骨干重建预训练；semantic=None；无 L_sem / L_dir
 
-阶段 2（epoch >= semantic_start_epoch）：
-    - 解冻全模型
-    - 加入 L_sem + L_dir，并在 semantic_warmup_epochs 内线性升权
-    - 传入 semantic=S → 启用结构注入（架构层语义调制）
+阶段 2（semantic_start_epoch <= epoch < semantic_end_epoch）：
+    - L_sem + L_dir，warmup 升权；semantic=S 架构注入
 
-这实现了：
-  - 损失层语义引导（SemanticSRLoss）
-  - 架构层语义调制（SPMUNet 解码器注入）
+阶段 3（epoch >= semantic_end_epoch）：
+    - 再次关闭语义损失与注入，纯像素收尾（L_noise + L_rec + L_grad + L_tv）
+
+若 train(..., semantic_end_epoch=None)，则 semantic_end_epoch 自动设为 epochs，退化为两阶段。
 """
 
 import torch
@@ -79,8 +74,8 @@ def train(
     tau_nuc=0.5, tau_conf=0.7,
     # 语义子项内部权重
     lambda_sem_dist=1.0, lambda_sem_cls=0.3, lambda_sem_conf=0.1,
-    # 双阶段训练日程
-    semantic_start_epoch=5, semantic_warmup_epochs=5,
+    # 三阶段训练日程（semantic_end_epoch=None → 训练结束时仍为 Stage 2，即原两阶段）
+    semantic_start_epoch=5, semantic_end_epoch=None, semantic_warmup_epochs=5,
     # 在线退化配置（与 ddpm_config / degradation.degrade 一致）
     scale=2,
     blur_sigma_range=(0.5, 1.5),
@@ -92,6 +87,9 @@ def train(
     num_train_timesteps=1000, t_max=400,
     create_semantic_branch: bool = False,
 ):
+    if semantic_end_epoch is None:
+        semantic_end_epoch = epochs
+
     os.makedirs(save_dir, exist_ok=True)
     vis_dir = os.path.join(save_dir, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
@@ -143,12 +141,13 @@ def train(
             t_max=t_max,
         ).to(device)
         # 注意：只要加载了 HoVer-Net 就会构造 SemanticSRLoss，但真正是否启用语义
-        # 由 epoch 与 semantic_start_epoch 决定（semantic_on）；下面避免误以为一上来就在训语义。
+        # 由 epoch 与 semantic_start_epoch / semantic_end_epoch 决定（semantic_on）。
         print(
             "模式：已加载 HoVer-Net（冻结）并构建 SemanticSRLoss；"
-            f"当 epoch < {semantic_start_epoch} 时为 Stage-1："
-            "仅主干损失（L_noise/L_rec/L_grad/L_tv），无 L_sem/L_dir、不传 semantic、关闭注入；"
-            f"当 epoch ≥ {semantic_start_epoch} 时为 Stage-2：语义损失 + 架构注入。"
+            f"Stage 1（epoch < {semantic_start_epoch}）：仅主干损失，关闭注入；"
+            f"Stage 2（{semantic_start_epoch} ≤ epoch < {semantic_end_epoch}）："
+            "语义损失 + 架构注入；"
+            f"Stage 3（epoch ≥ {semantic_end_epoch}）：再次纯像素收尾。"
         )
     else:
         if create_semantic_branch:
@@ -156,9 +155,9 @@ def train(
         else:
             print("模式：仅重建 SR（不使用 HoVer-Net，语义分支关闭）")
 
-    # 优化器策略（更严格两阶段）：
-    # - Stage-1：优化器只包含 backbone 参数（更省 optimizer state 内存）
-    # - Stage-2：重建优化器加入全部参数（backbone + 语义分支），并把 backbone 的 state 迁移过去
+    # 优化器策略：
+    # - Stage 1：仅 backbone 参数
+    # - Stage 2 / 3：全参数（Stage 3 仍 fine-tune 全量权重，仅关掉语义损失与注入）
     wd = 0.01
     def _make_adamw(params):
         return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
@@ -188,10 +187,15 @@ def train(
         ckpt_optimizer_state = ckpt.get('optimizer_state_dict', None)
         start_epoch = ckpt.get('epoch', 0)
 
-    # 根据 start_epoch 决定从哪一阶段开始
-    start_in_stage2 = (loss_fn is not None) and (start_epoch >= semantic_start_epoch)
+    # 根据 start_epoch 决定从哪一阶段开始（续训不误判 Stage 3 为 Stage 2）
+    start_in_stage2 = (
+        (loss_fn is not None)
+        and (start_epoch >= semantic_start_epoch)
+        and (start_epoch < semantic_end_epoch)
+    )
+    start_in_stage3 = (loss_fn is not None) and (start_epoch >= semantic_end_epoch)
 
-    # 先构建一个“全参数”优化器用于兼容加载 Stage-2 的 checkpoint state（若有）
+    # 先构建一个“全参数”优化器用于兼容加载 Stage 2/3 的 checkpoint state（若有）
     optimizer_full = _make_adamw(unet.parameters())
     if ckpt_optimizer_state is not None:
         try:
@@ -200,8 +204,8 @@ def train(
         except Exception as e:
             print(f"⚠️  优化器状态加载失败，将从头初始化优化器 state：{e}")
 
-    # Stage-1 严格：只用 backbone 参数；Stage-2：用全参数
-    if start_in_stage2:
+    # Stage 1：只用 backbone；Stage 2 / 3：全参数
+    if start_in_stage2 or start_in_stage3:
         optimizer = optimizer_full
         optimizer_is_full = True
     else:
@@ -251,21 +255,41 @@ def train(
     print(f"总训练轮数：{epochs} 个 epoch...")
     global_step = 0
 
-    # Stage-1 更严格：完全关闭语义注入 hooks，避免任何 hook 开销
-    # 到 Stage-2 再重新启用。
-    if loss_fn is not None and hasattr(unet, "disable_semantic_modulation") and semantic_start_epoch > 0 and (not start_in_stage2):
+    # Stage 1 或 Stage 3 续训：关闭语义注入 hooks；Stage 2 续训保持开启由循环内 in_stage2 处理
+    if (
+        loss_fn is not None
+        and hasattr(unet, "disable_semantic_modulation")
+        and semantic_start_epoch > 0
+        and (not start_in_stage2)
+    ):
         unet.disable_semantic_modulation()
 
     for epoch in range(start_epoch, epochs):
         unet.train()
 
-        sem_scale   = semantic_weight_scale(epoch, semantic_start_epoch,
-                                            semantic_warmup_epochs)
-        semantic_on = (epoch >= semantic_start_epoch) and (loss_fn is not None)
-        stage_label = f"Stage{'2' if semantic_on else '1'} sem={sem_scale:.2f}"
+        sem_scale = semantic_weight_scale(epoch, semantic_start_epoch,
+                                          semantic_warmup_epochs)
 
-        # 进入 Stage-2：开启语义调制（注册 hooks）并扩展优化器到“全参数”
-        if semantic_on:
+        in_stage2 = (
+            (epoch >= semantic_start_epoch)
+            and (epoch < semantic_end_epoch)
+            and (loss_fn is not None)
+        )
+        in_stage3 = epoch >= semantic_end_epoch
+        semantic_on = in_stage2
+
+        if epoch < semantic_start_epoch:
+            stage_name = '1'
+        elif epoch < semantic_end_epoch:
+            stage_name = '2'
+        else:
+            stage_name = '3'
+
+        sem_scale_log = sem_scale if in_stage2 else 0.0
+        stage_label = f"Stage{stage_name} sem={sem_scale_log:.2f}"
+
+        # Stage 2：开启语义调制（注册 hooks）并扩展优化器到“全参数”
+        if in_stage2:
             if hasattr(unet, "enable_semantic_modulation") and (getattr(unet, "use_semantic", False) is False):
                 unet.enable_semantic_modulation()
             if not optimizer_is_full:
@@ -273,6 +297,11 @@ def train(
                 _transfer_adamw_state(optimizer, new_opt)
                 optimizer = new_opt
                 optimizer_is_full = True
+
+        # Stage 3：关闭语义调制（纯像素路径）
+        if in_stage3:
+            if hasattr(unet, "disable_semantic_modulation") and (getattr(unet, "use_semantic", False) is True):
+                unet.disable_semantic_modulation()
 
         # 每个 epoch 的累计器
         acc = {k: 0.0 for k in
@@ -381,7 +410,7 @@ def train(
                     'L_sem_dist': bd['l_sem_dist'].item(),
                     'L_sem_cls':  bd['l_sem_cls'].item(),
                     'L_sem_conf': bd['l_sem_conf'].item(),
-                    'Sem_Scale': sem_scale,
+                    'Sem_Scale': sem_scale_log,
                 }, step=global_step, prefix='Train')
                 logger.flush()
 
@@ -475,18 +504,18 @@ def train(
                 'L_sem_cls': avg_sem_cls,
                 'L_sem_conf': avg_sem_conf,
                 'Sem_MAE': avg_sem_mae, 'Dir_Acc': avg_dir_acc,
-                'Sem_Scale': sem_scale,
+                'Sem_Scale': sem_scale_log,
             }, step=epoch+1, prefix='Epoch')
             logger.flush()
 
         with open(log_path, 'a', newline='') as f:
             csv.writer(f).writerow([
                 epoch+1,
-                '2' if semantic_on else '1',
+                stage_name,
                 avg['total'], avg['noise'], avg['rec'], avg['grad'],
                 avg['sem'], avg['dir'], avg['tv'],
                 avg_sem_dist, avg_sem_cls, avg_sem_conf,
-                avg_sem_mae, avg_dir_acc, sem_scale,
+                avg_sem_mae, avg_dir_acc, sem_scale_log,
             ])
 
         # ── 定量验证 ───────────────────────────────────────────────
@@ -611,6 +640,7 @@ def main():
     p.add_argument('--lambda_sem_cls',  type=float, default=cfg.lambda_sem_cls)
     p.add_argument('--lambda_sem_conf', type=float, default=cfg.lambda_sem_conf)
     p.add_argument('--semantic_start_epoch',  type=int, default=cfg.semantic_start_epoch)
+    p.add_argument('--semantic_end_epoch',    type=int, default=cfg.semantic_end_epoch)
     p.add_argument('--semantic_warmup_epochs',type=int, default=cfg.semantic_warmup_epochs)
     # Degradation（与 degradation.degrade / NCTDataset 对齐）
     p.add_argument('--scale', type=int, default=cfg.scale)
@@ -666,6 +696,7 @@ def main():
         lambda_sem_cls=args.lambda_sem_cls,
         lambda_sem_conf=args.lambda_sem_conf,
         semantic_start_epoch=args.semantic_start_epoch,
+        semantic_end_epoch=args.semantic_end_epoch,
         semantic_warmup_epochs=args.semantic_warmup_epochs,
         scale=args.scale,
         blur_sigma_range=tuple(args.blur_sigma_range),
