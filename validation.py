@@ -295,6 +295,8 @@ def create_val_dataloader(
     val_vis_dir, batch_size, device='cuda',
     scale=2, oversample=False,
     blur_sigma_range=(0.5, 1.5), noise_std_range=(0.0, 0.02), stain_jitter=0.05,
+    num_workers: int = 4,
+    pin_memory: bool = True,
 ):
     """
     基于 TUM/NORM 验证划分构建一个 DataLoader。
@@ -314,7 +316,13 @@ def create_val_dataloader(
         noise_std_range=noise_std_range,
         stain_jitter=stain_jitter,
     )
-    dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                    num_workers=4, pin_memory=(device == 'cuda'))
+    dl = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory and ('cuda' in str(device)),
+        drop_last=False,
+    )
     print(f"定量验证集：{len(val_ds)} 张图像")
     return dl

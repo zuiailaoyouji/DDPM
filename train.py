@@ -86,6 +86,13 @@ def train(
     logger=None, val_vis_dir=None,
     num_train_timesteps=1000, t_max=400,
     create_semantic_branch: bool = False,
+    # 优化器与 DataLoader（与 ddpm_config 对齐）
+    weight_decay: float = 0.01,
+    max_grad_norm: float = 1.0,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    oversample: bool = True,
+    train_drop_last: bool = True,
 ):
     if semantic_end_epoch is None:
         semantic_end_epoch = epochs
@@ -158,9 +165,8 @@ def train(
     # 优化器策略：
     # - Stage 1：仅 backbone 参数
     # - Stage 2 / 3：全参数（Stage 3 仍 fine-tune 全量权重，仅关掉语义损失与注入）
-    wd = 0.01
     def _make_adamw(params):
-        return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
     def _transfer_adamw_state(old_opt, new_opt):
         """
@@ -227,11 +233,14 @@ def train(
         if not val_set.load():
             val_set = None
 
+    _pin = pin_memory and ('cuda' in str(device))
     val_dl = create_val_dataloader(
         val_vis_dir, batch_size, device, scale=scale,
         blur_sigma_range=blur_sigma_range,
         noise_std_range=noise_std_range,
         stain_jitter=stain_jitter,
+        num_workers=num_workers,
+        pin_memory=_pin,
     )
     best_composite = -float('inf')
 
@@ -242,15 +251,19 @@ def train(
         f"noise_std_range={noise_std_range}, stain_jitter={stain_jitter}"
     )
     dataset = NCTDataset(
-        tum_dir, norm_dir, oversample=True, scale=scale,
+        tum_dir, norm_dir, oversample=oversample, scale=scale,
         blur_sigma_range=blur_sigma_range,
         noise_std_range=noise_std_range,
         stain_jitter=stain_jitter,
     )
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                            num_workers=4,
-                            pin_memory=(device == 'cuda'),
-                            drop_last=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=_pin,
+        drop_last=train_drop_last,
+    )
 
     print(f"总训练轮数：{epochs} 个 epoch...")
     global_step = 0
@@ -380,7 +393,7 @@ def train(
             loss_val = total_loss.item()
             (total_loss / accumulation_steps).backward()
             if (batch_idx+1) % accumulation_steps == 0 or (batch_idx+1) == len(dataloader):
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -652,6 +665,27 @@ def main():
                    help='加性高斯噪声标准差采样区间 [min, max]')
     p.add_argument('--stain_jitter', type=float, default=cfg.stain_jitter,
                    help='H&E 染色扰动强度（0 关闭）')
+    # Optimizer & DataLoader
+    p.add_argument('--weight_decay', type=float, default=cfg.weight_decay)
+    p.add_argument('--max_grad_norm', type=float, default=cfg.max_grad_norm)
+    p.add_argument('--num_workers', type=int, default=cfg.num_workers)
+    p.add_argument(
+        '--pin-memory', dest='pin_memory',
+        action=argparse.BooleanOptionalAction,
+        default=cfg.pin_memory,
+        help='DataLoader pin_memory（非 CUDA 时 train/val 内仍会关闭）',
+    )
+    p.add_argument(
+        '--oversample', action=argparse.BooleanOptionalAction,
+        default=cfg.oversample,
+        help='训练集 NCTDataset 是否过采样平衡类别',
+    )
+    p.add_argument(
+        '--train-drop-last', dest='train_drop_last',
+        action=argparse.BooleanOptionalAction,
+        default=cfg.train_drop_last,
+        help='训练 DataLoader 是否丢弃最后不完整 batch',
+    )
     # Misc
     p.add_argument('--accumulation_steps', type=int, default=cfg.accumulation_steps)
     p.add_argument('--resume_path', default=None)
@@ -703,6 +737,12 @@ def main():
         noise_std_range=tuple(args.noise_std_range),
         stain_jitter=args.stain_jitter,
         accumulation_steps=args.accumulation_steps,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        oversample=args.oversample,
+        train_drop_last=args.train_drop_last,
         resume_path=args.resume_path,
         logger=logger, val_vis_dir=args.val_vis_dir,
         t_max=args.t_max,

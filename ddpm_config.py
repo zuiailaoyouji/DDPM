@@ -21,7 +21,7 @@ class TrainingConfig:
     val_vis_dir:   Optional[str] = None
 
     # ── 基础训练配置 ────────────────────────────────────────────────
-    epochs:     int   = 400
+    epochs:     int   = 150
     batch_size: int   = 4
     lr:         float = 1e-4
     device:     str   = 'cuda'
@@ -80,9 +80,10 @@ class TrainingConfig:
     accumulation_steps: int   = 1
 
     # ── 数据加载 ───────────────────────────────────────────────────
-    num_workers: int  = 4
-    pin_memory:  bool = True
-    oversample:  bool = True
+    num_workers:     int  = 4
+    pin_memory:      bool = True   # 训练/验证 DataLoader；非 CUDA 时 train 内会忽略
+    oversample:      bool = True   # 训练集 NCTDataset；验证集仍默认 False
+    train_drop_last: bool = True   # 训练 DataLoader（避免最后不完整 batch 影响 BN/日志）
 
 
 def get_default_config() -> TrainingConfig:
