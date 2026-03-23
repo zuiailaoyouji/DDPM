@@ -14,6 +14,7 @@ validation.py
 """
 
 import os
+import random
 import cv2
 import numpy as np
 import torch
@@ -72,8 +73,12 @@ def load_fixed_validation_batch(
     hr_np   = np.stack(images, axis=0).astype(np.float32) / 255.0
     hr      = torch.from_numpy(hr_np).permute(0, 3, 1, 2).to(device)  # [B,3,H,W]
 
-    # 固定的 LR（使用固定种子 42，保证可复现）
+    # 固定的 LR（同时固定 torch + python random，且恢复现场）
+    torch_rng_state = torch.random.get_rng_state()
+    py_rng_state = random.getstate()
+
     torch.manual_seed(42)
+    random.seed(42)
     lr = torch.stack([
         degrade(
             hr[i].cpu(), scale=scale,
@@ -83,7 +88,8 @@ def load_fixed_validation_batch(
         )
         for i in range(len(hr))
     ]).to(device)
-    torch.manual_seed(torch.initial_seed())   # 恢复原始随机状态
+    torch.random.set_rng_state(torch_rng_state)
+    random.setstate(py_rng_state)
 
     labels_t = torch.tensor(labels, dtype=torch.long, device=device)
     return hr, lr, labels_t
@@ -133,13 +139,16 @@ class ValidationSet:
         return True
 
     def _prepare_noise(self):
+        torch_rng_state = torch.random.get_rng_state()
+
         torch.manual_seed(42)
         self.noise = torch.randn_like(self.hr)
         self.timesteps = torch.full(
             (self.hr.shape[0],), self.fixed_timestep,
             device=self.device, dtype=torch.long)
         self.noisy_hr = self.scheduler.add_noise(self.hr, self.noise, self.timesteps)
-        torch.manual_seed(torch.initial_seed())
+
+        torch.random.set_rng_state(torch_rng_state)
 
     def is_available(self):
         return self.hr is not None

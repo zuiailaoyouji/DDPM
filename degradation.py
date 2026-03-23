@@ -24,50 +24,103 @@ import math
 # 公共接口
 # ─────────────────────────────────────────────────────────────────────────────
 
+def sample_degradation_params(
+    blur_sigma_range: tuple,
+    noise_std_range: tuple,
+    stain_jitter_strength: float,
+    device='cpu',
+):
+    """
+    采样一次退化参数，全部返回 tensor，避免 DataLoader collate 时出现 None。
+    """
+    sigma = random.uniform(*blur_sigma_range)
+    noise_std = random.uniform(*noise_std_range)
+
+    if stain_jitter_strength > 0.0:
+        stain_scales = 1.0 + (torch.rand(3, 1, 1, device=device) * 2 - 1) * stain_jitter_strength
+    else:
+        stain_scales = torch.ones(3, 1, 1, device=device)
+
+    return {
+        "sigma": torch.tensor(sigma, dtype=torch.float32, device=device),
+        "noise_std": torch.tensor(noise_std, dtype=torch.float32, device=device),
+        "stain_scales": stain_scales,
+    }
+
+
+def apply_degradation(
+    hr: torch.Tensor,
+    scale: int = 2,
+    sigma: float = 1.0,
+    stain_scales: torch.Tensor = None,
+    noise_std: float = 0.0,
+    noise_tensor: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    根据给定参数执行一次前向退化。
+    """
+    x = hr.clone()
+
+    # 1. 高斯模糊
+    x = _gaussian_blur(x, sigma)
+
+    # 2. 下采样与上采样
+    C, H, W = x.shape
+    lr_h, lr_w = H // scale, W // scale
+    x = x.unsqueeze(0)
+    x = F.interpolate(x, size=(lr_h, lr_w), mode='bicubic', align_corners=False)
+    x = F.interpolate(x, size=(H, W), mode='bicubic', align_corners=False)
+    x = x.squeeze(0).clamp(0.0, 1.0)
+
+    # 3. 染色扰动（直接应用给定 scale）
+    if stain_scales is not None:
+        eps = 1e-6
+        od = -torch.log(x.clamp(min=eps))
+        od = od * stain_scales.to(x.device)
+        x = torch.exp(-od).clamp(0.0, 1.0)
+
+    # 4. 加噪
+    if noise_std > 0.0:
+        if noise_tensor is None:
+            noise_tensor = torch.randn_like(x)
+        x = x + noise_tensor.to(x.device) * noise_std
+
+    return x.clamp(0.0, 1.0)
+
+
 def degrade(hr: torch.Tensor,
             scale: int = 2,
             blur_sigma_range: tuple = (0.5, 1.5),
             noise_std_range: tuple = (0.0, 0.02),
             stain_jitter_strength: float = 0.05,
-            ) -> torch.Tensor:
+            return_params: bool = False):
     """
     从干净的 HR 张量合成 LR 图像。
 
-    参数:
-        hr                  : [C, H, W]，float32，取值范围 [0, 1]
-        scale               : 下采样倍率（2 → 128→256）
-        blur_sigma_range    : 高斯模糊 sigma 的最小/最大值
-        noise_std_range     : 加性噪声标准差的最小/最大值
-        stain_jitter_strength: 每个通道的最大乘性染色扰动幅度
-
-    返回:
-        lr : [C, H, W]，float32，取值范围 [0, 1]，与 hr 具有相同空间尺寸
+    当 return_params=True 时，返回 (lr, params) 以便推理阶段复用同一退化参数。
     """
     assert hr.dim() == 3, "Expected [C, H, W] tensor"
-    x = hr.clone()
+    params = sample_degradation_params(
+        blur_sigma_range=blur_sigma_range,
+        noise_std_range=noise_std_range,
+        stain_jitter_strength=stain_jitter_strength,
+        device=hr.device,
+    )
 
-    # 1. 高斯模糊（模拟衍射 / 对焦极限）
-    sigma = random.uniform(*blur_sigma_range)
-    x = _gaussian_blur(x, sigma)
+    noise_tensor = torch.randn_like(hr) if params["noise_std"].item() > 0 else None
+    lr = apply_degradation(
+        hr,
+        scale=scale,
+        sigma=params["sigma"].item(),
+        stain_scales=params["stain_scales"],
+        noise_std=params["noise_std"].item(),
+        noise_tensor=noise_tensor,
+    )
 
-    # 2. 下采样 → 上采样（模拟传感器分辨率上限）
-    C, H, W = x.shape
-    lr_h, lr_w = H // scale, W // scale
-    x = x.unsqueeze(0)                                           # [1,C,H,W]
-    x = F.interpolate(x, size=(lr_h, lr_w), mode='bicubic', align_corners=False)
-    x = F.interpolate(x, size=(H, W),       mode='bicubic', align_corners=False)
-    x = x.squeeze(0).clamp(0.0, 1.0)                            # [C,H,W]
-
-    # 3. H&E 染色扰动（病理特异性的颜色偏移）
-    if stain_jitter_strength > 0.0:
-        x = _stain_jitter(x, stain_jitter_strength)
-
-    # 4. 加性高斯噪声（传感器 / 数字化噪声）
-    noise_std = random.uniform(*noise_std_range)
-    if noise_std > 0.0:
-        x = x + torch.randn_like(x) * noise_std
-
-    return x.clamp(0.0, 1.0)
+    if return_params:
+        params["noise_tensor"] = noise_tensor if noise_tensor is not None else torch.zeros_like(hr)
+        return lr, params
+    return lr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +164,9 @@ def _gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
 
 def _stain_jitter(x: torch.Tensor, strength: float) -> torch.Tensor:
     """
+    旧接口保留：当前主流程已改为在 apply_degradation() 中直接使用 stain_scales。
+    如需一次性随机扰动可继续调用本函数。
+
     在每个通道上施加轻微的乘性染色扰动，以模拟 H&E 染色差异。
     每个通道会乘以 (1 + U(-strength, +strength))。
     在 OD（光密度）空间中操作以保持物理合理性。

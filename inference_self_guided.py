@@ -21,6 +21,7 @@ import numpy as np
 import os
 import argparse
 import csv
+import random
 from typing import Optional, Union
 
 from tqdm import tqdm
@@ -29,7 +30,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from unet_wrapper import create_model
 from ddpm_utils import load_hovernet, predict_x0_from_noise_shared, get_device
-from degradation import degrade
+from degradation import degrade, apply_degradation
 from metrics import (compute_psnr, compute_ssim, compute_artifact_penalty)
 
 
@@ -162,13 +163,17 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
 
     device = args.device
 
-    for batch_idx, (hr_batch, lr_batch, filenames) in enumerate(tqdm(dataloader, desc='SR Batch')):
+    for batch_idx, (hr_batch, lr_batch, deg_params_batch, filenames) in enumerate(tqdm(dataloader, desc='SR Batch')):
         valid = [i for i, f in enumerate(filenames) if f != 'ERROR']
         if not valid:
             continue
 
         hr_batch = hr_batch[valid].to(device)
         lr_batch = lr_batch[valid].to(device)
+        deg_params_batch = {
+            k: (v[valid].to(device) if torch.is_tensor(v) else v)
+            for k, v in deg_params_batch.items()
+        }
         filenames = [filenames[i] for i in valid]
         B = hr_batch.shape[0]
 
@@ -216,8 +221,24 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                 l = lr_batch[idx:idx+1]
                 b = bicubic_up[idx:idx+1].cpu()
 
-                # [修复2] pred 和 lr 同尺寸，直接 L1
-                fidelity_loss = F.l1_loss(p, l).item()
+                # 使用每个样本原始退化参数执行一致性校验
+                curr_sigma = deg_params_batch["sigma"][idx].item()
+                curr_stain = deg_params_batch["stain_scales"][idx]  # [3,1,1]
+                if args.use_noise_in_fidelity:
+                    curr_noise_std = deg_params_batch["noise_std"][idx].item()
+                    curr_noise_tensor = deg_params_batch["noise_tensor"][idx]
+                else:
+                    curr_noise_std = 0.0
+                    curr_noise_tensor = None
+                deg_p = apply_degradation(
+                    p.squeeze(0),  # [C,H,W]
+                    scale=args.scale,
+                    sigma=curr_sigma,
+                    stain_scales=curr_stain,
+                    noise_std=curr_noise_std,
+                    noise_tensor=curr_noise_tensor,
+                ).unsqueeze(0)  # [1,C,H,W]
+                fidelity_loss = F.l1_loss(deg_p, l).item()
                 art = compute_artifact_penalty(p.cpu(), b)
 
                 sem_shift = 0.0
@@ -268,7 +289,23 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                 final_ssim=final_ssim,
             )
 
-            fid_best = F.l1_loss(p_best, lr_batch[idx:idx+1]).item()
+            curr_sigma = deg_params_batch["sigma"][idx].item()
+            curr_stain = deg_params_batch["stain_scales"][idx]
+            if args.use_noise_in_fidelity:
+                curr_noise_std = deg_params_batch["noise_std"][idx].item()
+                curr_noise_tensor = deg_params_batch["noise_tensor"][idx]
+            else:
+                curr_noise_std = 0.0
+                curr_noise_tensor = None
+            deg_best = apply_degradation(
+                p_best.squeeze(0),
+                scale=args.scale,
+                sigma=curr_sigma,
+                stain_scales=curr_stain,
+                noise_std=curr_noise_std,
+                noise_tensor=curr_noise_tensor,
+            ).unsqueeze(0)
+            fid_best = F.l1_loss(deg_best, lr_batch[idx:idx+1]).item()
             art_best = compute_artifact_penalty(p_best.cpu(), bicubic_up[idx:idx+1].cpu())
 
             sem_best = 0.0
@@ -314,17 +351,31 @@ class InferenceDataset(Dataset):
             hr  = hr.permute(2, 0, 1)
 
             # [修复4] 真正的保存和恢复随机状态，避免干扰外部随机性
-            rng_state = torch.random.get_rng_state()
+            torch_rng_state = torch.random.get_rng_state()
+            py_rng_state = random.getstate()
             torch.manual_seed(idx)
-            lr  = degrade(hr, scale=self.args.scale,
-                          blur_sigma_range=tuple(self.args.blur_sigma_range),
-                          noise_std_range=tuple(self.args.noise_std_range),
-                          stain_jitter_strength=self.args.stain_jitter)
-            torch.random.set_rng_state(rng_state)
+            random.seed(idx)
+            lr, deg_params = degrade(
+                hr,
+                scale=self.args.scale,
+                blur_sigma_range=tuple(self.args.blur_sigma_range),
+                noise_std_range=tuple(self.args.noise_std_range),
+                stain_jitter_strength=self.args.stain_jitter,
+                return_params=True,
+            )
+            torch.random.set_rng_state(torch_rng_state)
+            random.setstate(py_rng_state)
 
-            return hr, lr, os.path.basename(path)
+            return hr, lr, deg_params, os.path.basename(path)
         except Exception:
-            return torch.zeros(3, 256, 256), torch.zeros(3, 256, 256), "ERROR"
+            zero_img = torch.zeros(3, 256, 256)
+            zero_params = {
+                "sigma": torch.tensor(0.0, dtype=torch.float32),
+                "noise_std": torch.tensor(0.0, dtype=torch.float32),
+                "stain_scales": torch.ones(3, 1, 1),
+                "noise_tensor": torch.zeros(3, 256, 256),
+            }
+            return zero_img, zero_img, zero_params, "ERROR"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,6 +405,8 @@ def main():
     # 语义阈值参数
     p.add_argument('--tau_nuc',  type=float, default=0.4)
     p.add_argument('--tau_conf', type=float, default=0.6)
+    p.add_argument('--use_noise_in_fidelity', action='store_true',
+                   help='在 fidelity 校验中复用退化噪声 realization（默认关闭以减少抖动）')
 
     args = p.parse_args()
     args.device = (get_device(gpu_id=args.gpu_id) if args.gpu_id is not None
@@ -361,7 +414,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 始终创建带语义分支的模型以匹配参数结构
+    # 为兼容带语义权重的 checkpoint，这里按 hovernet_path 决定是否构建语义分支；
+    # 实际是否启用 modulation 由 --use_semantic_injection 控制。
     unet = create_model(use_semantic=(args.hovernet_path is not None)).to(args.device)
     ckpt = torch.load(args.unet_path, map_location=args.device)
 
