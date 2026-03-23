@@ -9,6 +9,7 @@ inference_self_guided.py
   4. 补全批量推理：完整实现了 run_batch_inference 及其闭环评分逻辑。
   5. 扩展文件支持：支持 png, jpg, jpeg, tif, tiff。
   6. 增加 Stage 3 提示：对是否开启 semantic_injection 给出阶段匹配警告。
+  7. 输出三联图 comparison.png：LR | SR | HR，上方标注 Baseline / Final 的 PSNR、SSIM。
 """
 
 from __future__ import annotations
@@ -51,6 +52,63 @@ def save_tensor(t, path):
         t = t.squeeze(0)
     arr = (t.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     cv2.imwrite(path, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+
+
+def _tensor_to_rgb_u8(t: torch.Tensor) -> np.ndarray:
+    """[C,H,W] 或 [1,C,H,W] → uint8 RGB [H,W,3]"""
+    if t.dim() == 4:
+        t = t.squeeze(0)
+    return (t.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+
+def save_lr_sr_hr_triptych(
+    lr_t: torch.Tensor,
+    sr_t: torch.Tensor,
+    hr_t: torch.Tensor,
+    path: str,
+    baseline_psnr: float,
+    baseline_ssim: float,
+    final_psnr: float,
+    final_ssim: float,
+    caption_h: int = 80,
+    font_scale: float = 0.45,
+    text_margin: int = 8,
+) -> None:
+    """
+    横向拼接 LR | SR | HR，上方留出条带绘制指标（BGR 保存）。
+    Baseline：LR 相对 HR；Final：SR（BEST_SR）相对 HR。
+    """
+    lr_u8 = _tensor_to_rgb_u8(lr_t)
+    sr_u8 = _tensor_to_rgb_u8(sr_t)
+    hr_u8 = _tensor_to_rgb_u8(hr_t)
+    h, w, _ = lr_u8.shape
+    strip = np.hstack([lr_u8, sr_u8, hr_u8])
+    strip_bgr = cv2.cvtColor(strip, cv2.COLOR_RGB2BGR)
+
+    W = strip_bgr.shape[1]
+    banner = np.full((caption_h, W, 3), 255, dtype=np.uint8)
+    line1 = (
+        f"Baseline (LR vs HR)  PSNR={baseline_psnr:.2f} dB   SSIM={baseline_ssim:.4f}"
+    )
+    line2 = (
+        f"Final (SR vs HR)      PSNR={final_psnr:.2f} dB   SSIM={final_ssim:.4f}"
+    )
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thick = 1
+    color = (20, 20, 20)
+    y1 = text_margin + 18
+    y2 = text_margin + 42
+    cv2.putText(banner, line1, (text_margin, y1), font, font_scale, color, thick, cv2.LINE_AA)
+    cv2.putText(banner, line2, (text_margin, y2), font, font_scale, color, thick, cv2.LINE_AA)
+
+    # 子图标题（LR / SR / HR）
+    sub_w = w
+    for i, lab in enumerate(['LR input', 'SR (best)', 'HR ref']):
+        x0 = i * sub_w + text_margin
+        cv2.putText(strip_bgr, lab, (x0, h - 8), font, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+
+    out = np.vstack([banner, strip_bgr])
+    cv2.imwrite(path, out)
 
 
 def get_hovernet_maps_multiclass(hovernet, img_01):
@@ -96,7 +154,7 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
     fieldnames = ['Filename', 'Baseline_PSNR', 'Baseline_SSIM',
                   'Final_PSNR', 'Final_SSIM', 'Final_Fidelity_L1',
                   'Final_Artifact', 'Final_Semantic_Shift',
-                  'Final_Penalty_Score', 'Stop_Reason', 'Total_Iters']
+                  'Final_Penalty_Score', 'Stop_Reason', 'Best_Iter']
 
     if not os.path.exists(csv_path):
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -199,6 +257,17 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
             final_psnr = compute_psnr(p_best.cpu(), hr_batch[idx:idx+1].cpu())
             final_ssim = compute_ssim(p_best.cpu(), hr_batch[idx:idx+1].cpu())
 
+            save_lr_sr_hr_triptych(
+                lr_batch[idx:idx+1],
+                p_best,
+                hr_batch[idx:idx+1],
+                os.path.join(d, 'comparison.png'),
+                baseline_psnr=base_psnr[idx],
+                baseline_ssim=base_ssim[idx],
+                final_psnr=final_psnr,
+                final_ssim=final_ssim,
+            )
+
             fid_best = F.l1_loss(p_best, lr_batch[idx:idx+1]).item()
             art_best = compute_artifact_penalty(p_best.cpu(), bicubic_up[idx:idx+1].cpu())
 
@@ -216,7 +285,7 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
                 Final_PSNR=f"{final_psnr:.4f}", Final_SSIM=f"{final_ssim:.4f}",
                 Final_Fidelity_L1=f"{fid_best:.6f}", Final_Artifact=f"{art_best:.4f}",
                 Final_Semantic_Shift=f"{sem_best:.6f}", Final_Penalty_Score=f"{best_scores[idx]:.4f}",
-                Stop_Reason=stop_reasons[idx], Total_Iters=best_iters[idx]
+                Stop_Reason=stop_reasons[idx], Best_Iter=best_iters[idx]
             ))
 
         with open(csv_path, 'a', newline='', encoding='utf-8') as f:
