@@ -22,6 +22,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
 
 from ddpm_dataset import NCTDataset
 from ddpm_utils import predict_x0_from_noise_shared
@@ -160,8 +162,8 @@ class ValidationSet:
         返回的字典包含：
           reconstructed : [B,3,H,W]  重建结果
           diff_vis      : [B,3,H,W]  |reconstructed - hr|，已 clamp 到 [0,1]
-          cls_clean     : [B,1,H,W]  clean 的 tp argmax 类别图（归一化到 0~1）
-          cls_pred      : [B,1,H,W]  pred  的 tp argmax 类别图（归一化到 0~1）
+          cls_clean     : [B,1,H,W]  clean 的 tp argmax 类别图（离散类别索引）
+          cls_pred      : [B,1,H,W]  pred  的 tp argmax 类别图（离散类别索引）
           conf_clean    : [B,1,H,W]  clean 的 tp top1 置信度
           conf_pred     : [B,1,H,W]  pred  的 tp top1 置信度
           nuc_mask      : [B,1,H,W]  nuclei mask（np[:,1]）
@@ -190,13 +192,14 @@ class ValidationSet:
             diff_vis = (recon - self.hr).abs().clamp(0, 1)
 
             B, _, H, W = self.hr.shape
+            nr_types = 6
             cls_clean = cls_pred = conf_clean = conf_pred = nuc_mask = torch.zeros(B, 1, H, W, device=self.device)
             if loss_module is not None and hasattr(loss_module, '_run_hovernet'):
                 c = loss_module._run_hovernet(self.hr)
                 p = loss_module._run_hovernet(recon)
                 nr_types = c['tp_prob'].shape[1]
-                cls_clean = (c['tp_label'].float() / max(nr_types - 1, 1)).unsqueeze(1)
-                cls_pred  = (p['tp_label'].float() / max(nr_types - 1, 1)).unsqueeze(1)
+                cls_clean = c['tp_label'].float().unsqueeze(1)
+                cls_pred  = p['tp_label'].float().unsqueeze(1)
                 conf_clean = c['tp_conf'].unsqueeze(1)
                 conf_pred  = p['tp_conf'].unsqueeze(1)
                 nuc_mask   = c['nuc_mask'].unsqueeze(1)
@@ -209,6 +212,7 @@ class ValidationSet:
             conf_clean=conf_clean,
             conf_pred=conf_pred,
             nuc_mask=nuc_mask,
+            nr_types=nr_types,
         )
 
 
@@ -221,6 +225,7 @@ def save_validation_debug_images(
     epoch, save_dir, num_vis=8, return_tensor=False,
     col_titles=None,
     suptitle: str = None,
+    nr_types: int = 6,
 ):
     """
     保存 6 行图像的网格：
@@ -243,14 +248,17 @@ def save_validation_debug_images(
     def _gray(t):
         return t[:num_vis, 0].detach().cpu().clamp(0,1).numpy()
 
+    def _label(t):
+        return t[:num_vis, 0].detach().cpu().numpy()
+
     # 行标签（左侧）
     rows_data = [
         (_rgb(hr),            'HR'),
         (_rgb(lr),            'LR'),
         (_rgb(reconstructed), 'Recon'),
         (_rgb(diff_vis),      'Residual'),
-        (_gray(cls_clean),    'tp_label clean'),
-        (_gray(cls_pred),     'tp_label pred'),
+        (_label(cls_clean),   'tp_label clean'),
+        (_label(cls_pred),    'tp_label pred'),
         (_gray(conf_clean),   'tp_conf clean'),
         (_gray(conf_pred),    'tp_conf pred'),
         (_gray(nuc_mask),     'nuc_mask'),
@@ -260,6 +268,14 @@ def save_validation_debug_images(
     fig, axes = plt.subplots(n_rows, n_cols,
                               figsize=(2.8 * n_cols, 2.6 * n_rows),
                               squeeze=False)
+
+    # 固定离散类别色图，避免每张图动态映射导致颜色语义不一致
+    max_label = max(int(nr_types) - 1, 1)
+    cls_colors = ['#000000', '#e41a1c', '#377eb8', '#4daf4a', '#ff7f00', '#984ea3']
+    cls_names  = ['Background', 'Neoplastic', 'Inflammatory',
+                  'Connective', 'Dead', 'Non-Neoplastic Epithelial']
+    class_cmap = ListedColormap(cls_colors[:max_label + 1])
+    class_norm = BoundaryNorm(np.arange(-0.5, max_label + 1.5, 1), class_cmap.N)
 
     # 总标题：用于展示 epoch / checkpoint 指标等
     if suptitle:
@@ -276,9 +292,20 @@ def save_validation_debug_images(
             ax = axes[r, c]
             if data.ndim == 3:             # RGB 图像
                 ax.imshow(data[c])
-            else:                          # 灰度热力图
-                ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
+            else:                          # 灰度热力图 / 离散类别图
+                if r in (4, 5):
+                    ax.imshow(data[c], cmap=class_cmap, norm=class_norm, vmin=0, vmax=max_label)
+                else:
+                    ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
             ax.axis('off')
+
+    # 固定类别图例（与离散色图一一对应）
+    legend_handles = [
+        Patch(facecolor=cls_colors[i], edgecolor='none', label=f'{i}:{cls_names[i]}')
+        for i in range(min(max_label + 1, len(cls_names)))
+    ]
+    fig.legend(handles=legend_handles, loc='upper right', bbox_to_anchor=(0.995, 0.995),
+               frameon=True, fontsize=8, ncol=1, title='TP classes')
 
     # 留出 suptitle 空间
     plt.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1))

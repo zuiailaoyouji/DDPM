@@ -484,6 +484,7 @@ def train(
                         conf_clean=result['conf_clean'],
                         conf_pred=result['conf_pred'],
                         nuc_mask=result['nuc_mask'],
+                        nr_types=result.get('nr_types', 6),
                         epoch=epoch+1, save_dir=vis_dir,
                         num_vis=8, return_tensor=True,
                         col_titles=col_titles,
