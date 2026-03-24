@@ -249,7 +249,7 @@ def save_validation_debug_images(
         return t[:num_vis, 0].detach().cpu().clamp(0,1).numpy()
 
     def _label(t):
-        return t[:num_vis, 0].detach().cpu().numpy()
+        return t[:num_vis, 0].detach().cpu().numpy().astype(np.int32)
 
     # 行标签（左侧）
     rows_data = [
@@ -270,12 +270,16 @@ def save_validation_debug_images(
                               squeeze=False)
 
     # 固定离散类别色图，避免每张图动态映射导致颜色语义不一致
-    max_label = max(int(nr_types) - 1, 1)
-    cls_colors = ['#000000', '#e41a1c', '#377eb8', '#4daf4a', '#ff7f00', '#984ea3']
-    cls_names  = ['Background', 'Neoplastic', 'Inflammatory',
-                  'Connective', 'Dead', 'Non-Neoplastic Epithelial']
-    class_cmap = ListedColormap(cls_colors[:max_label + 1])
-    class_norm = BoundaryNorm(np.arange(-0.5, max_label + 1.5, 1), class_cmap.N)
+    tp_colors = [
+        '#440154',  # 0 background
+        '#d62728',  # 1 neoplastic
+        '#1f77b4',  # 2 inflammatory
+        '#2ca02c',  # 3 connective
+        '#17becf',  # 4 dead
+        '#bcbd22',  # 5 non-neoplastic epithelial
+    ]
+    tp_cmap = ListedColormap(tp_colors)
+    tp_norm = BoundaryNorm(np.arange(-0.5, len(tp_colors) + 0.5, 1), tp_cmap.N)
 
     # 总标题：用于展示 epoch / checkpoint 指标等
     if suptitle:
@@ -290,22 +294,24 @@ def save_validation_debug_images(
         axes[r, 0].set_ylabel(title, fontsize=10)
         for c in range(n_cols):
             ax = axes[r, c]
-            if data.ndim == 3:             # RGB 图像
+            if r in (4, 5):                # 第5、6行：离散类别图
+                ax.imshow(data[c], cmap=tp_cmap, norm=tp_norm, interpolation='nearest')
+            elif data.ndim == 3:           # RGB 图像
                 ax.imshow(data[c])
             else:                          # 灰度热力图 / 离散类别图
-                if r in (4, 5):
-                    ax.imshow(data[c], cmap=class_cmap, norm=class_norm, vmin=0, vmax=max_label)
-                else:
-                    ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
+                ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
             ax.axis('off')
 
     # 固定类别图例（与离散色图一一对应）
     legend_handles = [
-        Patch(facecolor=cls_colors[i], edgecolor='none', label=f'{i}:{cls_names[i]}')
-        for i in range(min(max_label + 1, len(cls_names)))
+        Patch(facecolor=tp_colors[0], label='0:Background'),
+        Patch(facecolor=tp_colors[1], label='1:Neoplastic'),
+        Patch(facecolor=tp_colors[2], label='2:Inflammatory'),
+        Patch(facecolor=tp_colors[3], label='3:Connective'),
+        Patch(facecolor=tp_colors[4], label='4:Dead'),
+        Patch(facecolor=tp_colors[5], label='5:Non-Neoplastic Epithelial'),
     ]
-    fig.legend(handles=legend_handles, loc='upper right', bbox_to_anchor=(0.995, 0.995),
-               frameon=True, fontsize=8, ncol=1, title='TP classes')
+    fig.legend(handles=legend_handles, title='TP classes', loc='upper right', fontsize=8)
 
     # 留出 suptitle 空间
     plt.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1))
