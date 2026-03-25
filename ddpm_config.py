@@ -19,9 +19,10 @@ class TrainingConfig:
     norm_dir:      str          = '/data/xuwen/NCT-CRC-HE-100K/NORM'
     hovernet_path: Optional[str] = None
     val_vis_dir:   Optional[str] = None
+    hovernet_upsample_factor: float = 2.0  # 20x→40x 常用 2.0；1.0 表示不做对齐上采样
 
     # ── 基础训练配置 ────────────────────────────────────────────────
-    epochs:     int   = 18
+    epochs:     int   = 150
     batch_size: int   = 4
     lr:         float = 1e-4
     device:     str   = 'cuda'
@@ -39,9 +40,9 @@ class TrainingConfig:
 
     # ── 在线退化设置 ────────────────────────────────────────────────
     scale:             int   = 2                  # LR 下采样倍率（×2）
-    blur_sigma_range:  Tuple = (0.8, 1.6)
-    noise_std_range:   Tuple = (0.0, 0.01)
-    stain_jitter:      float = 0.02
+    blur_sigma_range:  Tuple = (1.0, 1.0)
+    noise_std_range:   Tuple = (0.0, 0.0)
+    stain_jitter:      float = 0.0
 
     # ── 各项损失权重 ────────────────────────────────────────────────
     lambda_noise: float = 1.0    # 扩散噪声 MSE
@@ -70,9 +71,9 @@ class TrainingConfig:
     # 阶段 3（epoch >= semantic_end_epoch）：
     #   纯像素收尾：再次关闭 L_sem / L_dir 与 semantic injection
     #   仅使用 L_noise + L_rec + L_grad + L_tv
-    semantic_start_epoch:   int = 3
-    semantic_end_epoch:     int = 14
-    semantic_warmup_epochs: int = 3
+    semantic_start_epoch:   int = 30
+    semantic_end_epoch:     int = 110
+    semantic_warmup_epochs: int = 15
 
     # ── 优化器设置 ─────────────────────────────────────────────────
     weight_decay:       float = 0.01
@@ -80,7 +81,7 @@ class TrainingConfig:
     accumulation_steps: int   = 1
 
     # ── 数据加载 ───────────────────────────────────────────────────
-    num_workers:     int  = 8
+    num_workers:     int  = 4
     pin_memory:      bool = True   # 训练/验证 DataLoader；非 CUDA 时 train 内会忽略
     oversample:      bool = True   # 训练集 NCTDataset；验证集仍默认 False
     train_drop_last: bool = True   # 训练 DataLoader（避免最后不完整 batch 影响 BN/日志）

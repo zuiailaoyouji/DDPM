@@ -32,6 +32,7 @@ from unet_wrapper import create_model
 from ddpm_utils import load_hovernet, predict_x0_from_noise_shared, get_device
 from degradation import degrade, apply_degradation
 from metrics import (compute_psnr, compute_ssim, compute_artifact_penalty)
+from hovernet_input_preprocess import run_hovernet_semantics_aligned
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,15 +113,14 @@ def save_lr_sr_hr_triptych(
     cv2.imwrite(path, out)
 
 
-def get_hovernet_maps_multiclass(hovernet, img_01):
+def get_hovernet_maps_multiclass(hovernet, img_01, hovernet_upsample_factor: float = 2.0):
     """提取多类别语义特征：tp_prob, tp_conf, nuc_mask"""
-    with torch.no_grad():
-        dev = next(hovernet.parameters()).device
-        out = hovernet(img_01.to(dev) * 255.0)
-        tp_prob  = torch.softmax(out['tp'], dim=1)
-        tp_conf, _ = torch.max(tp_prob, dim=1, keepdim=True)
-        nuc_mask = torch.softmax(out['np'], dim=1)[:, 1:2, :, :]
-    return tp_prob.cpu(), tp_conf.cpu(), nuc_mask.cpu()
+    out = run_hovernet_semantics_aligned(
+        hovernet,
+        img_01,
+        upsample_factor=hovernet_upsample_factor,
+    )
+    return out["tp_prob"].cpu(), out["tp_conf"].unsqueeze(1).cpu(), out["nuc_mask"].unsqueeze(1).cpu()
 
 
 def compute_new_semantic_mae(p_pred, p_clean, conf_clean, mask_clean, tau_nuc=0.4, tau_conf=0.6):
@@ -132,18 +132,21 @@ def compute_new_semantic_mae(p_pred, p_clean, conf_clean, mask_clean, tau_nuc=0.
 
 
 def build_semantic_tensor(hovernet, img_01: torch.Tensor,
-                          device: Optional[Union[str, torch.device]] = None) -> torch.Tensor:
+                          device: Optional[Union[str, torch.device]] = None,
+                          hovernet_upsample_factor: float = 2.0) -> torch.Tensor:
     """输出: [B,8,H,W]"""
-    with torch.no_grad():
-        dev = next(hovernet.parameters()).device
-        out = hovernet(img_01.to(dev) * 255.0)
-        tp_prob  = torch.softmax(out['tp'], dim=1)
-        nuc_mask = torch.softmax(out['np'], dim=1)[:, 1:2, :, :]
-        tp_conf, _ = torch.max(tp_prob, dim=1, keepdim=True)
-        sem = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1)
-        if device is None:
-            device = img_01.device
-        return sem.to(device)
+    out = run_hovernet_semantics_aligned(
+        hovernet,
+        img_01,
+        upsample_factor=hovernet_upsample_factor,
+    )
+    tp_prob = out["tp_prob"]
+    nuc_mask = out["nuc_mask"].unsqueeze(1)  # [B,1,H,W]
+    tp_conf = out["tp_conf"].unsqueeze(1)    # [B,1,H,W]
+    sem = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1)
+    if device is None:
+        device = img_01.device
+    return sem.to(device)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,11 +189,24 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
         sem_tensor = None
         p_base, conf_base, mask_base = None, None, None
         if args.use_semantic_injection and (hovernet is not None) and getattr(unet, "use_semantic", False):
-            sem_tensor = build_semantic_tensor(hovernet, bicubic_up, device=device)
-            p_base, conf_base, mask_base = get_hovernet_maps_multiclass(hovernet, bicubic_up)
+            sem_tensor = build_semantic_tensor(
+                hovernet,
+                bicubic_up,
+                device=device,
+                hovernet_upsample_factor=args.hovernet_upsample_factor,
+            )
+            p_base, conf_base, mask_base = get_hovernet_maps_multiclass(
+                hovernet,
+                bicubic_up,
+                hovernet_upsample_factor=args.hovernet_upsample_factor,
+            )
         elif hovernet is not None:
             # 未开注入时仍可为 Semantic MAE 准备参照（与 bicubic 一致）
-            p_base, conf_base, mask_base = get_hovernet_maps_multiclass(hovernet, bicubic_up)
+            p_base, conf_base, mask_base = get_hovernet_maps_multiclass(
+                hovernet,
+                bicubic_up,
+                hovernet_upsample_factor=args.hovernet_upsample_factor,
+            )
 
         current      = bicubic_up.clone()
         best_tensor  = bicubic_up.clone()
@@ -243,7 +259,11 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
 
                 sem_shift = 0.0
                 if hovernet is not None and p_base is not None:
-                    p_p, _, _ = get_hovernet_maps_multiclass(hovernet, p)
+                    p_p, _, _ = get_hovernet_maps_multiclass(
+                        hovernet,
+                        p,
+                        hovernet_upsample_factor=args.hovernet_upsample_factor,
+                    )
                     sem_shift = compute_new_semantic_mae(
                         p_p,
                         p_base[idx:idx+1], conf_base[idx:idx+1], mask_base[idx:idx+1],
@@ -310,7 +330,11 @@ def run_batch_inference(dataloader, unet, hovernet, scheduler, args):
 
             sem_best = 0.0
             if hovernet and p_base is not None:
-                p_p, _, _ = get_hovernet_maps_multiclass(hovernet, p_best)
+                p_p, _, _ = get_hovernet_maps_multiclass(
+                    hovernet,
+                    p_best,
+                    hovernet_upsample_factor=args.hovernet_upsample_factor,
+                )
                 sem_best = compute_new_semantic_mae(
                     p_p, p_base[idx:idx+1], conf_base[idx:idx+1], mask_base[idx:idx+1],
                     args.tau_nuc, args.tau_conf
@@ -388,6 +412,8 @@ def main():
     p.add_argument('--output_dir',    default='./results/sr')
     p.add_argument('--unet_path',     required=True)
     p.add_argument('--hovernet_path', default=None)
+    p.add_argument('--hovernet_upsample_factor', type=float, default=2.0,
+                   help='HoVer-Net 语义提取前上采样倍率（例如 20x→40x 用 2.0；1.0 关闭）')
     p.add_argument('--iters',         type=int,   default=5)
     p.add_argument('--noise_t',       type=int,   default=200, help='起始噪声步(建议200-300)')
     p.add_argument('--scale',         type=int,   default=2)

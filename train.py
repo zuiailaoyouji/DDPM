@@ -86,6 +86,7 @@ def train(
     logger=None, val_vis_dir=None,
     num_train_timesteps=1000, t_max=400,
     create_semantic_branch: bool = False,
+    hovernet_upsample_factor: float = 2.0,
     # 优化器与 DataLoader（与 ddpm_config 对齐）
     weight_decay: float = 0.01,
     max_grad_norm: float = 1.0,
@@ -149,6 +150,7 @@ def train(
             lambda_dir=lambda_dir,
             lambda_tv=lambda_tv,
             t_max=t_max,
+            hovernet_upsample_factor=hovernet_upsample_factor,
         ).to(device)
         # 注意：只要加载了 HoVer-Net 就会构造 SemanticSRLoss，但真正是否启用语义
         # 由 epoch 与 semantic_start_epoch / semantic_end_epoch 决定（semantic_on）。
@@ -339,16 +341,20 @@ def train(
 
             # ── 构造语义先验张量 S：
             # S = [tp_prob(6), nuc_mask(1), tp_conf(1)]（8 通道语义先验）
+            # 重要：统一走 loss_fn._run_hovernet()，内部已包含“上采样→HoVer-Net→缩回原尺寸”的对齐逻辑。
             # 仅在 Stage-2（semantic_on=True）时需要（用于架构注入）。
             sem_tensor = None
             if semantic_on and loss_fn is not None and getattr(unet, "use_semantic", False):
                 with torch.no_grad():
-                    hn_dev = next(loss_fn.hovernet.parameters()).device
-                    hn_out = loss_fn.hovernet(hr.to(hn_dev) * 255.0)
-                    tp_prob  = torch.softmax(hn_out['tp'], dim=1)                 # [B,C,H,W]
-                    nuc_mask = torch.softmax(hn_out['np'], dim=1)[:, 1:2, :, :]   # [B,1,H,W]
-                    tp_conf, _ = torch.max(tp_prob, dim=1, keepdim=True)          # [B,1,H,W]
-                    sem_tensor = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1).to(device)  # [B,8,H,W]
+                    c = loss_fn._run_hovernet(hr)  # tp_prob/tp_conf/nuc_mask 已对齐回 hr 尺寸
+                    sem_tensor = torch.cat(
+                        [
+                            c["tp_prob"],
+                            c["nuc_mask"].unsqueeze(1),
+                            c["tp_conf"].unsqueeze(1),
+                        ],
+                        dim=1,
+                    ).to(device)  # [B,8,H,W]
 
             # U-Net：以 LR 为条件，对 noisy_hr 去噪（Stage-2 才启用语义注入）
             model_input = torch.cat([lr_img, noisy_hr], dim=1)   # [B, 6, H, W]
@@ -655,6 +661,8 @@ def main():
     p.add_argument('--tum_dir',  default=cfg.tum_dir)
     p.add_argument('--norm_dir', default=cfg.norm_dir)
     p.add_argument('--hovernet_path', default=cfg.hovernet_path)
+    p.add_argument('--hovernet_upsample_factor', type=float, default=getattr(cfg, "hovernet_upsample_factor", 2.0),
+                   help='HoVer-Net 语义提取前上采样倍率（例如 20x→40x 用 2.0；1.0 关闭）')
     p.add_argument('--epochs',     type=int,   default=cfg.epochs)
     p.add_argument('--batch_size', type=int,   default=cfg.batch_size)
     p.add_argument('--lr',         type=float, default=cfg.lr)
@@ -753,6 +761,7 @@ def main():
         blur_sigma_range=tuple(args.blur_sigma_range),
         noise_std_range=tuple(args.noise_std_range),
         stain_jitter=args.stain_jitter,
+        hovernet_upsample_factor=args.hovernet_upsample_factor,
         accumulation_steps=args.accumulation_steps,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,

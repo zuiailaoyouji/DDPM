@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hovernet_input_preprocess import run_hovernet_semantics_aligned
+
 
 class SemanticSRLoss(nn.Module):
     """
@@ -55,6 +57,8 @@ class SemanticSRLoss(nn.Module):
         lambda_sem:   float = 0.05,
         lambda_dir:   float = 0.02,
         lambda_tv:    float = 0.001,
+        # HoVer-Net 输入分辨率对齐（例如 20x -> 40x 通常 factor=2）
+        hovernet_upsample_factor: float = 2.0,
         # 扩散 / HoVer-Net 的门控相关参数
         t_max: int = 400,
         tv_margin_factor: float = 1.05,
@@ -80,6 +84,7 @@ class SemanticSRLoss(nn.Module):
         self.t_max            = t_max
         self.tv_margin_factor = tv_margin_factor
         self.tv_leaky_alpha   = tv_leaky_alpha
+        self.hovernet_upsample_factor = float(hovernet_upsample_factor)
 
         # 冻结 HoVer-Net 参数
         for p in self.hovernet.parameters():
@@ -195,18 +200,10 @@ class SemanticSRLoss(nn.Module):
           tp_conf  : [B,H,W]
           nuc_mask : [B,H,W]
         """
-        dev = next(self.hovernet.parameters()).device
-        out = self.hovernet(img_01.to(dev) * 255.0)
-        tp_logits = out['tp']
-        tp_prob   = torch.softmax(tp_logits, dim=1)
-        tp_conf, tp_label = torch.max(tp_prob, dim=1)
-        nuc_mask = torch.softmax(out['np'], dim=1)[:, 1, :, :]
-        return dict(
-            tp_logits=tp_logits,
-            tp_prob=tp_prob,
-            tp_label=tp_label,
-            tp_conf=tp_conf,
-            nuc_mask=nuc_mask,
+        return run_hovernet_semantics_aligned(
+            self.hovernet,
+            img_01,
+            upsample_factor=self.hovernet_upsample_factor,
         )
 
     def _semantic_losses(self, x0_hat, hr):
