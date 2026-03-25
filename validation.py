@@ -168,7 +168,8 @@ class ValidationSet:
           cls_pred      : [B,1,H,W]  pred  的 tp argmax 类别图（离散类别索引）
           conf_clean    : [B,1,H,W]  clean 的 tp top1 置信度
           conf_pred     : [B,1,H,W]  pred  的 tp top1 置信度
-          nuc_mask      : [B,1,H,W]  nuclei mask（np[:,1]）
+          nuc_mask_clean : [B,1,H,W]  clean nuclei mask
+          nuc_mask_pred  : [B,1,H,W]  pred  nuclei mask
         """
         if self.hr is None:
             return None
@@ -200,7 +201,9 @@ class ValidationSet:
 
             B, _, H, W = self.hr.shape
             nr_types = 6
-            cls_clean = cls_pred = conf_clean = conf_pred = nuc_mask = torch.zeros(B, 1, H, W, device=self.device)
+            cls_clean = cls_pred = conf_clean = conf_pred = torch.zeros(B, 1, H, W, device=self.device)
+            nuc_mask_clean = torch.zeros(B, 1, H, W, device=self.device)
+            nuc_mask_pred = torch.zeros(B, 1, H, W, device=self.device)
             if loss_module is not None and hasattr(loss_module, '_run_hovernet'):
                 c = loss_module._run_hovernet(self.hr)
                 p = loss_module._run_hovernet(recon)
@@ -209,7 +212,8 @@ class ValidationSet:
                 cls_pred  = p['tp_label'].float().unsqueeze(1)
                 conf_clean = c['tp_conf'].unsqueeze(1)
                 conf_pred  = p['tp_conf'].unsqueeze(1)
-                nuc_mask   = c['nuc_mask'].unsqueeze(1)
+                nuc_mask_clean = c['nuc_mask'].unsqueeze(1)
+                nuc_mask_pred  = p['nuc_mask'].unsqueeze(1)
 
         return dict(
             reconstructed=recon,
@@ -218,7 +222,8 @@ class ValidationSet:
             cls_pred=cls_pred,
             conf_clean=conf_clean,
             conf_pred=conf_pred,
-            nuc_mask=nuc_mask,
+            nuc_mask_clean=nuc_mask_clean,
+            nuc_mask_pred=nuc_mask_pred,
             nr_types=nr_types,
         )
 
@@ -228,7 +233,10 @@ class ValidationSet:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_validation_debug_images(
-    hr, lr, reconstructed, diff_vis, cls_clean, cls_pred, conf_clean, conf_pred, nuc_mask,
+    hr, lr, reconstructed, diff_vis,
+    cls_clean, cls_pred,
+    conf_clean, conf_pred,
+    nuc_mask_clean, nuc_mask_pred,
     epoch, save_dir, num_vis=8, return_tensor=False,
     col_titles=None,
     suptitle: str = None,
@@ -244,7 +252,7 @@ def save_validation_debug_images(
       第 6 行：TP overlay pred（Recon 上叠加语义类别）
       第 7 行：clean tp 置信度
       第 8 行：pred tp 置信度
-      第 9 行：nuclei mask
+      第 9 行：nuclei mask pred
     """
     os.makedirs(save_dir, exist_ok=True)
     num_vis = min(num_vis, hr.shape[0])
@@ -284,9 +292,11 @@ def save_validation_debug_images(
 
     cls_clean_int = _label(cls_clean)
     cls_pred_int = _label(cls_pred)
+    # conf_* 是 [B,1,H,W]，应当走灰度路径以得到 [N,H,W]（避免多出最后的 1 维导致广播错误）
     conf_clean_np = _gray(conf_clean)
     conf_pred_np = _gray(conf_pred)
-    nuc_mask_np = _gray(nuc_mask)
+    nuc_mask_clean_np = _gray(nuc_mask_clean)
+    nuc_mask_pred_np = _gray(nuc_mask_pred)
 
     # -------------------------
     # 从 HoVer-Net/type_info.json 复用颜色
@@ -307,8 +317,8 @@ def save_validation_debug_images(
         tp_color_map_rgb01[tid] = np.array([r, g, b], dtype=np.float32) / 255.0
         tp_colors_hex.append(f"#{r:02x}{g:02x}{b:02x}")
 
-    overlay_clean = _tp_overlay(hr_rgb, cls_clean_int, conf_clean_np, nuc_mask_np)
-    overlay_pred = _tp_overlay(recon_rgb, cls_pred_int, conf_pred_np, nuc_mask_np)
+    overlay_clean = _tp_overlay(hr_rgb, cls_clean_int, conf_clean_np, nuc_mask_clean_np)
+    overlay_pred = _tp_overlay(recon_rgb, cls_pred_int, conf_pred_np, nuc_mask_pred_np)
 
     # 行标签（左侧）
     rows_data = [
@@ -320,7 +330,7 @@ def save_validation_debug_images(
         (overlay_pred,      'TP overlay pred'),
         (conf_clean_np,     'tp_conf clean'),
         (conf_pred_np,      'tp_conf pred'),
-        (nuc_mask_np,       'nuc_mask'),
+        (nuc_mask_pred_np,  'nuc_mask pred'),
     ]
 
     n_rows, n_cols = len(rows_data), num_vis
