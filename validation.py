@@ -15,6 +15,8 @@ validation.py
 
 import os
 import random
+import json
+from pathlib import Path
 import cv2
 import numpy as np
 import torch
@@ -174,15 +176,20 @@ class ValidationSet:
             model_input = torch.cat([self.lr, self.noisy_hr], dim=1)
 
             # 可选：SPM-UNet 架构层语义注入（semantic modulation）
-            # 语义先验 S = [tp_prob(6), nuc_mask, tp_conf]
+            # 语义先验 S：
+            # S = [tp_prob(6), nuc_mask, tp_conf]（8 通道语义先验）
             sem_tensor = None
             if use_semantic_injection and (loss_module is not None) and hasattr(loss_module, '_run_hovernet'):
                 c = loss_module._run_hovernet(self.hr)
-                sem_tensor = torch.cat([
-                    c['tp_prob'],
-                    c['nuc_mask'].unsqueeze(1),
-                    c['tp_conf'].unsqueeze(1),
-                ], dim=1)  # [B,8,H,W]
+                tp_prob = c['tp_prob']  # [B,C,H,W]
+                sem_tensor = torch.cat(
+                    [
+                        tp_prob,
+                        c['nuc_mask'].unsqueeze(1),
+                        c['tp_conf'].unsqueeze(1),
+                    ],
+                    dim=1,
+                )  # [B,8,H,W]
 
             # 若 unet 是 SPMUNet 且当前阶段 hooks 已关闭，则 semantic 会被忽略/走直通路径
             noise_pred = unet(model_input, self.timesteps, semantic=sem_tensor).sample
@@ -228,13 +235,13 @@ def save_validation_debug_images(
     nr_types: int = 6,
 ):
     """
-    保存 6 行图像的网格：
+    保存验证调试网格（模仿 HoVer-Net overlay 风格）：
       第 1 行：HR（真值）
       第 2 行：LR 输入
       第 3 行：重建结果
       第 4 行：绝对残差 |Recon - HR|
-      第 5 行：clean tp 类别图（argmax）
-      第 6 行：pred tp 类别图（argmax）
+      第 5 行：TP overlay clean（HR 上叠加语义类别）
+      第 6 行：TP overlay pred（Recon 上叠加语义类别）
       第 7 行：clean tp 置信度
       第 8 行：pred tp 置信度
       第 9 行：nuclei mask
@@ -251,17 +258,69 @@ def save_validation_debug_images(
     def _label(t):
         return t[:num_vis, 0].detach().cpu().numpy().astype(np.int32)
 
+    def _tp_overlay(base_rgb, tp_label_int, tp_conf_gray, nuc_mask_gray, overlay_alpha=0.6):
+        """
+        base_rgb:      [N,H,W,3] float in [0,1]，RGB
+        tp_label_int: [N,H,W]   int
+        tp_conf_gray: [N,H,W]   float in [0,1]
+        nuc_mask_gray:[N,H,W]   float in [0,1]
+        """
+        # overlay 颜色完全复用 HoVer-Net type_info.json
+        tp_label_int = np.clip(tp_label_int, 0, tp_color_map_rgb01.shape[0] - 1)
+        color_map = tp_color_map_rgb01[tp_label_int]  # [N,H,W,3]
+
+        valid_mask = (tp_label_int > 0) & (nuc_mask_gray > 0)
+        alpha = overlay_alpha * tp_conf_gray * valid_mask.astype(np.float32)  # [N,H,W]
+        alpha = np.clip(alpha, 0.0, 1.0)
+        alpha = alpha[..., None]  # [N,H,W,1]
+
+        overlay = base_rgb * (1.0 - alpha) + color_map * alpha
+        return overlay
+
+    hr_rgb = _rgb(hr)
+    lr_rgb = _rgb(lr)
+    recon_rgb = _rgb(reconstructed)
+    diff_rgb = _rgb(diff_vis)
+
+    cls_clean_int = _label(cls_clean)
+    cls_pred_int = _label(cls_pred)
+    conf_clean_np = _gray(conf_clean)
+    conf_pred_np = _gray(conf_pred)
+    nuc_mask_np = _gray(nuc_mask)
+
+    # -------------------------
+    # 从 HoVer-Net/type_info.json 复用颜色
+    # -------------------------
+    default_type_info_path = Path(__file__).resolve().parent / "HoVer-net" / "type_info.json"
+    raw_type_info = json.loads(default_type_info_path.read_text(encoding="utf-8"))
+
+    tp_colors_hex = []
+    tp_color_map_rgb01 = np.zeros((6, 3), dtype=np.float32)
+    for tid in range(6):
+        t = raw_type_info.get(str(tid), None)
+        if t is None:
+            rgb = [0, 0, 0]
+        else:
+            # [type_name, [R,G,B]]
+            rgb = t[1]
+        r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+        tp_color_map_rgb01[tid] = np.array([r, g, b], dtype=np.float32) / 255.0
+        tp_colors_hex.append(f"#{r:02x}{g:02x}{b:02x}")
+
+    overlay_clean = _tp_overlay(hr_rgb, cls_clean_int, conf_clean_np, nuc_mask_np)
+    overlay_pred = _tp_overlay(recon_rgb, cls_pred_int, conf_pred_np, nuc_mask_np)
+
     # 行标签（左侧）
     rows_data = [
-        (_rgb(hr),            'HR'),
-        (_rgb(lr),            'LR'),
-        (_rgb(reconstructed), 'Recon'),
-        (_rgb(diff_vis),      'Residual'),
-        (_label(cls_clean),   'tp_label clean'),
-        (_label(cls_pred),    'tp_label pred'),
-        (_gray(conf_clean),   'tp_conf clean'),
-        (_gray(conf_pred),    'tp_conf pred'),
-        (_gray(nuc_mask),     'nuc_mask'),
+        (hr_rgb,            'HR'),
+        (lr_rgb,            'LR'),
+        (recon_rgb,         'Recon'),
+        (diff_rgb,         'Residual'),
+        (overlay_clean,     'TP overlay clean'),
+        (overlay_pred,      'TP overlay pred'),
+        (conf_clean_np,     'tp_conf clean'),
+        (conf_pred_np,      'tp_conf pred'),
+        (nuc_mask_np,       'nuc_mask'),
     ]
 
     n_rows, n_cols = len(rows_data), num_vis
@@ -269,17 +328,8 @@ def save_validation_debug_images(
                               figsize=(2.8 * n_cols, 2.6 * n_rows),
                               squeeze=False)
 
-    # 固定离散类别色图，避免每张图动态映射导致颜色语义不一致
-    tp_colors = [
-        '#440154',  # 0 background
-        '#d62728',  # 1 neoplastic
-        '#1f77b4',  # 2 inflammatory
-        '#2ca02c',  # 3 connective
-        '#17becf',  # 4 dead
-        '#bcbd22',  # 5 non-neoplastic epithelial
-    ]
-    tp_cmap = ListedColormap(tp_colors)
-    tp_norm = BoundaryNorm(np.arange(-0.5, len(tp_colors) + 0.5, 1), tp_cmap.N)
+    # 固定类别颜色（从 HoVer-Net type_info.json 复用）
+    tp_colors = tp_colors_hex
 
     # 总标题：用于展示 epoch / checkpoint 指标等
     if suptitle:
@@ -294,22 +344,20 @@ def save_validation_debug_images(
         axes[r, 0].set_ylabel(title, fontsize=10)
         for c in range(n_cols):
             ax = axes[r, c]
-            if r in (4, 5):                # 第5、6行：离散类别图
-                ax.imshow(data[c], cmap=tp_cmap, norm=tp_norm, interpolation='nearest')
-            elif data.ndim == 3:           # RGB 图像
+            if data.ndim == 4:  # RGB overlay
                 ax.imshow(data[c])
-            else:                          # 灰度热力图 / 离散类别图
-                ax.imshow(data[c], cmap='jet', vmin=0, vmax=1)
+            else:               # 灰度图（conf / nuc_mask）
+                ax.imshow(data[c], cmap='gray', vmin=0, vmax=1)
             ax.axis('off')
 
     # 固定类别图例（与离散色图一一对应）
     legend_handles = [
-        Patch(facecolor=tp_colors[0], label='0:Background'),
-        Patch(facecolor=tp_colors[1], label='1:Neoplastic'),
-        Patch(facecolor=tp_colors[2], label='2:Inflammatory'),
-        Patch(facecolor=tp_colors[3], label='3:Connective'),
-        Patch(facecolor=tp_colors[4], label='4:Dead'),
-        Patch(facecolor=tp_colors[5], label='5:Non-Neoplastic Epithelial'),
+        Patch(facecolor=tp_colors[0], label='0:background(nolabe)'),
+        Patch(facecolor=tp_colors[1], label='1:neopla'),
+        Patch(facecolor=tp_colors[2], label='2:inflam'),
+        Patch(facecolor=tp_colors[3], label='3:connec'),
+        Patch(facecolor=tp_colors[4], label='4:necros'),
+        Patch(facecolor=tp_colors[5], label='5:no-neo'),
     ]
     fig.legend(handles=legend_handles, title='TP classes', loc='upper right', fontsize=8)
 

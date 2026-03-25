@@ -5,7 +5,7 @@ SPM-UNet（语义先验调制 U-Net）的三阶段训练循环。
 架构层语义注入（相较旧版训练代码的新增点）
 ------------------------------------------
 SPMUNet 在扩散骨干 UNet2DModel 之上新增了 SemanticEncoder + SemanticModBlock，
-把 `[tp_prob(6), nuc_mask, tp_conf]` 注入到解码器高分辨率层（128×128）。
+把 `[tp_onehot(6), nuc_mask, tp_conf]` 注入到解码器高分辨率层（128×128）。
 每个 batch 都会基于 HR 真值图通过 HoVer-Net 构造语义先验张量 `S`，并作为
 `semantic=S` 传入模型前向（仅 Stage 2 启用）。
 
@@ -337,14 +337,15 @@ def train(
             timesteps = torch.randint(0, t_max, (bs,), device=device).long()
             noisy_hr  = scheduler.add_noise(hr, noise, timesteps)
 
-            # ── 构造语义先验张量 S = [tp_prob(6), nuc_mask, tp_conf]
+            # ── 构造语义先验张量 S：
+            # S = [tp_prob(6), nuc_mask(1), tp_conf(1)]（8 通道语义先验）
             # 仅在 Stage-2（semantic_on=True）时需要（用于架构注入）。
             sem_tensor = None
             if semantic_on and loss_fn is not None and getattr(unet, "use_semantic", False):
                 with torch.no_grad():
                     hn_dev = next(loss_fn.hovernet.parameters()).device
                     hn_out = loss_fn.hovernet(hr.to(hn_dev) * 255.0)
-                    tp_prob  = torch.softmax(hn_out['tp'], dim=1)                 # [B,6,H,W]
+                    tp_prob  = torch.softmax(hn_out['tp'], dim=1)                 # [B,C,H,W]
                     nuc_mask = torch.softmax(hn_out['np'], dim=1)[:, 1:2, :, :]   # [B,1,H,W]
                     tp_conf, _ = torch.max(tp_prob, dim=1, keepdim=True)          # [B,1,H,W]
                     sem_tensor = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1).to(device)  # [B,8,H,W]
