@@ -1,18 +1,14 @@
 """
 hovernet_input_preprocess.py
 
-把“输入分辨率（例如 20x 对应的 HR）与 HoVer-Net 预训练分辨率（例如 40x）不一致”带来的误差，
-通过在语义提取前对输入做上采样，并在语义输出后再对齐回原分辨率来处理。
-
-核心思想：
-1) 将 img_01: [B,3,H,W] 上采样到 (H*upsample_factor, W*upsample_factor)
-2) 前向 HoVer-Net 得到 tp_prob / tp_conf / nuc_mask
-3) 将这些语义输出下采样回原始 (H,W)，保证下游损失/注入张量形状不变
+语义提取前可选上采样；语义提取后采用 HoVer-Net 原生风格的 patch 回拼对齐，
+避免“中心贴回”导致外围有效区域不足。
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from math import ceil
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -37,27 +33,131 @@ def upsample_img_01(
     )
 
 
-def resize_semantic_maps_to_hw(
-    tp_prob: torch.Tensor,
-    tp_conf: torch.Tensor,
-    nuc_mask: torch.Tensor,
-    target_hw: Tuple[int, int],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    tp_prob: [B,C,H,W]
-    tp_conf: [B,H,W]
-    nuc_mask: [B,H,W]
+def _get_last_steps(length: int, step_size: int) -> int:
+    nr_step = int(ceil((float(length) - float(step_size)) / float(step_size)))
+    return int((nr_step + 1) * step_size)
 
-    返回：
-      tp_prob_down: [B,C,target_h,target_w]
-      tp_conf_down: [B,target_h,target_w]
-      nuc_mask_down:[B,target_h,target_w]
+
+def _prepare_padded_tensor(img_chw: torch.Tensor, patch_input: int, patch_output: int):
     """
-    th, tw = target_hw
-    tp_prob_down = F.interpolate(tp_prob, size=(th, tw), mode="bilinear", align_corners=False)
-    tp_conf_down = F.interpolate(tp_conf.unsqueeze(1), size=(th, tw), mode="bilinear", align_corners=False).squeeze(1)
-    nuc_mask_down = F.interpolate(nuc_mask.unsqueeze(1), size=(th, tw), mode="bilinear", align_corners=False).squeeze(1)
-    return tp_prob_down, tp_conf_down, nuc_mask_down
+    参考 HoVer-Net tile 推理的 patching 规则。
+    img_chw: [3,H,W]
+    """
+    _, h, w = img_chw.shape
+    last_h = _get_last_steps(h, patch_output)
+    last_w = _get_last_steps(w, patch_output)
+
+    diff = patch_input - patch_output
+    pad_t = pad_l = diff // 2
+    pad_b = last_h + patch_input - h
+    pad_r = last_w + patch_input - w
+
+    img_pad = F.pad(img_chw.unsqueeze(0), (pad_l, pad_r, pad_t, pad_b), mode="reflect").squeeze(0)
+    coord_y = list(range(0, last_h, patch_output))
+    coord_x = list(range(0, last_w, patch_output))
+    return img_pad, coord_y, coord_x, h, w
+
+
+@torch.no_grad()
+def _infer_patch_output_size(hovernet, img_in: torch.Tensor, patch_input: int) -> int:
+    """
+    用单个 probe patch 推断 HoVer-Net 的有效输出 patch 尺寸（fast 模式通常为 164）。
+    """
+    sample = img_in[0:1]  # [1,3,H,W]
+    _, _, h, w = sample.shape
+    if h < patch_input or w < patch_input:
+        pad_h = max(0, patch_input - h)
+        pad_w = max(0, patch_input - w)
+        sample = F.pad(sample, (0, pad_w, 0, pad_h), mode="reflect")
+    patch = sample[:, :, :patch_input, :patch_input]
+    out = hovernet(patch * 255.0)
+    return int(out["tp"].shape[-1])
+
+
+@torch.no_grad()
+def _run_hovernet_stitch_semantics(
+    hovernet,
+    img_in: torch.Tensor,
+    patch_input: int = 256,
+    infer_batch_size: int = 16,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    原生风格 patch 推理 + 回拼，返回：
+      tp_logits [B,C,H,W], tp_prob [B,C,H,W], tp_conf [B,H,W], nuc_mask [B,H,W]
+    """
+    dev = img_in.device
+    patch_output = _infer_patch_output_size(hovernet, img_in, patch_input)
+
+    tp_logits_all: List[torch.Tensor] = []
+    tp_prob_all: List[torch.Tensor] = []
+    tp_conf_all: List[torch.Tensor] = []
+    nuc_mask_all: List[torch.Tensor] = []
+
+    for b in range(img_in.shape[0]):
+        img_chw = img_in[b]
+        img_pad, ys, xs, src_h, src_w = _prepare_padded_tensor(img_chw, patch_input, patch_output)
+        nr_row, nr_col = len(ys), len(xs)
+
+        patch_list: List[torch.Tensor] = []
+        for y in ys:
+            for x in xs:
+                patch_list.append(img_pad[:, y:y + patch_input, x:x + patch_input])
+        patches = torch.stack(patch_list, dim=0).to(dev)
+
+        out_logits_list: List[torch.Tensor] = []
+        out_prob_list: List[torch.Tensor] = []
+        out_conf_list: List[torch.Tensor] = []
+        out_nuc_list: List[torch.Tensor] = []
+        for s in range(0, patches.shape[0], infer_batch_size):
+            p = patches[s:s + infer_batch_size]
+            out = hovernet(p * 255.0)
+            tp_logits = out["tp"]  # [N,C,h,w]
+            tp_prob = F.softmax(tp_logits, dim=1)
+            tp_conf = torch.max(tp_prob, dim=1)[0]  # [N,h,w]
+            nuc = F.softmax(out["np"], dim=1)[:, 1, :, :]  # [N,h,w]
+
+            out_logits_list.append(tp_logits)
+            out_prob_list.append(tp_prob)
+            out_conf_list.append(tp_conf)
+            out_nuc_list.append(nuc)
+
+        tp_logits_p = torch.cat(out_logits_list, dim=0)
+        tp_prob_p = torch.cat(out_prob_list, dim=0)
+        tp_conf_p = torch.cat(out_conf_list, dim=0)
+        nuc_p = torch.cat(out_nuc_list, dim=0)
+
+        c = int(tp_logits_p.shape[1])
+        ho = int(tp_logits_p.shape[-2])
+        wo = int(tp_logits_p.shape[-1])
+
+        logits_canvas = torch.zeros((c, nr_row * ho, nr_col * wo), device=dev, dtype=tp_logits_p.dtype)
+        prob_canvas = torch.zeros((c, nr_row * ho, nr_col * wo), device=dev, dtype=tp_prob_p.dtype)
+        conf_canvas = torch.zeros((nr_row * ho, nr_col * wo), device=dev, dtype=tp_conf_p.dtype)
+        nuc_canvas = torch.zeros((nr_row * ho, nr_col * wo), device=dev, dtype=nuc_p.dtype)
+
+        idx = 0
+        for r in range(nr_row):
+            y0 = r * ho
+            y1 = y0 + ho
+            for cc in range(nr_col):
+                x0 = cc * wo
+                x1 = x0 + wo
+                logits_canvas[:, y0:y1, x0:x1] = tp_logits_p[idx]
+                prob_canvas[:, y0:y1, x0:x1] = tp_prob_p[idx]
+                conf_canvas[y0:y1, x0:x1] = tp_conf_p[idx]
+                nuc_canvas[y0:y1, x0:x1] = nuc_p[idx]
+                idx += 1
+
+        tp_logits_all.append(logits_canvas[:, :src_h, :src_w])
+        tp_prob_all.append(prob_canvas[:, :src_h, :src_w])
+        tp_conf_all.append(conf_canvas[:src_h, :src_w])
+        nuc_mask_all.append(nuc_canvas[:src_h, :src_w])
+
+    tp_logits_b = torch.stack(tp_logits_all, dim=0)
+    tp_prob_b = torch.stack(tp_prob_all, dim=0)
+    tp_conf_b = torch.stack(tp_conf_all, dim=0)
+    nuc_mask_b = torch.stack(nuc_mask_all, dim=0)
+    return tp_logits_b, tp_prob_b, tp_conf_b, nuc_mask_b
 
 
 @torch.no_grad()
@@ -68,7 +168,7 @@ def run_hovernet_semantics_aligned(
     upsample_mode: str = "bicubic",
 ) -> Dict[str, torch.Tensor]:
     """
-    对齐语义输出到输入原分辨率，返回与 semantic_sr_loss._run_hovernet 相同 key 的结构。
+    对齐语义输出到输入原分辨率（原生 patch 回拼），返回与 semantic_sr_loss._run_hovernet 相同 key 的结构。
 
     返回字段：
       tp_logits: [B,C,H,W]（下采样对齐后的 logits）
@@ -87,25 +187,21 @@ def run_hovernet_semantics_aligned(
     else:
         img_in = img_01
 
-    out = hovernet(img_in * 255.0)
-    tp_logits = out["tp"]  # [B,C,Hup,Wup]
-    tp_prob_hup = F.softmax(tp_logits, dim=1)
-    tp_conf_hup, tp_label_hup = torch.max(tp_prob_hup, dim=1)  # [B,Hup,Wup]
-    nuc_mask_hup = F.softmax(out["np"], dim=1)[:, 1, :, :]  # [B,Hup,Wup]
+    tp_logits, tp_prob, tp_conf, nuc_mask = _run_hovernet_stitch_semantics(
+        hovernet,
+        img_in,
+        patch_input=256,
+        infer_batch_size=16,
+    )
 
-    # 下采样对齐回原分辨率
-    if upsample_factor != 1.0:
-        tp_prob, tp_conf, nuc_mask = resize_semantic_maps_to_hw(
-            tp_prob_hup, tp_conf_hup, nuc_mask_hup, target_hw=(target_h, target_w)
-        )
-        tp_label = torch.argmax(tp_prob, dim=1)
-        # logits 没有严格意义（因为我们用了 softmax 再 resize），但为了保持结构一致，做个对齐兜底
+    # 若上采样过，则从 img_in 尺寸回到原始 img_01 尺寸
+    if (tp_prob.shape[-2] != target_h) or (tp_prob.shape[-1] != target_w):
         tp_logits = F.interpolate(tp_logits, size=(target_h, target_w), mode="bilinear", align_corners=False)
-    else:
-        tp_prob = tp_prob_hup
-        tp_conf = tp_conf_hup
-        nuc_mask = nuc_mask_hup
-        tp_label = tp_label_hup
+        tp_prob = F.interpolate(tp_prob, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        tp_conf = F.interpolate(tp_conf.unsqueeze(1), size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(1)
+        nuc_mask = F.interpolate(nuc_mask.unsqueeze(1), size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(1)
+
+    tp_label = torch.argmax(tp_prob, dim=1)
 
     return dict(
         tp_logits=tp_logits,

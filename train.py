@@ -5,7 +5,7 @@ SPM-UNet（语义先验调制 U-Net）的三阶段训练循环。
 架构层语义注入（相较旧版训练代码的新增点）
 ------------------------------------------
 SPMUNet 在扩散骨干 UNet2DModel 之上新增了 SemanticEncoder + SemanticModBlock，
-把 `[tp_prob(6), nuc_mask, tp_conf]` 注入到解码器高分辨率层（128×128）。
+把 `[tp_onehot(6), nuc_mask, tp_conf]` 注入到解码器高分辨率层（128×128）。
 每个 batch 都会基于 HR 真值图通过 HoVer-Net 构造语义先验张量 `S`，并作为
 `semantic=S` 传入模型前向（仅 Stage 2 启用）。
 
@@ -31,7 +31,7 @@ import csv
 import datetime
 from tqdm import tqdm
 
-from ddpm_dataset import NCTDataset
+from ddpm_dataset import build_dataset
 from unet_wrapper import create_model, count_parameters
 from semantic_sr_loss import SemanticSRLoss
 from ddpm_utils import load_hovernet, get_device, print_gpu_info, predict_x0_from_noise_shared
@@ -64,7 +64,10 @@ def semantic_weight_scale(epoch, start, warmup):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(
-    tum_dir, norm_dir, hovernet,
+    hovernet,
+    dataset_type='pannuke',
+    tum_dir=None, norm_dir=None,
+    pannuke_root=None, pannuke_train_fold_dir=None, pannuke_val_fold_dir=None, pannuke_test_fold_dir=None,
     epochs=100, batch_size=8, lr=1e-4,
     device='cuda', save_dir='./checkpoints_sr',
     # 各项损失权重
@@ -86,6 +89,7 @@ def train(
     logger=None, val_vis_dir=None,
     num_train_timesteps=1000, t_max=400,
     create_semantic_branch: bool = False,
+    hovernet_upsample_factor: float = 2.0,
     # 优化器与 DataLoader（与 ddpm_config 对齐）
     weight_decay: float = 0.01,
     max_grad_norm: float = 1.0,
@@ -149,6 +153,7 @@ def train(
             lambda_dir=lambda_dir,
             lambda_tv=lambda_tv,
             t_max=t_max,
+            hovernet_upsample_factor=hovernet_upsample_factor,
         ).to(device)
         # 注意：只要加载了 HoVer-Net 就会构造 SemanticSRLoss，但真正是否启用语义
         # 由 epoch 与 semantic_start_epoch / semantic_end_epoch 决定（semantic_on）。
@@ -237,28 +242,76 @@ def train(
             val_set = None
 
     _pin = pin_memory and ('cuda' in str(device))
-    val_dl = create_val_dataloader(
-        val_vis_dir, batch_size, device, scale=scale,
-        blur_sigma_range=blur_sigma_range,
-        noise_std_range=noise_std_range,
-        stain_jitter=stain_jitter,
-        num_workers=num_workers,
-        pin_memory=_pin,
-    )
     best_composite = -float('inf')
 
     # ── 数据集 ─────────────────────────────────────────────────────
     print("正在加载数据集...")
+    print(f"  dataset_type={dataset_type}")
     print(
         f"  在线退化: scale={scale}, blur_sigma_range={blur_sigma_range}, "
         f"noise_std_range={noise_std_range}, stain_jitter={stain_jitter}"
     )
-    dataset = NCTDataset(
-        tum_dir, norm_dir, oversample=oversample, scale=scale,
-        blur_sigma_range=blur_sigma_range,
-        noise_std_range=noise_std_range,
-        stain_jitter=stain_jitter,
-    )
+
+    dataset_type = str(dataset_type).lower()
+    if dataset_type == 'pannuke':
+        if pannuke_train_fold_dir is None and pannuke_root is None:
+            raise ValueError('dataset_type=pannuke 时，至少需要提供 pannuke_train_fold_dir 或 pannuke_root。')
+        train_folds = [pannuke_train_fold_dir] if pannuke_train_fold_dir else None
+        val_folds = [pannuke_val_fold_dir] if pannuke_val_fold_dir else None
+
+        dataset = build_dataset(
+            dataset_type='pannuke',
+            pannuke_root=None if train_folds else pannuke_root,
+            pannuke_folds=train_folds,
+            scale=scale,
+            blur_sigma_range=blur_sigma_range,
+            noise_std_range=noise_std_range,
+            stain_jitter=stain_jitter,
+            target_size=256,
+        )
+        val_dl = None
+        if pannuke_val_fold_dir:
+            val_ds = build_dataset(
+                dataset_type='pannuke',
+                pannuke_folds=val_folds,
+                scale=scale,
+                blur_sigma_range=blur_sigma_range,
+                noise_std_range=noise_std_range,
+                stain_jitter=stain_jitter,
+                target_size=256,
+            )
+            val_dl = DataLoader(
+                val_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=_pin,
+                drop_last=False,
+            )
+            print(f"定量验证集（PanNuke）：{len(val_ds)} 张 patch | fold={pannuke_val_fold_dir}")
+        else:
+            print('⚠️  未提供 pannuke_val_fold_dir —— 跳过定量验证。')
+    else:
+        dataset = build_dataset(
+            dataset_type='nct',
+            tum_dir=tum_dir,
+            norm_dir=norm_dir,
+            oversample=oversample,
+            scale=scale,
+            blur_sigma_range=blur_sigma_range,
+            noise_std_range=noise_std_range,
+            stain_jitter=stain_jitter,
+            target_size=256,
+        )
+        val_dl = create_val_dataloader(
+            val_vis_dir, batch_size, device, scale=scale,
+            blur_sigma_range=blur_sigma_range,
+            noise_std_range=noise_std_range,
+            stain_jitter=stain_jitter,
+            num_workers=num_workers,
+            pin_memory=_pin,
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -337,17 +390,22 @@ def train(
             timesteps = torch.randint(0, t_max, (bs,), device=device).long()
             noisy_hr  = scheduler.add_noise(hr, noise, timesteps)
 
-            # ── 构造语义先验张量 S = [tp_prob(6), nuc_mask, tp_conf]
+            # ── 构造语义先验张量 S：
+            # S = [tp_prob(6), nuc_mask(1), tp_conf(1)]（8 通道语义先验）
+            # 重要：统一走 loss_fn._run_hovernet()，内部已包含“上采样→HoVer-Net→缩回原尺寸”的对齐逻辑。
             # 仅在 Stage-2（semantic_on=True）时需要（用于架构注入）。
             sem_tensor = None
             if semantic_on and loss_fn is not None and getattr(unet, "use_semantic", False):
                 with torch.no_grad():
-                    hn_dev = next(loss_fn.hovernet.parameters()).device
-                    hn_out = loss_fn.hovernet(hr.to(hn_dev) * 255.0)
-                    tp_prob  = torch.softmax(hn_out['tp'], dim=1)                 # [B,6,H,W]
-                    nuc_mask = torch.softmax(hn_out['np'], dim=1)[:, 1:2, :, :]   # [B,1,H,W]
-                    tp_conf, _ = torch.max(tp_prob, dim=1, keepdim=True)          # [B,1,H,W]
-                    sem_tensor = torch.cat([tp_prob, nuc_mask, tp_conf], dim=1).to(device)  # [B,8,H,W]
+                    c = loss_fn._run_hovernet(hr)  # tp_prob/tp_conf/nuc_mask 已对齐回 hr 尺寸
+                    sem_tensor = torch.cat(
+                        [
+                            c["tp_prob"],
+                            c["nuc_mask"].unsqueeze(1),
+                            c["tp_conf"].unsqueeze(1),
+                        ],
+                        dim=1,
+                    ).to(device)  # [B,8,H,W]
 
             # U-Net：以 LR 为条件，对 noisy_hr 去噪（Stage-2 才启用语义注入）
             model_input = torch.cat([lr_img, noisy_hr], dim=1)   # [B, 6, H, W]
@@ -436,23 +494,16 @@ def train(
                 result = val_set.generate_reconstructions(
                     unet, loss_fn, use_semantic_injection=semantic_on)
                 if result:
-                    # 优先使用验证集内部生成的列标题（例如 PanNuke 的 type_name），
-                    # 否则再回退到旧版 TUM/NORM 或 Sample-i。
-                    col_titles = result.get('col_titles', None)
-                    if col_titles is None:
-                        try:
-                            if val_set.labels is not None:
-                                t_i = n_i = 0
-                                col_titles = []
-                                for lbl in val_set.labels[:min(8, val_set.labels.shape[0])].detach().cpu().tolist():
-                                    if int(lbl) == 1:
-                                        t_i += 1
-                                        col_titles.append(f"TUM-{t_i}")
-                                    else:
-                                        n_i += 1
-                                        col_titles.append(f"NORM-{n_i}")
-                        except Exception:
-                            col_titles = [f"Sample {i+1}" for i in range(min(8, val_set.hr.shape[0]))]
+                    # 生成列标题（TUM-1 / NORM-1 / Sample-i）
+                    col_titles = None
+                    try:
+                        # 优先使用 ValidationSet 在 load_fixed_validation_batch() 里生成的列名：
+                        # - PanNuke: type_name
+                        # - NCT:    TUM/NORM
+                        if hasattr(val_set, "col_titles") and val_set.col_titles:
+                            col_titles = [str(x) for x in val_set.col_titles[:min(8, val_set.hr.shape[0])]]
+                    except Exception:
+                        col_titles = [f"Sample {i+1}" for i in range(min(8, val_set.hr.shape[0]))]
 
                     # 计算并拼接总标题指标（整图顶部）
                     try:
@@ -461,7 +512,7 @@ def train(
                         v_l1   = F.l1_loss(result['reconstructed'], val_set.hr).item()
                         v_art  = compute_artifact_penalty(result['reconstructed'].cpu(), val_set.hr.cpu())
                         v_sem  = None
-                        if loss_fn is not None:
+                        if loss_fn is not None and semantic_on:
                             c = loss_fn._run_hovernet(val_set.hr)
                             p = loss_fn._run_hovernet(result['reconstructed'])
                             cm = c['nuc_mask']
@@ -487,11 +538,11 @@ def train(
                         conf_pred=result['conf_pred'],
                         nuc_mask_clean=result['nuc_mask_clean'],
                         nuc_mask_pred=result['nuc_mask_pred'],
+                        nr_types=result.get('nr_types', 6),
                         epoch=epoch+1, save_dir=vis_dir,
                         num_vis=8, return_tensor=True,
                         col_titles=col_titles,
                         suptitle=suptitle,
-                        nr_types=result.get('nr_types', 6),
                     )
                     if logger and grid is not None:
                         logger.log_images('Validation/SR_Comparison',
@@ -554,15 +605,7 @@ def train(
                     vts       = torch.randint(0, t_max, (bs,), device=device).long()
                     vnoisy_hr = scheduler.add_noise(vhr, vnoise, vts)
                     vinput    = torch.cat([vlr, vnoisy_hr], dim=1)
-                    v_sem_tensor = None
-                    if semantic_on and (loss_fn is not None) and hasattr(loss_fn, '_run_hovernet'):
-                        c_sem = loss_fn._run_hovernet(vhr)
-                        v_sem_tensor = torch.cat([
-                            c_sem['tp_prob'],
-                            c_sem['nuc_mask'].unsqueeze(1),
-                            c_sem['tp_conf'].unsqueeze(1),
-                        ], dim=1)
-                    vnoise_p  = unet(vinput, vts, semantic=v_sem_tensor).sample
+                    vnoise_p  = unet(vinput, vts).sample
 
                     vx0 = predict_x0_from_noise_shared(vnoisy_hr, vnoise_p, vts, scheduler)
 
@@ -662,9 +705,16 @@ def _add_bool_mutex(parser, dest: str, default: bool, opt_name: str, help_on: st
 def main():
     cfg = get_default_config()
     p = argparse.ArgumentParser(description='SPM-UNet 语义引导 SR DDPM 训练')
-    p.add_argument('--tum_dir',  default=cfg.tum_dir)
-    p.add_argument('--norm_dir', default=cfg.norm_dir)
+    p.add_argument('--dataset_type', type=str, default=getattr(cfg, 'dataset_type', 'pannuke'), choices=['nct', 'pannuke'])
+    p.add_argument('--tum_dir',  default=getattr(cfg, 'tum_dir', None))
+    p.add_argument('--norm_dir', default=getattr(cfg, 'norm_dir', None))
+    p.add_argument('--pannuke_root', default=getattr(cfg, 'pannuke_root', None))
+    p.add_argument('--pannuke_train_fold_dir', default=getattr(cfg, 'pannuke_train_fold_dir', None))
+    p.add_argument('--pannuke_val_fold_dir', default=getattr(cfg, 'pannuke_val_fold_dir', None))
+    p.add_argument('--pannuke_test_fold_dir', default=getattr(cfg, 'pannuke_test_fold_dir', None))
     p.add_argument('--hovernet_path', default=cfg.hovernet_path)
+    p.add_argument('--hovernet_upsample_factor', type=float, default=getattr(cfg, "hovernet_upsample_factor", 2.0),
+                   help='HoVer-Net 语义提取前上采样倍率（例如 20x→40x 用 2.0；1.0 关闭）')
     p.add_argument('--epochs',     type=int,   default=cfg.epochs)
     p.add_argument('--batch_size', type=int,   default=cfg.batch_size)
     p.add_argument('--lr',         type=float, default=cfg.lr)
@@ -707,7 +757,7 @@ def main():
     )
     _add_bool_mutex(
         p, 'oversample', cfg.oversample, 'oversample',
-        help_on='训练集 NCTDataset 过采样平衡类别',
+        help_on='训练集 NCTDataset 过采样平衡类别（PanNuke 下忽略）',
     )
     _add_bool_mutex(
         p, 'train_drop_last', cfg.train_drop_last, 'train-drop-last',
@@ -745,8 +795,13 @@ def main():
         hovernet = load_hovernet(args.hovernet_path, device=device)
 
     train(
-        tum_dir=args.tum_dir, norm_dir=args.norm_dir,
         hovernet=hovernet,
+        dataset_type=args.dataset_type,
+        tum_dir=args.tum_dir, norm_dir=args.norm_dir,
+        pannuke_root=args.pannuke_root,
+        pannuke_train_fold_dir=args.pannuke_train_fold_dir,
+        pannuke_val_fold_dir=args.pannuke_val_fold_dir,
+        pannuke_test_fold_dir=args.pannuke_test_fold_dir,
         epochs=args.epochs, batch_size=args.batch_size,
         lr=args.lr, device=device, save_dir=args.save_dir,
         lambda_noise=args.lambda_noise, lambda_rec=args.lambda_rec,
@@ -763,6 +818,7 @@ def main():
         blur_sigma_range=tuple(args.blur_sigma_range),
         noise_std_range=tuple(args.noise_std_range),
         stain_jitter=args.stain_jitter,
+        hovernet_upsample_factor=args.hovernet_upsample_factor,
         accumulation_steps=args.accumulation_steps,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
