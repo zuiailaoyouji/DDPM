@@ -52,10 +52,41 @@ def _prepare_padded_tensor(img_chw: torch.Tensor, patch_input: int, patch_output
     pad_b = last_h + patch_input - h
     pad_r = last_w + patch_input - w
 
-    img_pad = F.pad(img_chw.unsqueeze(0), (pad_l, pad_r, pad_t, pad_b), mode="reflect").squeeze(0)
+    img_pad = _safe_reflect_pad_2d(img_chw.unsqueeze(0), pad_l, pad_r, pad_t, pad_b).squeeze(0)
     coord_y = list(range(0, last_h, patch_output))
     coord_x = list(range(0, last_w, patch_output))
     return img_pad, coord_y, coord_x, h, w
+
+
+def _safe_reflect_pad_2d(x: torch.Tensor, pad_l: int, pad_r: int, pad_t: int, pad_b: int) -> torch.Tensor:
+    """
+    torch 的 reflect pad 要求每次 pad < 对应维度。
+    这里把大 padding 拆成多次小步 padding，保证与 HoVer-Net 原生 tile 的大范围反射填充兼容。
+    x: [N,C,H,W]
+    """
+    out = x
+    rem_l, rem_r, rem_t, rem_b = int(pad_l), int(pad_r), int(pad_t), int(pad_b)
+
+    while rem_l > 0 or rem_r > 0 or rem_t > 0 or rem_b > 0:
+        h = int(out.shape[-2])
+        w = int(out.shape[-1])
+        # reflect 约束：pad 必须 < 当前维度
+        step_l = min(rem_l, max(0, w - 1))
+        step_r = min(rem_r, max(0, w - 1))
+        step_t = min(rem_t, max(0, h - 1))
+        step_b = min(rem_b, max(0, h - 1))
+
+        if step_l == 0 and step_r == 0 and step_t == 0 and step_b == 0:
+            # 理论上不会到这里；兜底避免死循环
+            out = F.pad(out, (rem_l, rem_r, rem_t, rem_b), mode="replicate")
+            break
+
+        out = F.pad(out, (step_l, step_r, step_t, step_b), mode="reflect")
+        rem_l -= step_l
+        rem_r -= step_r
+        rem_t -= step_t
+        rem_b -= step_b
+    return out
 
 
 @torch.no_grad()

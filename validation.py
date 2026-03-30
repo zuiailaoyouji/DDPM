@@ -13,7 +13,7 @@ import os
 import random
 import json
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -59,6 +59,53 @@ def infer_dataset_type_from_path(val_source: Optional[str]) -> str:
     return 'nct'
 
 
+def _pannuke_mask_hwc_to_label_map(mask: np.ndarray) -> np.ndarray:
+    """
+    PanNuke masks.npy 单样本：
+      - (H,W,5): 通道 0..4 -> 细胞类型 1..5（实例 id >0 即属于该类型）
+      - (H,W,6): 通道 0..4 -> 类型 1..5；通道 5 忽略（不映射为细胞类别）
+      - (5,H,W)/(6,H,W) 会转为 HWC
+    返回整图类型 id: 0=背景, 1..5 对应 type_info.json 与图例。
+    """
+    m = np.asarray(mask)
+    if m.ndim != 3:
+        raise ValueError(f"PanNuke mask 期望 3 维，得到 shape={m.shape}")
+
+    if m.shape[0] in (5, 6) and m.shape[-1] not in (5, 6):
+        m = np.transpose(m, (1, 2, 0))
+
+    h, w, c = m.shape
+    if c not in (5, 6):
+        raise ValueError(f"PanNuke mask 通道数应为 5 或 6，得到 shape={m.shape}")
+
+    m = m.astype(np.int32, copy=False)
+    lbl = np.zeros((h, w), dtype=np.int32)
+    # 5 通道与 6 通道前 5 个通道语义一致：ch k -> type (k+1)；6 通道仅 ch5 忽略
+    n_type_ch = 5
+    for ch in range(n_type_ch):
+        lbl = np.where(m[..., ch] > 0, np.int32(ch + 1), lbl)
+    return lbl
+
+
+def _pannuke_gt_type_rgb_from_mask(
+    mask: np.ndarray,
+    target_hw: Tuple[int, int],
+    tp_color_map_rgb01: np.ndarray,
+) -> np.ndarray:
+    """返回 float32 [H,W,3] in [0,1]，颜色与 tp_color_map_rgb01（type_info）一致。"""
+    th, tw = target_hw
+    lbl = _pannuke_mask_hwc_to_label_map(mask)
+    h, w = lbl.shape[:2]
+    if h != th or w != tw:
+        lbl = cv2.resize(
+            lbl.astype(np.float32),
+            (tw, th),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(np.int32)
+    lbl = np.clip(lbl, 0, tp_color_map_rgb01.shape[0] - 1)
+    return tp_color_map_rgb01[lbl].astype(np.float32)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 工具函数：加载一小批固定验证样本用于可视化
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,7 +134,7 @@ def _load_fixed_validation_batch_nct(
             labels.append(lbl)
 
     if not images:
-        return None, None, None, None
+        return None, None, None, None, None
 
     hr_np = np.stack(images, axis=0).astype(np.float32) / 255.0
     hr = torch.from_numpy(hr_np).permute(0, 3, 1, 2).to(device)
@@ -111,7 +158,7 @@ def _load_fixed_validation_batch_nct(
     labels_t = torch.tensor(labels, dtype=torch.long, device=device)
     titles = [f'TUM-{i+1}' for i in range(sum(1 for x in labels if x == 1))] + \
              [f'NORM-{i+1}' for i in range(sum(1 for x in labels if x == 0))]
-    return hr, lr, labels_t, titles
+    return hr, lr, labels_t, titles, None
 
 
 def _load_fixed_validation_batch_pannuke(
@@ -135,7 +182,7 @@ def _load_fixed_validation_batch_pannuke(
     )
 
     if len(ds) == 0:
-        return None, None, None, None
+        return None, None, None, None, None
 
     # 建立 type_name -> indices
     type_to_indices = {}
@@ -183,7 +230,34 @@ def _load_fixed_validation_batch_pannuke(
     hr_t = torch.stack(hrs, dim=0).to(device)
     lr_t = torch.stack(lrs, dim=0).to(device)
     labels_t = torch.stack(labels, dim=0).to(device)
-    return hr_t, lr_t, labels_t, titles
+
+    gt_rgb_list = []
+    if hasattr(ds, "masks") and hasattr(ds, "index"):
+        type_info_path = Path(__file__).resolve().parent / "HoVer-net" / "type_info.json"
+        if type_info_path.exists():
+            raw = json.loads(type_info_path.read_text(encoding="utf-8"))
+        else:
+            raw = {
+                str(i): ["", [0, 0, 0]] for i in range(6)
+            }
+        cmap = np.zeros((6, 3), dtype=np.float32)
+        for tid in range(6):
+            t = raw.get(str(tid), None)
+            rgb = [0, 0, 0] if t is None else t[1]
+            cmap[tid] = np.array([rgb[0], rgb[1], rgb[2]], dtype=np.float32) / 255.0
+        _, _, th, tw = hr_t.shape
+        for idx in selected_indices:
+            try:
+                fold_id, local_idx = ds.index[idx]
+                mask = np.asarray(ds.masks[fold_id][local_idx])
+                gt_rgb_list.append(_pannuke_gt_type_rgb_from_mask(mask, (th, tw), cmap))
+            except Exception:
+                gt_rgb_list.append(np.zeros((th, tw, 3), dtype=np.float32))
+        gt_type_rgb = np.stack(gt_rgb_list, axis=0)
+    else:
+        gt_type_rgb = None
+
+    return hr_t, lr_t, labels_t, titles, gt_type_rgb
 
 
 def load_fixed_validation_batch(
@@ -201,6 +275,7 @@ def load_fixed_validation_batch(
     lr_tensor  : [B, 3, H, W]
     labels     : [B]
     titles     : list[str]，用于列标题
+    gt_type_rgb: Optional[np.ndarray]，PanNuke 时为 [N,H,W,3] float32 RGB01，与 type_info 一致；否则 None
     """
     if dataset_type == 'auto':
         dataset_type = infer_dataset_type_from_path(val_dir)
@@ -245,13 +320,14 @@ class ValidationSet:
         self.hr = self.lr = self.noisy_hr = None
         self.labels = self.noise = self.timesteps = None
         self.col_titles = None
+        self.gt_pannuke_type_rgb = None  # np.ndarray [N,H,W,3] float32，与 masks.npy 类型着色一致
 
     def load(self) -> bool:
         if not self.val_dir or not os.path.exists(self.val_dir):
             return False
         self.dataset_type = infer_dataset_type_from_path(self.val_dir) if self.dataset_type == 'auto' else self.dataset_type
         print(f"Loading fixed validation batch: {self.val_dir} | dataset_type={self.dataset_type}")
-        self.hr, self.lr, self.labels, self.col_titles = load_fixed_validation_batch(
+        self.hr, self.lr, self.labels, self.col_titles, self.gt_pannuke_type_rgb = load_fixed_validation_batch(
             self.val_dir, self.sample_size, self.device, self.scale,
             blur_sigma_range=self.blur_sigma_range,
             noise_std_range=self.noise_std_range,
@@ -339,6 +415,7 @@ class ValidationSet:
             nuc_mask_pred=nuc_mask_pred,
             nr_types=nr_types,
             col_titles=self.col_titles,
+            gt_pannuke_type_rgb=self.gt_pannuke_type_rgb,
         )
 
 
@@ -355,6 +432,7 @@ def save_validation_debug_images(
     col_titles=None,
     suptitle: str = None,
     nr_types: int = 6,
+    gt_pannuke_type_rgb: Optional[np.ndarray] = None,
 ):
     os.makedirs(save_dir, exist_ok=True)
     num_vis = min(num_vis, hr.shape[0])
@@ -412,7 +490,12 @@ def save_validation_debug_images(
         nuc_mask_pred_np = _resize_gray_np(nuc_mask_pred_np, target_hw)
 
     default_type_info_path = Path(__file__).resolve().parent / 'HoVer-net' / 'type_info.json'
-    raw_type_info = json.loads(default_type_info_path.read_text(encoding='utf-8'))
+    if default_type_info_path.exists():
+        raw_type_info = json.loads(default_type_info_path.read_text(encoding='utf-8'))
+    else:
+        raw_type_info = {
+            str(i): ['', [0, 0, 0]] for i in range(6)
+        }
 
     tp_colors_hex = []
     tp_color_map_rgb01 = np.zeros((6, 3), dtype=np.float32)
@@ -439,12 +522,30 @@ def save_validation_debug_images(
         (lr_rgb, 'LR'),
         (recon_rgb, 'Recon'),
         (diff_rgb, 'Residual'),
+    ]
+    if gt_pannuke_type_rgb is not None:
+        gt_vis = np.asarray(gt_pannuke_type_rgb[:num_vis], dtype=np.float32)
+        if gt_vis.shape[1:3] != target_hw:
+            gt_fixed = []
+            for i in range(min(num_vis, gt_vis.shape[0])):
+                g = gt_vis[i]
+                gt_fixed.append(
+                    cv2.resize(
+                        (g * 255.0).clip(0, 255).astype(np.uint8),
+                        (target_hw[1], target_hw[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(np.float32) / 255.0
+                )
+            gt_vis = np.stack(gt_fixed, axis=0)
+        rows_data.append((gt_vis, 'GT mask types (PanNuke)'))
+
+    rows_data.extend([
         (overlay_clean, 'TP overlay clean'),
         (overlay_pred, 'TP overlay pred'),
         (conf_clean_np, 'tp_conf clean'),
         (conf_pred_np, 'tp_conf pred'),
         (nuc_mask_pred_np, 'nuc_mask pred'),
-    ]
+    ])
 
     n_rows, n_cols = len(rows_data), num_vis
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.6 * n_rows), squeeze=False)

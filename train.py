@@ -543,6 +543,7 @@ def train(
                         num_vis=8, return_tensor=True,
                         col_titles=col_titles,
                         suptitle=suptitle,
+                        gt_pannuke_type_rgb=result.get('gt_pannuke_type_rgb'),
                     )
                     if logger and grid is not None:
                         logger.log_images('Validation/SR_Comparison',
