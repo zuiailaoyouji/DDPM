@@ -114,6 +114,77 @@ def _normalize_fold_dirs(
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PanNuke masks.npy → HoVer-Net 语义空间 转换工具
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pannuke_mask_to_semantic(
+    mask: np.ndarray,
+    target_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    将 PanNuke masks.npy 单个样本转换为 HoVer-Net 语义空间的标签图与核掩膜。
+
+    PanNuke masks 格式：
+        shape (H, W, 6) 或 (H, W, 5) 或转置版 (5/6, H, W)
+        ch 0: Neoplastic    → HoVer-Net tp class 1
+        ch 1: Inflammatory  → HoVer-Net tp class 2
+        ch 2: Connective    → HoVer-Net tp class 3
+        ch 3: Dead          → HoVer-Net tp class 4
+        ch 4: Epithelial    → HoVer-Net tp class 5
+        ch 5: 背景通道（若存在），忽略
+
+    返回：
+        label_map : np.ndarray [H, W] int32
+                    0=背景, 1=Neoplastic, 2=Inflammatory,
+                    3=Connective, 4=Dead, 5=Epithelial
+                    （与 HoVer-Net tp 分支的 6 类索引一致）
+        nuc_mask  : np.ndarray [H, W] float32
+                    任意细胞核通道有实例（>0）的像素为 1.0，其余为 0.0
+    """
+    m = np.asarray(mask)
+    if m.ndim != 3:
+        raise ValueError(f"PanNuke mask 期望 3 维，得到 shape={m.shape}")
+
+    # 兼容 (C, H, W) 或 (H, W, C)
+    if m.shape[0] in (5, 6) and m.shape[-1] not in (5, 6):
+        m = np.transpose(m, (1, 2, 0))   # → (H, W, C)
+
+    h, w, c = m.shape
+    if c not in (5, 6):
+        raise ValueError(f"PanNuke mask 通道数应为 5 或 6，得到 shape={m.shape}")
+
+    m = m.astype(np.int32, copy=False)
+
+    # label_map：逐通道写入 HoVer-Net 类别索引（后写的会覆盖前写的，保持"最后类型优先"；
+    # 若像素同时属于多个类型的实例则不常见，但以防万一用 argmax 更严谨——此处保留简单赋值）
+    label_map = np.zeros((h, w), dtype=np.int32)
+    nuc_binary = np.zeros((h, w), dtype=np.int32)
+    n_type_ch = 5   # ch 0..4 对应 5 种细胞类型
+    for ch in range(n_type_ch):
+        cell_mask = m[..., ch] > 0          # 该通道有实例的像素
+        label_map[cell_mask] = ch + 1       # HoVer-Net class = pannuke_ch + 1
+        nuc_binary[cell_mask] = 1
+
+    if target_hw is not None:
+        th, tw = target_hw
+        if (h, w) != (th, tw):
+            label_map = cv2.resize(
+                label_map.astype(np.float32),
+                (tw, th),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(np.int32)
+            nuc_binary = cv2.resize(
+                nuc_binary.astype(np.float32),
+                (tw, th),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(np.int32)
+
+    nuc_mask = nuc_binary.astype(np.float32)
+    return label_map, nuc_mask
+
+
+
 class NCTDataset(Dataset):
     """
     旧版 NCT-CRC-HE 数据集读取逻辑。
@@ -224,17 +295,26 @@ class PanNukeDataset(Dataset):
        Fold 1/images/fold1/types.npy
        Fold 1/masks/fold1/masks.npy
 
-    返回接口与旧版保持一致：
-        {
-            'hr': Tensor[C,H,W],
-            'lr': Tensor[C,h,w] or Tensor[C,H,W]（取决于 degrade 实现）,
-            'label': LongTensor[],
-            'type_name': str (仅用于日志/可视化)
-        }
+    新增返回字段（相比旧版）
+    ─────────────────────────
+    'gt_label_map' : LongTensor [H, W]
+        像素级 GT 细胞类型标签，与 HoVer-Net tp 分支空间一致：
+            0 = 背景
+            1 = Neoplastic
+            2 = Inflammatory
+            3 = Connective
+            4 = Dead
+            5 = Epithelial
 
-    注意：
-    - label 来自 types.npy 的 patch 级组织标签（字符串会做稳定映射为整数）。
-    - masks.npy 当前仅用于 fold 定位与兼容接口；当前训练不会直接用 masks.npy。
+    'gt_nuc_mask'  : FloatTensor [H, W]
+        GT 细胞核二值掩膜（任意类型细胞核所在像素=1.0）
+
+    原有返回字段
+    ─────────────
+    'hr'        : FloatTensor [3, H, W]
+    'lr'        : FloatTensor [3, H, W]
+    'label'     : LongTensor []   — patch 级组织类型整数标签（来自 types.npy）
+    'type_name' : str             — patch 级组织类型名称
     """
 
     def __init__(
@@ -386,6 +466,7 @@ class PanNukeDataset(Dataset):
     def __getitem__(self, idx):
         fold_id, local_idx = self.index[idx]
 
+        # ── 图像 ──────────────────────────────────────────────────────────
         img = self._to_hwc3_uint8(self.images[fold_id][local_idx])
         type_arr = np.asarray(self.types[fold_id][local_idx])
 
@@ -409,13 +490,21 @@ class PanNukeDataset(Dataset):
             stain_jitter_strength=self.stain_jitter,
         )
 
+        # ── Patch 级标签 ───────────────────────────────────────────────────
         label_id, type_name = self._to_patch_label(type_arr)
+
+        # ── 像素级 GT mask → HoVer-Net 语义空间 ────────────────────────────
+        raw_mask = np.asarray(self.masks[fold_id][local_idx])
+        target_hw = (self.target_size, self.target_size) if self.target_size is not None else None
+        gt_label_map, gt_nuc_mask = pannuke_mask_to_semantic(raw_mask, target_hw=target_hw)
 
         return {
             "hr": hr,
             "lr": lr,
             "label": torch.tensor(label_id, dtype=torch.long),
             "type_name": type_name,
+            "gt_label_map": torch.from_numpy(gt_label_map).long(),   # [H, W]
+            "gt_nuc_mask":  torch.from_numpy(gt_nuc_mask).float(),   # [H, W]
         }
 
 

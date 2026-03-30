@@ -7,7 +7,10 @@ ddpm_config.py
 - 一个 Fold 验证
 - 一个 Fold 测试
 
-仍保留少量旧字段兼容训练/推理脚本，但默认入口已切换到 PanNuke。
+语义监督模式：GT mask 驱动
+- 语义损失仅保留 CE(pred_prob, gt_label_map)，在 GT 核掩膜区域内监督
+- KL 损失、confidence supervision、lambda_dir 均已移除
+- sem_tensor 格式：[gt_tp_onehot(6), gt_nuc_mask(1)]，共 7 通道
 """
 
 from dataclasses import dataclass
@@ -29,15 +32,15 @@ class TrainingConfig:
     # 兼容旧写法：可选地直接传 folds 列表
     pannuke_folds: Optional[Tuple[str, ...]] = None
 
-    # 旧 NCT 路径：仅保留为 legacy 兼容，不再作为默认主线
+    # 旧 NCT 路径：仅保留为 legacy 兼容
     tum_dir: str = '/data/xuwen/NCT-CRC-HE-100K/TUM'
     norm_dir: str = '/data/xuwen/NCT-CRC-HE-100K/NORM'
-    oversample: bool = False  # PanNuke 下通常无意义；NCT legacy 时可再开启
+    oversample: bool = False
 
     # HoVer-Net 与验证可视化
     hovernet_path: Optional[str] = '/home/xuwen/DDPM/HoVer-net/hovernet_fast_pannuke_type_tf2pytorch.tar'
     val_vis_dir: Optional[str] = '/data/xuwen/PanNuke/Fold 2'
-    hovernet_upsample_factor: float = 1.0  # PanNuke 本身 256×256，默认不额外上采样
+    hovernet_upsample_factor: float = 1.0   # PanNuke 256×256，pred 侧不额外上采样
 
     # ── 基础训练配置 ────────────────────────────────────────────────
     epochs: int = 150
@@ -56,9 +59,7 @@ class TrainingConfig:
     in_channels: int = 6      # [lr_image || noisy_hr]
     out_channels: int = 3
 
-    # ── 输入尺寸 / 数据兼容逻辑 ─────────────────────────────────────
-    # PanNuke 原始 patch 就是 256×256，因此保留 target_size=256 的兼容逻辑即可。
-    # 若未来换数据集，可由 train/validation/inference 参数覆盖。
+    # ── 输入尺寸 ────────────────────────────────────────────────────
     target_size: Optional[int] = 256
 
     # ── 在线退化设置 ────────────────────────────────────────────────
@@ -72,15 +73,11 @@ class TrainingConfig:
     lambda_rec: float = 15.0
     lambda_grad: float = 0.8
     lambda_sem: float = 0.01
-    lambda_dir: float = 0.001
     lambda_tv: float = 0.0005
 
     # ── 语义目标参数 ────────────────────────────────────────────────
-    tau_nuc: float = 0.4
-    tau_conf: float = 0.6
-    lambda_sem_dist: float = 0.3
-    lambda_sem_cls: float = 0.05
-    lambda_sem_conf: float = 0.02
+    tau_nuc: float = 0.4          # GT 核掩膜阈值
+    lambda_sem_cls: float = 0.05  # CE 损失权重（唯一保留的语义子项）
 
     # ── 三阶段训练策略 ─────────────────────────────────────────────
     semantic_start_epoch: int = 30
@@ -97,7 +94,7 @@ class TrainingConfig:
     pin_memory: bool = True
     train_drop_last: bool = True
 
-    # ── 推理 / 测试常用默认项（inference_self_guided.py 默认由此读取）────
+    # ── 推理 / 测试常用默认项 ───────────────────────────────────────
     use_semantic_injection: bool = True
     test_output_dir: str = '/data/xuwen/ddpm_inference_results/pannuke_fold3'
     infer_iters: int = 5

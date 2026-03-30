@@ -2,11 +2,16 @@
 validation.py
 语义引导型 SR DDPM 的验证集管理。
 
-当前版本特点
-----------------
-1. 同时兼容 legacy NCT 目录结构与 PanNuke fold(.npy) 结构。
-2. 可视化固定样本不再强依赖 TUM/NORM；若传入的是 PanNuke fold，会直接从 fold 中抽样。
-3. 定量验证 DataLoader 支持通过 dataset_type 显式指定，也支持基于路径自动推断。
+v2 变更
+────────
+1. generate_reconstructions 不再对 HR 跑 HoVer-Net 取 clean 语义参考。
+   cls_clean / conf_clean / nuc_mask_clean 改为由 GT masks.npy 提供：
+     - cls_clean   : gt_label_map（整数类别图）
+     - nuc_mask_clean : gt_nuc_mask（GT 核掩膜）
+     - conf_clean  : 已移除，GT 硬标签置信度恒为 1，无可视化意义
+2. ValidationSet 新增 gt_label_map / gt_nuc_mask 字段，在 load() 阶段一并缓存。
+3. save_validation_debug_images 移除 conf_clean 行（保留 conf_pred 供观测）。
+4. 兼容 NCT 数据集：NCT 无 GT mask，GT 相关字段退化为全零占位，不影响可视化。
 """
 
 import os
@@ -18,6 +23,7 @@ from typing import Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
@@ -34,80 +40,44 @@ from hovernet_input_preprocess import run_hovernet_semantics_aligned
 # ─────────────────────────────────────────────────────────────────────────────
 
 def infer_dataset_type_from_path(val_source: Optional[str]) -> str:
-    """
-    根据路径粗略推断验证数据源类型：
-      - 若能识别为 PanNuke fold/root，则返回 'pannuke'
-      - 若存在 TUM/NORM 子目录，则返回 'nct'
-      - 否则默认 'nct'
-    """
     if not val_source or not os.path.exists(val_source):
         return 'nct'
-
     if _is_pannuke_fold_dir(val_source):
         return 'pannuke'
-
     if os.path.isdir(val_source):
         entries = set(os.listdir(val_source))
         if 'TUM' in entries and 'NORM' in entries:
             return 'nct'
-        # 也兼容传入 PanNuke 根目录（其下有 Fold 1/Fold 2/...）
         for name in entries:
             cand = os.path.join(val_source, name)
             if _is_pannuke_fold_dir(cand):
                 return 'pannuke'
-
     return 'nct'
 
 
 def _pannuke_mask_hwc_to_label_map(mask: np.ndarray) -> np.ndarray:
     """
-    PanNuke masks.npy 单样本：
-      - (H,W,5): 通道 0..4 -> 细胞类型 1..5（实例 id >0 即属于该类型）
-      - (H,W,6): 通道 0..4 -> 类型 1..5；通道 5 忽略（不映射为细胞类别）
-      - (5,H,W)/(6,H,W) 会转为 HWC
-    返回整图类型 id: 0=背景, 1..5 对应 type_info.json 与图例。
+    PanNuke masks.npy 单样本 → 整图类型 id [H, W] int32。
+    0=背景, 1..5 对应 Neoplastic/Inflammatory/Connective/Dead/Epithelial。
     """
     m = np.asarray(mask)
     if m.ndim != 3:
         raise ValueError(f"PanNuke mask 期望 3 维，得到 shape={m.shape}")
-
     if m.shape[0] in (5, 6) and m.shape[-1] not in (5, 6):
         m = np.transpose(m, (1, 2, 0))
-
     h, w, c = m.shape
     if c not in (5, 6):
         raise ValueError(f"PanNuke mask 通道数应为 5 或 6，得到 shape={m.shape}")
-
     m = m.astype(np.int32, copy=False)
     lbl = np.zeros((h, w), dtype=np.int32)
-    # 5 通道与 6 通道前 5 个通道语义一致：ch k -> type (k+1)；6 通道仅 ch5 忽略
-    n_type_ch = 5
-    for ch in range(n_type_ch):
+    for ch in range(5):
         lbl = np.where(m[..., ch] > 0, np.int32(ch + 1), lbl)
     return lbl
 
 
-def _pannuke_gt_type_rgb_from_mask(
-    mask: np.ndarray,
-    target_hw: Tuple[int, int],
-    tp_color_map_rgb01: np.ndarray,
-) -> np.ndarray:
-    """返回 float32 [H,W,3] in [0,1]，颜色与 tp_color_map_rgb01（type_info）一致。"""
-    th, tw = target_hw
-    lbl = _pannuke_mask_hwc_to_label_map(mask)
-    h, w = lbl.shape[:2]
-    if h != th or w != tw:
-        lbl = cv2.resize(
-            lbl.astype(np.float32),
-            (tw, th),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(np.int32)
-    lbl = np.clip(lbl, 0, tp_color_map_rgb01.shape[0] - 1)
-    return tp_color_map_rgb01[lbl].astype(np.float32)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 工具函数：加载一小批固定验证样本用于可视化
+# 加载固定验证样本
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_fixed_validation_batch_nct(
@@ -115,7 +85,6 @@ def _load_fixed_validation_batch_nct(
     scale=2, n_per_class=4,
     blur_sigma_range=(0.5, 1.5), noise_std_range=(0.0, 0.02), stain_jitter=0.05,
 ):
-    """从 TUM/NORM 中各取 n_per_class 张图像作为固定可视化样本。"""
     images, labels = [], []
     for subdir, lbl in [('TUM', 1), ('NORM', 0)]:
         path = os.path.join(val_dir, subdir)
@@ -134,7 +103,7 @@ def _load_fixed_validation_batch_nct(
             labels.append(lbl)
 
     if not images:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     hr_np = np.stack(images, axis=0).astype(np.float32) / 255.0
     hr = torch.from_numpy(hr_np).permute(0, 3, 1, 2).to(device)
@@ -144,21 +113,25 @@ def _load_fixed_validation_batch_nct(
     torch.manual_seed(42)
     random.seed(42)
     lr = torch.stack([
-        degrade(
-            hr[i].cpu(), scale=scale,
-            blur_sigma_range=blur_sigma_range,
-            noise_std_range=noise_std_range,
-            stain_jitter_strength=stain_jitter,
-        )
+        degrade(hr[i].cpu(), scale=scale,
+                blur_sigma_range=blur_sigma_range,
+                noise_std_range=noise_std_range,
+                stain_jitter_strength=stain_jitter)
         for i in range(len(hr))
     ]).to(device)
     torch.random.set_rng_state(torch_rng_state)
     random.setstate(py_rng_state)
 
     labels_t = torch.tensor(labels, dtype=torch.long, device=device)
-    titles = [f'TUM-{i+1}' for i in range(sum(1 for x in labels if x == 1))] + \
-             [f'NORM-{i+1}' for i in range(sum(1 for x in labels if x == 0))]
-    return hr, lr, labels_t, titles, None
+    titles = (
+        [f'TUM-{i+1}' for i in range(sum(1 for x in labels if x == 1))] +
+        [f'NORM-{i+1}' for i in range(sum(1 for x in labels if x == 0))]
+    )
+    # NCT 无 GT mask，返回全零占位
+    B, _, H, W = hr.shape
+    gt_label_map = torch.zeros(B, H, W, dtype=torch.long, device=device)
+    gt_nuc_mask  = torch.zeros(B, H, W, dtype=torch.float32, device=device)
+    return hr, lr, labels_t, titles, gt_label_map, gt_nuc_mask
 
 
 def _load_fixed_validation_batch_pannuke(
@@ -166,10 +139,6 @@ def _load_fixed_validation_batch_pannuke(
     scale=2, n_per_class=4,
     blur_sigma_range=(0.5, 1.5), noise_std_range=(0.0, 0.02), stain_jitter=0.05,
 ):
-    """
-    从 PanNuke fold/root 中抽取固定可视化样本。
-    优先按组织类型均匀抽样；若某些类型不足，则按顺序补足。
-    """
     ds = build_dataset(
         dataset_type='pannuke',
         pannuke_folds=[val_dir] if _is_pannuke_fold_dir(val_dir) else None,
@@ -180,11 +149,10 @@ def _load_fixed_validation_batch_pannuke(
         stain_jitter=stain_jitter,
         target_size=sample_size,
     )
-
     if len(ds) == 0:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
-    # 建立 type_name -> indices
+    # round-robin 抽样
     type_to_indices = {}
     for idx in range(len(ds)):
         sample = ds[idx]
@@ -192,7 +160,6 @@ def _load_fixed_validation_batch_pannuke(
         type_to_indices.setdefault(type_name, []).append(idx)
 
     selected_indices = []
-    # round-robin 抽样，避免前 8 张只落在排序靠前的少数类型
     type_names_sorted = sorted(type_to_indices.keys())
     per_type_ptr = {k: 0 for k in type_names_sorted}
     per_type_cap = {k: min(n_per_class, len(type_to_indices[k])) for k in type_names_sorted}
@@ -207,57 +174,30 @@ def _load_fixed_validation_batch_pannuke(
         if not progressed:
             break
 
-    # 控制总数，避免过多；至少保留若干类型样本
     max_total = max(8, n_per_class * min(4, len(type_to_indices)))
     selected_indices = selected_indices[:max_total]
-
     if not selected_indices:
         selected_indices = list(range(min(max_total, len(ds))))
 
     hrs, lrs, labels, titles = [], [], [], []
+    gt_label_maps, gt_nuc_masks = [], []
+
     for idx in selected_indices:
         sample = ds[idx]
-        hr = sample['hr']
-        lr = sample['lr']
-        label = sample['label']
-        type_name = sample.get('type_name', str(int(label)))
+        hrs.append(sample['hr'])
+        lrs.append(sample['lr'])
+        labels.append(sample['label'])
+        titles.append(sample.get('type_name', str(int(sample['label']))))
+        gt_label_maps.append(sample['gt_label_map'])   # [H, W] long
+        gt_nuc_masks.append(sample['gt_nuc_mask'])     # [H, W] float
 
-        hrs.append(hr)
-        lrs.append(lr)
-        labels.append(label)
-        titles.append(type_name)
+    hr_t  = torch.stack(hrs).to(device)
+    lr_t  = torch.stack(lrs).to(device)
+    lbl_t = torch.stack(labels).to(device)
+    gt_label_map_t = torch.stack(gt_label_maps).to(device)   # [B, H, W]
+    gt_nuc_mask_t  = torch.stack(gt_nuc_masks).to(device)    # [B, H, W]
 
-    hr_t = torch.stack(hrs, dim=0).to(device)
-    lr_t = torch.stack(lrs, dim=0).to(device)
-    labels_t = torch.stack(labels, dim=0).to(device)
-
-    gt_rgb_list = []
-    if hasattr(ds, "masks") and hasattr(ds, "index"):
-        type_info_path = Path(__file__).resolve().parent / "HoVer-net" / "type_info.json"
-        if type_info_path.exists():
-            raw = json.loads(type_info_path.read_text(encoding="utf-8"))
-        else:
-            raw = {
-                str(i): ["", [0, 0, 0]] for i in range(6)
-            }
-        cmap = np.zeros((6, 3), dtype=np.float32)
-        for tid in range(6):
-            t = raw.get(str(tid), None)
-            rgb = [0, 0, 0] if t is None else t[1]
-            cmap[tid] = np.array([rgb[0], rgb[1], rgb[2]], dtype=np.float32) / 255.0
-        _, _, th, tw = hr_t.shape
-        for idx in selected_indices:
-            try:
-                fold_id, local_idx = ds.index[idx]
-                mask = np.asarray(ds.masks[fold_id][local_idx])
-                gt_rgb_list.append(_pannuke_gt_type_rgb_from_mask(mask, (th, tw), cmap))
-            except Exception:
-                gt_rgb_list.append(np.zeros((th, tw, 3), dtype=np.float32))
-        gt_type_rgb = np.stack(gt_rgb_list, axis=0)
-    else:
-        gt_type_rgb = None
-
-    return hr_t, lr_t, labels_t, titles, gt_type_rgb
+    return hr_t, lr_t, lbl_t, titles, gt_label_map_t, gt_nuc_mask_t
 
 
 def load_fixed_validation_batch(
@@ -267,15 +207,9 @@ def load_fixed_validation_batch(
     dataset_type: str = 'auto',
 ):
     """
-    加载一小批固定验证样本用于可视化。
-
     返回
-    -------
-    hr_tensor  : [B, 3, H, W]
-    lr_tensor  : [B, 3, H, W]
-    labels     : [B]
-    titles     : list[str]，用于列标题
-    gt_type_rgb: Optional[np.ndarray]，PanNuke 时为 [N,H,W,3] float32 RGB01，与 type_info 一致；否则 None
+    ────
+    hr, lr, labels, titles, gt_label_map, gt_nuc_mask
     """
     if dataset_type == 'auto':
         dataset_type = infer_dataset_type_from_path(val_dir)
@@ -285,7 +219,6 @@ def load_fixed_validation_batch(
             val_dir, sample_size, device, scale, n_per_class,
             blur_sigma_range, noise_std_range, stain_jitter,
         )
-
     return _load_fixed_validation_batch_nct(
         val_dir, sample_size, device, scale, n_per_class,
         blur_sigma_range, noise_std_range, stain_jitter,
@@ -293,41 +226,48 @@ def load_fixed_validation_batch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ValidationSet：用于可视化的一小批固定验证样本
+# ValidationSet
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ValidationSet:
     """
     管理一小批固定的验证样本，用于主观可视化。
-    在 load() 之后固定 LR、噪声和时间步，以保证不同 epoch 之间的公平对比。
+
+    新增缓存字段：
+      gt_label_map : [B, H, W] long   — GT 像素级类别索引
+      gt_nuc_mask  : [B, H, W] float  — GT 核掩膜
     """
 
     def __init__(self, val_dir, scheduler, device='cuda',
                  sample_size=256, fixed_timestep=100, scale=2,
                  blur_sigma_range=(0.5, 1.5), noise_std_range=(0.0, 0.02),
                  stain_jitter=0.05, dataset_type: str = 'auto'):
-        self.val_dir = val_dir
-        self.scheduler = scheduler
-        self.device = device
-        self.sample_size = sample_size
+        self.val_dir        = val_dir
+        self.scheduler      = scheduler
+        self.device         = device
+        self.sample_size    = sample_size
         self.fixed_timestep = fixed_timestep
-        self.scale = scale
+        self.scale          = scale
         self.blur_sigma_range = blur_sigma_range
-        self.noise_std_range = noise_std_range
-        self.stain_jitter = stain_jitter
-        self.dataset_type = dataset_type
+        self.noise_std_range  = noise_std_range
+        self.stain_jitter     = stain_jitter
+        self.dataset_type     = dataset_type
 
         self.hr = self.lr = self.noisy_hr = None
         self.labels = self.noise = self.timesteps = None
-        self.col_titles = None
-        self.gt_pannuke_type_rgb = None  # np.ndarray [N,H,W,3] float32，与 masks.npy 类型着色一致
+        self.col_titles   = None
+        self.gt_label_map = None   # [B, H, W] long
+        self.gt_nuc_mask  = None   # [B, H, W] float
 
     def load(self) -> bool:
         if not self.val_dir or not os.path.exists(self.val_dir):
             return False
-        self.dataset_type = infer_dataset_type_from_path(self.val_dir) if self.dataset_type == 'auto' else self.dataset_type
+        if self.dataset_type == 'auto':
+            self.dataset_type = infer_dataset_type_from_path(self.val_dir)
         print(f"Loading fixed validation batch: {self.val_dir} | dataset_type={self.dataset_type}")
-        self.hr, self.lr, self.labels, self.col_titles, self.gt_pannuke_type_rgb = load_fixed_validation_batch(
+
+        (self.hr, self.lr, self.labels, self.col_titles,
+         self.gt_label_map, self.gt_nuc_mask) = load_fixed_validation_batch(
             self.val_dir, self.sample_size, self.device, self.scale,
             blur_sigma_range=self.blur_sigma_range,
             noise_std_range=self.noise_std_range,
@@ -343,79 +283,85 @@ class ValidationSet:
     def _prepare_noise(self):
         torch_rng_state = torch.random.get_rng_state()
         torch.manual_seed(42)
-        self.noise = torch.randn_like(self.hr)
+        self.noise     = torch.randn_like(self.hr)
         self.timesteps = torch.full(
             (self.hr.shape[0],), self.fixed_timestep,
-            device=self.device, dtype=torch.long)
+            device=self.device, dtype=torch.long,
+        )
         self.noisy_hr = self.scheduler.add_noise(self.hr, self.noise, self.timesteps)
         torch.random.set_rng_state(torch_rng_state)
 
     def is_available(self):
         return self.hr is not None
 
-    def generate_reconstructions(self, unet, loss_module=None, use_semantic_injection: bool = False):
+    def generate_reconstructions(
+        self,
+        unet,
+        loss_module=None,
+        use_semantic_injection: bool = False,
+    ):
         if self.hr is None:
             return None
+
         with torch.no_grad():
             model_input = torch.cat([self.lr, self.noisy_hr], dim=1)
 
-            def _run_hovernet_val(img_01: torch.Tensor):
-                if loss_module is None:
-                    return None
-                # 验证阶段显式走对齐 helper，避免只依赖 loss_module 的间接封装
-                if hasattr(loss_module, "hovernet"):
-                    return run_hovernet_semantics_aligned(
-                        loss_module.hovernet,
-                        img_01,
-                        upsample_factor=float(getattr(loss_module, "hovernet_upsample_factor", 2.0)),
-                    )
-                if hasattr(loss_module, "_run_hovernet"):
-                    return loss_module._run_hovernet(img_01)
-                return None
-
+            # ── Stage 2：用 GT 构造 sem_tensor 做架构注入 ──────────
             sem_tensor = None
-            if use_semantic_injection and (loss_module is not None):
-                c = _run_hovernet_val(self.hr)
-                if c is not None:
-                    tp_prob = c['tp_prob']
-                    sem_tensor = torch.cat(
-                        [tp_prob, c['nuc_mask'].unsqueeze(1), c['tp_conf'].unsqueeze(1)],
-                        dim=1,
-                    )
+            if use_semantic_injection and (self.gt_label_map is not None):
+                from semantic_sr_loss import build_gt_sem_tensor
+                sem_tensor = build_gt_sem_tensor(
+                    self.gt_label_map, self.gt_nuc_mask, device=self.device,
+                )
 
             noise_pred = unet(model_input, self.timesteps, semantic=sem_tensor).sample
-            recon = predict_x0_from_noise_shared(self.noisy_hr, noise_pred, self.timesteps, self.scheduler)
+            recon      = predict_x0_from_noise_shared(
+                self.noisy_hr, noise_pred, self.timesteps, self.scheduler,
+            )
             diff_vis = (recon - self.hr).abs().clamp(0, 1)
 
             B, _, H, W = self.hr.shape
             nr_types = 6
-            cls_clean = cls_pred = conf_clean = conf_pred = torch.zeros(B, 1, H, W, device=self.device)
-            nuc_mask_clean = torch.zeros(B, 1, H, W, device=self.device)
+
+            # ── clean 侧：直接用 GT ────────────────────────────────
+            if self.gt_label_map is not None:
+                cls_clean     = self.gt_label_map.float().unsqueeze(1)   # [B,1,H,W]
+                nuc_mask_clean = self.gt_nuc_mask.unsqueeze(1)            # [B,1,H,W]
+            else:
+                cls_clean      = torch.zeros(B, 1, H, W, device=self.device)
+                nuc_mask_clean = torch.zeros(B, 1, H, W, device=self.device)
+
+            # ── pred 侧：HoVer-Net 对重建图预测 ──────────────────
+            cls_pred      = torch.zeros(B, 1, H, W, device=self.device)
+            conf_pred     = torch.zeros(B, 1, H, W, device=self.device)
             nuc_mask_pred = torch.zeros(B, 1, H, W, device=self.device)
-            if loss_module is not None:
-                c = _run_hovernet_val(self.hr)
-                p = _run_hovernet_val(recon)
-                if (c is not None) and (p is not None):
-                    nr_types = c['tp_prob'].shape[1]
-                    cls_clean = c['tp_label'].float().unsqueeze(1)
-                    cls_pred = p['tp_label'].float().unsqueeze(1)
-                    conf_clean = c['tp_conf'].unsqueeze(1)
-                    conf_pred = p['tp_conf'].unsqueeze(1)
-                    nuc_mask_clean = c['nuc_mask'].unsqueeze(1)
+
+            if loss_module is not None and hasattr(loss_module, 'hovernet'):
+                try:
+                    p = run_hovernet_semantics_aligned(
+                        loss_module.hovernet,
+                        recon,
+                        upsample_factor=float(
+                            getattr(loss_module, 'hovernet_upsample_factor', 1.0)
+                        ),
+                    )
+                    cls_pred      = p['tp_label'].float().unsqueeze(1)
+                    conf_pred     = p['tp_conf'].unsqueeze(1)
                     nuc_mask_pred = p['nuc_mask'].unsqueeze(1)
+                    nr_types = p['tp_prob'].shape[1]
+                except Exception:
+                    pass
 
         return dict(
-            reconstructed=recon,
-            diff_vis=diff_vis,
-            cls_clean=cls_clean,
-            cls_pred=cls_pred,
-            conf_clean=conf_clean,
-            conf_pred=conf_pred,
-            nuc_mask_clean=nuc_mask_clean,
-            nuc_mask_pred=nuc_mask_pred,
-            nr_types=nr_types,
-            col_titles=self.col_titles,
-            gt_pannuke_type_rgb=self.gt_pannuke_type_rgb,
+            reconstructed  = recon,
+            diff_vis       = diff_vis,
+            cls_clean      = cls_clean,
+            cls_pred       = cls_pred,
+            conf_pred      = conf_pred,
+            nuc_mask_clean = nuc_mask_clean,
+            nuc_mask_pred  = nuc_mask_pred,
+            nr_types       = nr_types,
+            col_titles     = self.col_titles,
         )
 
 
@@ -426,19 +372,15 @@ class ValidationSet:
 def save_validation_debug_images(
     hr, lr, reconstructed, diff_vis,
     cls_clean, cls_pred,
-    conf_clean, conf_pred,
+    conf_pred,                         # conf_clean 已移除（GT 恒为 1 无意义）
     nuc_mask_clean, nuc_mask_pred,
     epoch, save_dir, num_vis=8, return_tensor=False,
     col_titles=None,
     suptitle: str = None,
     nr_types: int = 6,
-    gt_pannuke_type_rgb: Optional[np.ndarray] = None,
 ):
     os.makedirs(save_dir, exist_ok=True)
     num_vis = min(num_vis, hr.shape[0])
-
-    import torch.nn.functional as F
-    import torch
 
     def _rgb(t):
         return t[:num_vis].detach().cpu().clamp(0, 1).permute(0, 2, 3, 1).numpy()
@@ -450,105 +392,84 @@ def save_validation_debug_images(
         return t[:num_vis, 0].detach().cpu().numpy().astype(np.int32)
 
     def _resize_label_np(arr_np, out_hw):
-        # arr_np: [N,H,W] int
-        t = torch.from_numpy(arr_np).unsqueeze(1).float()  # [N,1,H,W]
+        t = torch.from_numpy(arr_np).unsqueeze(1).float()
         t = F.interpolate(t, size=out_hw, mode='nearest')
         return t[:, 0].numpy().astype(np.int32)
 
     def _resize_gray_np(arr_np, out_hw):
-        # arr_np: [N,H,W] float
-        t = torch.from_numpy(arr_np).unsqueeze(1).float()  # [N,1,H,W]
+        t = torch.from_numpy(arr_np).unsqueeze(1).float()
         t = F.interpolate(t, size=out_hw, mode='bilinear', align_corners=False)
         return t[:, 0].numpy()
 
-    hr_rgb = _rgb(hr)
-    lr_rgb = _rgb(lr)
+    hr_rgb    = _rgb(hr)
+    lr_rgb    = _rgb(lr)
     recon_rgb = _rgb(reconstructed)
-    diff_rgb = _rgb(diff_vis)
+    diff_rgb  = _rgb(diff_vis)
 
-    cls_clean_int = _label(cls_clean)
-    cls_pred_int = _label(cls_pred)
-    conf_clean_np = _gray(conf_clean)
-    conf_pred_np = _gray(conf_pred)
-    nuc_mask_clean_np = _gray(nuc_mask_clean)
-    nuc_mask_pred_np = _gray(nuc_mask_pred)
+    cls_clean_int  = _label(cls_clean)
+    cls_pred_int   = _label(cls_pred)
+    conf_pred_np   = _gray(conf_pred)
+    nuc_clean_np   = _gray(nuc_mask_clean)
+    nuc_pred_np    = _gray(nuc_mask_pred)
 
-    target_hw = hr_rgb.shape[1:3]  # (H,W)
-    if cls_clean_int.shape[1:3] != target_hw:
-        cls_clean_int = _resize_label_np(cls_clean_int, target_hw)
-    if cls_pred_int.shape[1:3] != target_hw:
-        cls_pred_int = _resize_label_np(cls_pred_int, target_hw)
+    target_hw = hr_rgb.shape[1:3]
 
-    if conf_clean_np.shape[1:3] != target_hw:
-        conf_clean_np = _resize_gray_np(conf_clean_np, target_hw)
-    if conf_pred_np.shape[1:3] != target_hw:
-        conf_pred_np = _resize_gray_np(conf_pred_np, target_hw)
+    for arr, is_lbl in [
+        (cls_clean_int, True), (cls_pred_int, True),
+    ]:
+        if arr.shape[1:3] != target_hw:
+            arr[:] = _resize_label_np(arr, target_hw)
 
-    if nuc_mask_clean_np.shape[1:3] != target_hw:
-        nuc_mask_clean_np = _resize_gray_np(nuc_mask_clean_np, target_hw)
-    if nuc_mask_pred_np.shape[1:3] != target_hw:
-        nuc_mask_pred_np = _resize_gray_np(nuc_mask_pred_np, target_hw)
+    for arr in [conf_pred_np, nuc_clean_np, nuc_pred_np]:
+        if arr.shape[1:3] != target_hw:
+            arr[:] = _resize_gray_np(arr, target_hw)
 
-    default_type_info_path = Path(__file__).resolve().parent / 'HoVer-net' / 'type_info.json'
-    if default_type_info_path.exists():
-        raw_type_info = json.loads(default_type_info_path.read_text(encoding='utf-8'))
+    # 颜色表
+    type_info_path = Path(__file__).resolve().parent / 'HoVer-net' / 'type_info.json'
+    if type_info_path.exists():
+        raw_type_info = json.loads(type_info_path.read_text(encoding='utf-8'))
     else:
-        raw_type_info = {
-            str(i): ['', [0, 0, 0]] for i in range(6)
-        }
+        raw_type_info = {str(i): ['', [0, 0, 0]] for i in range(6)}
 
     tp_colors_hex = []
     tp_color_map_rgb01 = np.zeros((6, 3), dtype=np.float32)
     for tid in range(6):
-        t = raw_type_info.get(str(tid), None)
+        t   = raw_type_info.get(str(tid), None)
         rgb = [0, 0, 0] if t is None else t[1]
         r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
         tp_color_map_rgb01[tid] = np.array([r, g, b], dtype=np.float32) / 255.0
         tp_colors_hex.append(f'#{r:02x}{g:02x}{b:02x}')
 
-    def _tp_overlay(base_rgb, tp_label_int, tp_conf_gray, nuc_mask_gray, overlay_alpha=0.6):
+    def _tp_overlay(base_rgb, tp_label_int, tp_conf_gray, nuc_mask_gray, alpha=0.6):
         tp_label_int = np.clip(tp_label_int, 0, tp_color_map_rgb01.shape[0] - 1)
-        color_map = tp_color_map_rgb01[tp_label_int]
-        valid_mask = (tp_label_int > 0) & (nuc_mask_gray > 0)
-        alpha = overlay_alpha * tp_conf_gray * valid_mask.astype(np.float32)
-        alpha = np.clip(alpha, 0.0, 1.0)[..., None]
-        return base_rgb * (1.0 - alpha) + color_map * alpha
+        color_map    = tp_color_map_rgb01[tp_label_int]
+        valid_mask   = (tp_label_int > 0) & (nuc_mask_gray > 0)
+        a = (alpha * tp_conf_gray * valid_mask.astype(np.float32))[..., None].clip(0, 1)
+        return base_rgb * (1 - a) + color_map * a
 
-    overlay_clean = _tp_overlay(hr_rgb, cls_clean_int, conf_clean_np, nuc_mask_clean_np)
-    overlay_pred = _tp_overlay(recon_rgb, cls_pred_int, conf_pred_np, nuc_mask_pred_np)
+    # GT clean 侧用 nuc_clean 作为 conf（GT 核区域置信度视为 1）
+    overlay_clean = _tp_overlay(hr_rgb,    cls_clean_int, nuc_clean_np, nuc_clean_np)
+    overlay_pred  = _tp_overlay(recon_rgb, cls_pred_int,  conf_pred_np, nuc_pred_np)
 
     rows_data = [
-        (hr_rgb, 'HR'),
-        (lr_rgb, 'LR'),
+        (hr_rgb,    'HR'),
+        (lr_rgb,    'LR'),
         (recon_rgb, 'Recon'),
-        (diff_rgb, 'Residual'),
+        (diff_rgb,  'Residual'),
     ]
-    if gt_pannuke_type_rgb is not None:
-        gt_vis = np.asarray(gt_pannuke_type_rgb[:num_vis], dtype=np.float32)
-        if gt_vis.shape[1:3] != target_hw:
-            gt_fixed = []
-            for i in range(min(num_vis, gt_vis.shape[0])):
-                g = gt_vis[i]
-                gt_fixed.append(
-                    cv2.resize(
-                        (g * 255.0).clip(0, 255).astype(np.uint8),
-                        (target_hw[1], target_hw[0]),
-                        interpolation=cv2.INTER_NEAREST,
-                    ).astype(np.float32) / 255.0
-                )
-            gt_vis = np.stack(gt_fixed, axis=0)
-        rows_data.append((gt_vis, 'GT mask types (PanNuke)'))
 
     rows_data.extend([
-        (overlay_clean, 'TP overlay clean'),
-        (overlay_pred, 'TP overlay pred'),
-        (conf_clean_np, 'tp_conf clean'),
-        (conf_pred_np, 'tp_conf pred'),
-        (nuc_mask_pred_np, 'nuc_mask pred'),
+        (overlay_clean,  'TP overlay GT'),
+        (overlay_pred,   'TP overlay pred'),
+        (conf_pred_np,   'tp_conf pred'),
+        (nuc_clean_np,   'nuc_mask GT'),
+        (nuc_pred_np,    'nuc_mask pred'),
     ])
 
     n_rows, n_cols = len(rows_data), num_vis
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.6 * n_rows), squeeze=False)
+    fig, axes = plt.subplots(n_rows, n_cols,
+                              figsize=(2.8 * n_cols, 2.6 * n_rows),
+                              squeeze=False)
 
     if suptitle:
         fig.suptitle(suptitle, fontsize=12, y=0.995)
@@ -567,14 +488,15 @@ def save_validation_debug_images(
             ax.axis('off')
 
     legend_handles = [
-        Patch(facecolor=tp_colors_hex[0], label='0:background(nolabe)'),
-        Patch(facecolor=tp_colors_hex[1], label='1:neopla'),
-        Patch(facecolor=tp_colors_hex[2], label='2:inflam'),
-        Patch(facecolor=tp_colors_hex[3], label='3:connec'),
-        Patch(facecolor=tp_colors_hex[4], label='4:necros'),
-        Patch(facecolor=tp_colors_hex[5], label='5:no-neo'),
+        Patch(facecolor=tp_colors_hex[0], label='0: background'),
+        Patch(facecolor=tp_colors_hex[1], label='1: Neoplastic'),
+        Patch(facecolor=tp_colors_hex[2], label='2: Inflammatory'),
+        Patch(facecolor=tp_colors_hex[3], label='3: Connective'),
+        Patch(facecolor=tp_colors_hex[4], label='4: Dead'),
+        Patch(facecolor=tp_colors_hex[5], label='5: Epithelial'),
     ]
-    fig.legend(handles=legend_handles, title='TP classes', loc='upper right', fontsize=8)
+    fig.legend(handles=legend_handles, title='TP classes',
+               loc='upper right', fontsize=8)
 
     plt.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1))
     save_path = os.path.join(save_dir, f'epoch_{epoch:03d}_val.png')
@@ -585,8 +507,10 @@ def save_validation_debug_images(
         return None
 
     grid = make_grid(
-        torch.cat([hr[:num_vis], lr[:num_vis], reconstructed[:num_vis], diff_vis[:num_vis]]).detach().cpu(),
-        nrow=num_vis, padding=2)
+        torch.cat([hr[:num_vis], lr[:num_vis],
+                   reconstructed[:num_vis], diff_vis[:num_vis]]).detach().cpu(),
+        nrow=num_vis, padding=2,
+    )
     return grid
 
 
@@ -603,12 +527,6 @@ def create_val_dataloader(
     dataset_type: str = 'auto',
     target_size: Optional[int] = 256,
 ):
-    """
-    构建定量验证 DataLoader。
-
-    - NCT: 需要 val_vis_dir/TUM 与 val_vis_dir/NORM
-    - PanNuke: val_vis_dir 可以是单个 Fold 目录，也可以是 PanNuke 根目录
-    """
     if not val_vis_dir or not os.path.exists(val_vis_dir):
         return None
 
@@ -637,7 +555,7 @@ def create_val_dataloader(
         print(f'定量验证集（PanNuke）：{len(val_ds)} 张 patch')
         return dl
 
-    tum_dir = os.path.join(val_vis_dir, 'TUM')
+    tum_dir  = os.path.join(val_vis_dir, 'TUM')
     norm_dir = os.path.join(val_vis_dir, 'NORM')
     if not os.path.exists(tum_dir) or not os.path.exists(norm_dir):
         print('⚠️  验证目录缺少 TUM/NORM 子目录 —— 跳过定量验证。')
