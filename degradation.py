@@ -127,7 +127,13 @@ def degrade(hr: torch.Tensor,
 # 内部辅助函数
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _gaussian_kernel(sigma: float, kernel_size: int = None) -> torch.Tensor:
+def _gaussian_kernel(
+    sigma: float,
+    kernel_size: int = None,
+    *,
+    device=None,
+    dtype=torch.float32,
+) -> torch.Tensor:
     """一维高斯核；返回长度为 k 的张量（先非归一化，再归一化）。"""
     if kernel_size is None:
         # 经验公式：6σ + 1，且保证为奇数
@@ -135,8 +141,8 @@ def _gaussian_kernel(sigma: float, kernel_size: int = None) -> torch.Tensor:
         if kernel_size % 2 == 0:
             kernel_size += 1
     half = kernel_size // 2
-    xs = torch.arange(-half, half + 1, dtype=torch.float32)
-    k  = torch.exp(-0.5 * (xs / sigma) ** 2)
+    xs = torch.arange(-half, half + 1, dtype=dtype, device=device)
+    k = torch.exp(-0.5 * (xs / sigma) ** 2)
     return k / k.sum()
 
 
@@ -145,7 +151,7 @@ def _gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
     if sigma < 1e-3:
         return x
 
-    k1d = _gaussian_kernel(sigma)                   # [k]
+    k1d = _gaussian_kernel(sigma, device=x.device, dtype=x.dtype)  # [k]
     C   = x.shape[0]
     pad = k1d.shape[0] // 2
 

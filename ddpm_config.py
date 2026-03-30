@@ -97,9 +97,13 @@ class TrainingConfig:
     pin_memory: bool = True
     train_drop_last: bool = True
 
-    # ── 推理 / 测试常用默认项 ───────────────────────────────────────
+    # ── 推理 / 测试常用默认项（inference_self_guided.py 默认由此读取）────
     use_semantic_injection: bool = True
-    test_output_dir: str = './results/infer_fold3'
+    test_output_dir: str = '/data/xuwen/ddpm_inference_results/pannuke_fold3'
+    infer_iters: int = 5
+    infer_noise_t: int = 200
+    infer_max_fidelity_loss: float = 0.05
+    infer_use_noise_in_fidelity: bool = False
 
 
 def get_default_config() -> TrainingConfig:

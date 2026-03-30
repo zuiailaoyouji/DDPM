@@ -12,6 +12,7 @@ inference_self_guided.py
        Fold 1/masks/fold1/masks.npy
   3. 保留原有“普通图片文件夹推理”路径。
   4. 保留 target_size 兼容逻辑：默认 256；若输入本来就是 256x256，则不会重复插值。
+  5. 与 ddpm_config.get_default_config() 对齐：退化、扩散步数、HoVer-Net、输出目录等默认可在配置里改。
 """
 
 import argparse
@@ -28,6 +29,7 @@ from diffusers import DDPMScheduler
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from ddpm_config import get_default_config
 from ddpm_dataset import _find_pannuke_fold_files, _is_pannuke_fold_dir, _normalize_fold_dirs
 from ddpm_utils import get_device, load_hovernet, predict_x0_from_noise_shared
 from degradation import apply_degradation, degrade
@@ -504,41 +506,59 @@ class PanNukeInferenceDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description='SPM-UNet 语义注入 SR 批量推理')
+    cfg = get_default_config()
+    p = argparse.ArgumentParser(description='SPM-UNet 语义注入 SR 批量推理（默认超参来自 ddpm_config）')
     p.add_argument('--input_path', required=True, help='普通图片文件夹，或 PanNuke 的 fold/root 路径')
     p.add_argument('--input_mode', default='auto', choices=['auto', 'image_folder', 'pannuke'])
-    p.add_argument('--output_dir', default='./results/sr')
+    p.add_argument('--output_dir', default=cfg.test_output_dir,
+                   help='默认取自 TrainingConfig.test_output_dir')
     p.add_argument('--unet_path', required=True)
-    p.add_argument('--hovernet_path', default=None)
-    p.add_argument('--hovernet_upsample_factor', type=float, default=2.0,
-                   help='HoVer-Net 语义提取前上采样倍率（例如 20x→40x 用 2.0；1.0 关闭）')
-    p.add_argument('--iters', type=int, default=5)
-    p.add_argument('--noise_t', type=int, default=200, help='起始噪声步(建议200-300)')
-    p.add_argument('--scale', type=int, default=2)
-    p.add_argument('--target_size', type=int, default=256,
-                   help='输入 patch 目标尺寸；设为 256 可兼容 PanNuke，设为 -1 表示不 resize')
-    p.add_argument('--max_fidelity_loss', type=float, default=0.05, help='保真度崩塌阈值')
-    p.add_argument('--batch_size', type=int, default=4)
-    p.add_argument('--num_workers', type=int, default=4)
-    p.add_argument('--device', default=None)
+    p.add_argument('--hovernet_path', default=cfg.hovernet_path,
+                   help='默认取自 TrainingConfig.hovernet_path；不需要 HoVer-Net 时请改配置或传空路径')
+    p.add_argument('--hovernet_upsample_factor', type=float, default=cfg.hovernet_upsample_factor,
+                   help='默认 cfg.hovernet_upsample_factor；例如 20x→40x 用 2.0；PanNuke 256 常配 1.0')
+    p.add_argument('--iters', type=int, default=cfg.infer_iters)
+    p.add_argument('--noise_t', type=int, default=cfg.infer_noise_t, help='起始噪声步(建议200-300)')
+    p.add_argument('--num_train_timesteps', type=int, default=cfg.num_train_timesteps,
+                   help='须与训练一致；默认 cfg.num_train_timesteps')
+    p.add_argument('--scale', type=int, default=cfg.scale)
+    _ts_default = cfg.target_size if cfg.target_size is not None else -1
+    p.add_argument('--target_size', type=int, default=_ts_default,
+                   help='默认 cfg.target_size；-1 表示不 resize')
+    p.add_argument('--max_fidelity_loss', type=float, default=cfg.infer_max_fidelity_loss,
+                   help='默认 cfg.infer_max_fidelity_loss')
+    p.add_argument('--batch_size', type=int, default=cfg.batch_size)
+    p.add_argument('--num_workers', type=int, default=cfg.num_workers)
+    p.add_argument('--device', type=str, default=cfg.device)
     p.add_argument('--gpu_id', type=int, default=None)
-    p.add_argument('--use_semantic_injection', action='store_true')
-    p.add_argument('--blur_sigma_range', type=float, nargs=2, default=[1.0, 1.0])
-    p.add_argument('--noise_std_range', type=float, nargs=2, default=[0.0, 0.0])
-    p.add_argument('--stain_jitter', type=float, default=0.0)
-    p.add_argument('--tau_nuc', type=float, default=0.4)
-    p.add_argument('--tau_conf', type=float, default=0.6)
-    p.add_argument('--use_noise_in_fidelity', action='store_true',
-                   help='在 fidelity 校验中复用退化噪声 realization（默认关闭以减少抖动）')
+    g_sem = p.add_mutually_exclusive_group()
+    g_sem.add_argument('--use_semantic_injection', dest='use_semantic_injection', action='store_true',
+                       help='启用架构语义注入（与 Stage 2 对齐；默认见 cfg.use_semantic_injection）')
+    g_sem.add_argument('--no-use_semantic_injection', dest='use_semantic_injection', action='store_false',
+                       help='关闭架构语义注入（与 Stage 3 对齐）')
+    p.set_defaults(use_semantic_injection=cfg.use_semantic_injection)
+    p.add_argument('--blur_sigma_range', type=float, nargs=2, default=list(cfg.blur_sigma_range))
+    p.add_argument('--noise_std_range', type=float, nargs=2, default=list(cfg.noise_std_range))
+    p.add_argument('--stain_jitter', type=float, default=cfg.stain_jitter)
+    p.add_argument('--tau_nuc', type=float, default=cfg.tau_nuc)
+    p.add_argument('--tau_conf', type=float, default=cfg.tau_conf)
+    g_nf = p.add_mutually_exclusive_group()
+    g_nf.add_argument('--use_noise_in_fidelity', dest='use_noise_in_fidelity', action='store_true',
+                      help='fidelity 复用退化噪声 realization')
+    g_nf.add_argument('--no-use_noise_in_fidelity', dest='use_noise_in_fidelity', action='store_false',
+                      help='fidelity 不加随机噪声项（默认）')
+    p.set_defaults(use_noise_in_fidelity=cfg.infer_use_noise_in_fidelity)
 
     args = p.parse_args()
     args.device = get_device(gpu_id=args.gpu_id) if args.gpu_id is not None else (args.device or get_device())
     if args.target_size is not None and args.target_size <= 0:
         args.target_size = None
+    if args.hovernet_path is not None and not str(args.hovernet_path).strip():
+        args.hovernet_path = None
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    unet = create_model(use_semantic=(args.hovernet_path is not None)).to(args.device)
+    unet = create_model(use_semantic=bool(args.hovernet_path)).to(args.device)
     ckpt = torch.load(args.unet_path, map_location=args.device)
     epoch = ckpt.get('epoch', -1) if isinstance(ckpt, dict) else -1
     if args.use_semantic_injection:
@@ -559,7 +579,7 @@ def main():
         hovernet = load_hovernet(args.hovernet_path, device=args.device)
         print('✓ HoVer-Net loaded')
 
-    scheduler = DDPMScheduler(num_train_timesteps=1000)
+    scheduler = DDPMScheduler(num_train_timesteps=args.num_train_timesteps)
 
     input_mode = infer_input_mode(args.input_path) if args.input_mode == 'auto' else args.input_mode
     print(f'Input mode: {input_mode}')
