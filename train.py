@@ -512,6 +512,9 @@ def train(
                         num_vis=8, return_tensor=True,
                         col_titles=col_titles,
                         suptitle=suptitle,
+                        cls_pred_lr=result.get('cls_pred_lr'),
+                        conf_pred_lr=result.get('conf_pred_lr'),
+                        nuc_mask_pred_lr=result.get('nuc_mask_pred_lr'),
                     )
                     if logger and grid is not None:
                         logger.log_images('Validation/SR_Comparison',

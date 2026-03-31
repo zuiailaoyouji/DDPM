@@ -6,12 +6,22 @@ v2 变更
 ────────
 1. generate_reconstructions 不再对 HR 跑 HoVer-Net 取 clean 语义参考。
    cls_clean / conf_clean / nuc_mask_clean 改为由 GT masks.npy 提供：
-     - cls_clean   : gt_label_map（整数类别图）
+     - cls_clean      : gt_label_map（整数类别图）
      - nuc_mask_clean : gt_nuc_mask（GT 核掩膜）
-     - conf_clean  : 已移除，GT 硬标签置信度恒为 1，无可视化意义
+     - conf_clean     : 已移除，GT 硬标签置信度恒为 1，无可视化意义
 2. ValidationSet 新增 gt_label_map / gt_nuc_mask 字段，在 load() 阶段一并缓存。
 3. save_validation_debug_images 移除 conf_clean 行（保留 conf_pred 供观测）。
 4. 兼容 NCT 数据集：NCT 无 GT mask，GT 相关字段退化为全零占位，不影响可视化。
+
+v3 变更
+────────
+5. generate_reconstructions 新增对 LR 图像的 HoVer-Net 预测：
+     cls_pred_lr / conf_pred_lr / nuc_mask_pred_lr
+6. save_validation_debug_images 新增三行，插入在原 SR pred 行之前，
+   使 LR pred 与 SR pred 成对出现，便于直观对比超分前后语义质量：
+     - "TP overlay LR pred"  : LR 的 HoVer-Net 类别 overlay
+     - "tp_conf LR pred"     : LR 的 HoVer-Net 置信度图
+     - "nuc_mask LR pred"    : LR 的 HoVer-Net 核掩膜
 """
 
 import os
@@ -73,7 +83,6 @@ def _pannuke_mask_hwc_to_label_map(mask: np.ndarray) -> np.ndarray:
     for ch in range(5):
         lbl = np.where(m[..., ch] > 0, np.int32(ch + 1), lbl)
     return lbl
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -325,43 +334,67 @@ class ValidationSet:
 
             # ── clean 侧：直接用 GT ────────────────────────────────
             if self.gt_label_map is not None:
-                cls_clean     = self.gt_label_map.float().unsqueeze(1)   # [B,1,H,W]
-                nuc_mask_clean = self.gt_nuc_mask.unsqueeze(1)            # [B,1,H,W]
+                cls_clean      = self.gt_label_map.float().unsqueeze(1)   # [B,1,H,W]
+                nuc_mask_clean = self.gt_nuc_mask.unsqueeze(1)             # [B,1,H,W]
             else:
                 cls_clean      = torch.zeros(B, 1, H, W, device=self.device)
                 nuc_mask_clean = torch.zeros(B, 1, H, W, device=self.device)
 
-            # ── pred 侧：HoVer-Net 对重建图预测 ──────────────────
+            # ── SR pred 侧：HoVer-Net 对重建图预测 ────────────────
             cls_pred      = torch.zeros(B, 1, H, W, device=self.device)
             conf_pred     = torch.zeros(B, 1, H, W, device=self.device)
             nuc_mask_pred = torch.zeros(B, 1, H, W, device=self.device)
 
+            # ── LR pred 侧：HoVer-Net 对 LR 图预测 ───────────────
+            cls_pred_lr      = torch.zeros(B, 1, H, W, device=self.device)
+            conf_pred_lr     = torch.zeros(B, 1, H, W, device=self.device)
+            nuc_mask_pred_lr = torch.zeros(B, 1, H, W, device=self.device)
+
             if loss_module is not None and hasattr(loss_module, 'hovernet'):
+                upsample_factor = float(
+                    getattr(loss_module, 'hovernet_upsample_factor', 1.0)
+                )
+
+                # SR 重建图预测
                 try:
-                    p = run_hovernet_semantics_aligned(
+                    p_sr = run_hovernet_semantics_aligned(
                         loss_module.hovernet,
                         recon,
-                        upsample_factor=float(
-                            getattr(loss_module, 'hovernet_upsample_factor', 1.0)
-                        ),
+                        upsample_factor=upsample_factor,
                     )
-                    cls_pred      = p['tp_label'].float().unsqueeze(1)
-                    conf_pred     = p['tp_conf'].unsqueeze(1)
-                    nuc_mask_pred = p['nuc_mask'].unsqueeze(1)
-                    nr_types = p['tp_prob'].shape[1]
+                    cls_pred      = p_sr['tp_label'].float().unsqueeze(1)
+                    conf_pred     = p_sr['tp_conf'].unsqueeze(1)
+                    nuc_mask_pred = p_sr['nuc_mask'].unsqueeze(1)
+                    nr_types      = p_sr['tp_prob'].shape[1]
+                except Exception:
+                    pass
+
+                # LR 图预测
+                try:
+                    p_lr = run_hovernet_semantics_aligned(
+                        loss_module.hovernet,
+                        self.lr,
+                        upsample_factor=upsample_factor,
+                    )
+                    cls_pred_lr      = p_lr['tp_label'].float().unsqueeze(1)
+                    conf_pred_lr     = p_lr['tp_conf'].unsqueeze(1)
+                    nuc_mask_pred_lr = p_lr['nuc_mask'].unsqueeze(1)
                 except Exception:
                     pass
 
         return dict(
-            reconstructed  = recon,
-            diff_vis       = diff_vis,
-            cls_clean      = cls_clean,
-            cls_pred       = cls_pred,
-            conf_pred      = conf_pred,
-            nuc_mask_clean = nuc_mask_clean,
-            nuc_mask_pred  = nuc_mask_pred,
-            nr_types       = nr_types,
-            col_titles     = self.col_titles,
+            reconstructed    = recon,
+            diff_vis         = diff_vis,
+            cls_clean        = cls_clean,
+            cls_pred         = cls_pred,
+            conf_pred        = conf_pred,
+            nuc_mask_clean   = nuc_mask_clean,
+            nuc_mask_pred    = nuc_mask_pred,
+            cls_pred_lr      = cls_pred_lr,
+            conf_pred_lr     = conf_pred_lr,
+            nuc_mask_pred_lr = nuc_mask_pred_lr,
+            nr_types         = nr_types,
+            col_titles       = self.col_titles,
         )
 
 
@@ -372,12 +405,16 @@ class ValidationSet:
 def save_validation_debug_images(
     hr, lr, reconstructed, diff_vis,
     cls_clean, cls_pred,
-    conf_pred,                         # conf_clean 已移除（GT 恒为 1 无意义）
+    conf_pred,                          # SR pred 置信度
     nuc_mask_clean, nuc_mask_pred,
     epoch, save_dir, num_vis=8, return_tensor=False,
     col_titles=None,
     suptitle: str = None,
     nr_types: int = 6,
+    # ── v3 新增：LR pred 字段（均有默认值，向后兼容旧调用方）────
+    cls_pred_lr=None,                   # [B,1,H,W] float  LR 类别图
+    conf_pred_lr=None,                  # [B,1,H,W] float  LR 置信度
+    nuc_mask_pred_lr=None,              # [B,1,H,W] float  LR 核掩膜
 ):
     os.makedirs(save_dir, exist_ok=True)
     num_vis = min(num_vis, hr.shape[0])
@@ -406,21 +443,30 @@ def save_validation_debug_images(
     recon_rgb = _rgb(reconstructed)
     diff_rgb  = _rgb(diff_vis)
 
-    cls_clean_int  = _label(cls_clean)
-    cls_pred_int   = _label(cls_pred)
-    conf_pred_np   = _gray(conf_pred)
-    nuc_clean_np   = _gray(nuc_mask_clean)
-    nuc_pred_np    = _gray(nuc_mask_pred)
+    cls_clean_int = _label(cls_clean)
+    cls_pred_int  = _label(cls_pred)
+    conf_pred_np  = _gray(conf_pred)
+    nuc_clean_np  = _gray(nuc_mask_clean)
+    nuc_pred_np   = _gray(nuc_mask_pred)
+
+    # ── LR pred 数据（若未传入则用零占位，保持向后兼容）──────────
+    _, _, H, W = hr.shape
+    _zeros_label = np.zeros((num_vis, H, W), dtype=np.int32)
+    _zeros_gray  = np.zeros((num_vis, H, W), dtype=np.float32)
+
+    cls_pred_lr_int = _label(cls_pred_lr)      if cls_pred_lr      is not None else _zeros_label.copy()
+    conf_pred_lr_np = _gray(conf_pred_lr)       if conf_pred_lr     is not None else _zeros_gray.copy()
+    nuc_pred_lr_np  = _gray(nuc_mask_pred_lr)   if nuc_mask_pred_lr is not None else _zeros_gray.copy()
 
     target_hw = hr_rgb.shape[1:3]
 
-    for arr, is_lbl in [
-        (cls_clean_int, True), (cls_pred_int, True),
-    ]:
+    # 对齐所有标签图到 target_hw
+    for arr in [cls_clean_int, cls_pred_int, cls_pred_lr_int]:
         if arr.shape[1:3] != target_hw:
             arr[:] = _resize_label_np(arr, target_hw)
 
-    for arr in [conf_pred_np, nuc_clean_np, nuc_pred_np]:
+    # 对齐所有灰度图到 target_hw
+    for arr in [conf_pred_np, nuc_clean_np, nuc_pred_np, conf_pred_lr_np, nuc_pred_lr_np]:
         if arr.shape[1:3] != target_hw:
             arr[:] = _resize_gray_np(arr, target_hw)
 
@@ -448,23 +494,26 @@ def save_validation_debug_images(
         return base_rgb * (1 - a) + color_map * a
 
     # GT clean 侧用 nuc_clean 作为 conf（GT 核区域置信度视为 1）
-    overlay_clean = _tp_overlay(hr_rgb,    cls_clean_int, nuc_clean_np, nuc_clean_np)
-    overlay_pred  = _tp_overlay(recon_rgb, cls_pred_int,  conf_pred_np, nuc_pred_np)
+    overlay_clean = _tp_overlay(hr_rgb,    cls_clean_int,   nuc_clean_np,   nuc_clean_np)
+    overlay_lr    = _tp_overlay(lr_rgb,    cls_pred_lr_int, conf_pred_lr_np, nuc_pred_lr_np)
+    overlay_pred  = _tp_overlay(recon_rgb, cls_pred_int,    conf_pred_np,   nuc_pred_np)
 
+    # ── 行定义 ─────────────────────────────────────────────────────
+    # LR pred 行紧跟在对应 SR pred 行之前，方便上下对比
     rows_data = [
-        (hr_rgb,    'HR'),
-        (lr_rgb,    'LR'),
-        (recon_rgb, 'Recon'),
-        (diff_rgb,  'Residual'),
+        (hr_rgb,          'HR'),
+        (lr_rgb,          'LR'),
+        (recon_rgb,       'Recon'),
+        (diff_rgb,        'Residual'),
+        (overlay_clean,   'TP overlay GT'),
+        (overlay_lr,      'TP overlay LR pred'),    # ← 新增
+        (overlay_pred,    'TP overlay SR pred'),
+        (conf_pred_lr_np, 'tp_conf LR pred'),       # ← 新增
+        (conf_pred_np,    'tp_conf SR pred'),
+        (nuc_clean_np,    'nuc_mask GT'),
+        (nuc_pred_lr_np,  'nuc_mask LR pred'),      # ← 新增
+        (nuc_pred_np,     'nuc_mask SR pred'),
     ]
-
-    rows_data.extend([
-        (overlay_clean,  'TP overlay GT'),
-        (overlay_pred,   'TP overlay pred'),
-        (conf_pred_np,   'tp_conf pred'),
-        (nuc_clean_np,   'nuc_mask GT'),
-        (nuc_pred_np,    'nuc_mask pred'),
-    ])
 
     n_rows, n_cols = len(rows_data), num_vis
     fig, axes = plt.subplots(n_rows, n_cols,
