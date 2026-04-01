@@ -43,7 +43,7 @@ class TrainingConfig:
     hovernet_upsample_factor: float = 1.0   # PanNuke 256×256，pred 侧不额外上采样
 
     # ── 基础训练配置 ────────────────────────────────────────────────
-    epochs: int = 150
+    epochs: int = 200
     batch_size: int = 4
     lr: float = 1e-4
     device: str = 'cuda'
@@ -70,18 +70,18 @@ class TrainingConfig:
 
     # ── 各项损失权重 ────────────────────────────────────────────────
     lambda_noise: float = 1.0
-    lambda_rec: float = 15.0
+    lambda_rec: float = 6.0
     lambda_grad: float = 0.8
-    lambda_sem: float = 0.01
+    lambda_sem: float = 0.15
     lambda_tv: float = 0.0005
 
     # ── 语义目标参数 ────────────────────────────────────────────────
     tau_nuc: float = 0.4          # GT 核掩膜阈值
-    lambda_sem_cls: float = 0.05  # CE 损失权重（唯一保留的语义子项）
+    lambda_sem_cls: float = 0.3  # CE 损失权重（唯一保留的语义子项）
 
     # ── 三阶段训练策略 ─────────────────────────────────────────────
-    semantic_start_epoch: int = 30
-    semantic_end_epoch: int = 110
+    semantic_start_epoch: int = 50
+    semantic_end_epoch: int = 200
     semantic_warmup_epochs: int = 15
 
     # ── 优化器设置 ─────────────────────────────────────────────────
