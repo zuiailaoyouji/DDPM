@@ -1,31 +1,21 @@
 """
 train.py
-SPM-UNet（语义先验调制 U-Net）的三阶段训练循环。
+SPM-UNet（语义先验调制 U-Net）的两阶段训练循环。
 
-v2 升级：GT mask 驱动的语义监督与注入
+v3 升级：CellViT 双侧推理语义监督
 ──────────────────────────────────────
-语义先验张量 sem_tensor 来源于 Dataset 的 GT 像素级标注（masks.npy 转换而来）：
+语义教师从 HoVer-Net 替换为 CellViT-256-x40：
+  - clean 侧：CellViT(HR) no_grad 推理，得到伪标签
+  - pred  侧：CellViT(x0_hat) 实时推理，CE 损失向伪标签靠近
+  - valid_mask：gt_nuc_mask > tau_nuc
 
-  sem_tensor = build_gt_sem_tensor(gt_label_map, gt_nuc_mask)
-             = [gt_tp_onehot(6), gt_nuc_mask(1)]   共 7 通道
-             其中 gt_tp_onehot 在 build_gt_sem_tensor 内部由 gt_label_map 用 F.one_hot 生成
-
-  - gt_label_map : 像素级整数类别索引（0-5，HoVer-Net tp 类别空间）
-  - gt_nuc_mask  : GT 细胞核二值掩膜
-
-语义损失 clean 侧使用 GT，不再对 HR 跑 HoVer-Net（节省推理开销）；
-pred 侧（x0_hat）仍用 HoVer-Net 实时预测，损失为 CE(pred_prob, gt_label_map)。
-
-三阶段训练策略（不变）
-──────────────────────
+两阶段训练策略（去掉 Stage 3）
+──────────────────────────────
 阶段 1（epoch < semantic_start_epoch）：
     仅骨干重建预训练；semantic=None；无 L_sem
 
-阶段 2（semantic_start_epoch <= epoch < semantic_end_epoch）：
-    L_sem（GT mask CE 驱动）；sem_tensor 架构注入
-
-阶段 3（epoch >= semantic_end_epoch）：
-    关闭语义损失与注入；纯像素收尾（L_noise + L_rec + L_grad + L_tv）
+阶段 2（epoch >= semantic_start_epoch）：
+    L_sem（CellViT 双侧 CE）；sem_tensor 架构注入；训练全部参数
 """
 
 import torch
@@ -36,12 +26,13 @@ import os
 import argparse
 import csv
 import datetime
+from typing import Optional
 from tqdm import tqdm
 
 from ddpm_dataset import build_dataset
 from unet_wrapper import create_model, count_parameters
 from semantic_sr_loss import SemanticSRLoss, build_gt_sem_tensor
-from ddpm_utils import load_hovernet, get_device, print_gpu_info, predict_x0_from_noise_shared
+from ddpm_utils import load_cellvit, get_device, print_gpu_info, predict_x0_from_noise_shared
 from logger import ExperimentLogger
 from validation import (ValidationSet, create_val_dataloader,
                          save_validation_debug_images)
@@ -50,15 +41,15 @@ from metrics import (compute_psnr, compute_ssim,
                       compute_composite_score)
 from ddpm_config import get_default_config
 
+_DEFAULT_CFG = get_default_config()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 语义损失预热调度器
 # ─────────────────────────────────────────────────────────────────────────────
 
 def semantic_weight_scale(epoch, start, warmup):
-    """
-    返回 [0, 1] 标量，在 start epoch 之后经过 warmup 个 epoch 线性升到 1。
-    """
+    """返回 [0, 1] 标量，在 start epoch 之后经过 warmup 个 epoch 线性升到 1。"""
     if epoch < start:
         return 0.0
     return min((epoch - start) / max(warmup, 1), 1.0)
@@ -69,42 +60,53 @@ def semantic_weight_scale(epoch, start, warmup):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(
-    hovernet,
-    dataset_type='pannuke',
-    tum_dir=None, norm_dir=None,
-    pannuke_root=None, pannuke_train_fold_dir=None, pannuke_val_fold_dir=None, pannuke_test_fold_dir=None,
-    epochs=100, batch_size=8, lr=1e-4,
-    device='cuda', save_dir='./checkpoints_sr',
-    # 各项损失权重
-    lambda_noise=1.0, lambda_rec=1.0, lambda_grad=0.1,
-    lambda_sem=0.05,  lambda_tv=0.001,
-    # 语义监督阈值
-    tau_nuc=0.5,
-    # 语义子项内部权重
-    lambda_sem_cls=0.3,
-    # 三阶段训练日程
-    semantic_start_epoch=5, semantic_end_epoch=None, semantic_warmup_epochs=5,
-    # 在线退化配置
-    scale=2,
-    blur_sigma_range=(0.5, 1.5),
-    noise_std_range=(0.0, 0.02),
-    stain_jitter=0.05,
-    # 其他参数
-    accumulation_steps=1, resume_path=None,
-    logger=None, val_vis_dir=None,
-    num_train_timesteps=1000, t_max=400,
+    cellvit,
+    dataset_type=_DEFAULT_CFG.dataset_type,
+    tum_dir=_DEFAULT_CFG.tum_dir,
+    norm_dir=_DEFAULT_CFG.norm_dir,
+    pannuke_root=_DEFAULT_CFG.pannuke_root,
+    pannuke_train_fold_dir=_DEFAULT_CFG.pannuke_train_fold_dir,
+    pannuke_val_fold_dir=_DEFAULT_CFG.pannuke_val_fold_dir,
+    pannuke_test_fold_dir=_DEFAULT_CFG.pannuke_test_fold_dir,
+    epochs=_DEFAULT_CFG.epochs,
+    batch_size=_DEFAULT_CFG.batch_size,
+    lr=_DEFAULT_CFG.lr,
+    device=_DEFAULT_CFG.device,
+    save_dir=_DEFAULT_CFG.save_dir,
+    lambda_noise=_DEFAULT_CFG.lambda_noise,
+    lambda_rec=_DEFAULT_CFG.lambda_rec,
+    lambda_grad=_DEFAULT_CFG.lambda_grad,
+    lambda_sem=_DEFAULT_CFG.lambda_sem,
+    lambda_tv=_DEFAULT_CFG.lambda_tv,
+    tau_nuc=_DEFAULT_CFG.tau_nuc,
+    lambda_sem_cls=_DEFAULT_CFG.lambda_sem_cls,
+    semantic_start_epoch=_DEFAULT_CFG.semantic_start_epoch,
+    semantic_end_epoch=None,
+    semantic_warmup_epochs=_DEFAULT_CFG.semantic_warmup_epochs,
+    scale=_DEFAULT_CFG.scale,
+    blur_sigma_range=_DEFAULT_CFG.blur_sigma_range,
+    noise_std_range=_DEFAULT_CFG.noise_std_range,
+    stain_jitter=_DEFAULT_CFG.stain_jitter,
+    accumulation_steps=_DEFAULT_CFG.accumulation_steps,
+    resume_path=None,
+    logger=None,
+    val_vis_dir=_DEFAULT_CFG.val_vis_dir,
+    num_train_timesteps=_DEFAULT_CFG.num_train_timesteps,
+    t_max=_DEFAULT_CFG.t_max,
+    target_size: Optional[int] = None,
     create_semantic_branch: bool = False,
-    hovernet_upsample_factor: float = 1.0,
-    # 优化器与 DataLoader
-    weight_decay: float = 0.01,
-    max_grad_norm: float = 1.0,
-    num_workers: int = 4,
-    pin_memory: bool = True,
-    oversample: bool = True,
-    train_drop_last: bool = True,
+    weight_decay: float = _DEFAULT_CFG.weight_decay,
+    max_grad_norm: float = _DEFAULT_CFG.max_grad_norm,
+    num_workers: int = _DEFAULT_CFG.num_workers,
+    pin_memory: bool = _DEFAULT_CFG.pin_memory,
+    oversample: bool = _DEFAULT_CFG.oversample,
+    train_drop_last: bool = _DEFAULT_CFG.train_drop_last,
 ):
-    if semantic_end_epoch is None:
-        semantic_end_epoch = epochs
+    # Stage 3 已移除，semantic_end_epoch 设为 epochs
+    semantic_end_epoch = epochs
+
+    if target_size is None:
+        target_size = _DEFAULT_CFG.target_size if _DEFAULT_CFG.target_size is not None else 256
 
     base_lr = lr
 
@@ -121,15 +123,13 @@ def train(
             w.writerow([
                 'Epoch', 'Stage',
                 'Total_Loss', 'L_noise', 'L_rec', 'L_grad',
-                'L_sem', 'L_tv',
-                'L_sem_cls',
-                'Sem_MAE', 'Dir_Acc',
-                'Sem_Scale',
+                'L_sem', 'L_tv', 'L_sem_cls',
+                'Sem_MAE', 'Dir_Acc', 'Sem_Scale',
             ])
 
     # ── 模型与调度器 ────────────────────────────────────────────────
     print("初始化 SPM-UNet...")
-    unet      = create_model(use_semantic=(create_semantic_branch or (hovernet is not None))).to(device)
+    unet      = create_model(use_semantic=(create_semantic_branch or (cellvit is not None))).to(device)
     scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps)
 
     param_info = count_parameters(unet)
@@ -138,11 +138,10 @@ def train(
     print(f"  参数量：bone={bb:,}  semantic={sem:,}  total={param_info['total']:,}")
 
     # ── 损失函数 ────────────────────────────────────────────────────
-    # GT mask 模式下 hovernet 仅用于 pred 侧（对 x0_hat 推理），clean 侧不再调用
     loss_fn = None
-    if hovernet is not None:
+    if cellvit is not None:
         loss_fn = SemanticSRLoss(
-            hovernet=hovernet,
+            cellvit=cellvit,
             noise_scheduler=scheduler,
             tau_nuc=tau_nuc,
             lambda_sem_cls=lambda_sem_cls,
@@ -152,17 +151,14 @@ def train(
             lambda_sem=lambda_sem,
             lambda_tv=lambda_tv,
             t_max=t_max,
-            hovernet_upsample_factor=hovernet_upsample_factor,
         ).to(device)
         print(
-            "模式：GT mask 驱动语义监督（clean 侧使用 masks.npy GT，pred 侧 HoVer-Net 推理）\n"
+            "模式：CellViT 双侧推理语义监督\n"
             f"  Stage 1（epoch < {semantic_start_epoch}）：仅主干损失\n"
-            f"  Stage 2（{semantic_start_epoch} ≤ epoch < {semantic_end_epoch}）："
-            "GT sem_tensor 注入 + 语义损失\n"
-            f"  Stage 3（epoch ≥ {semantic_end_epoch}）：纯像素收尾"
+            f"  Stage 2（epoch >= {semantic_start_epoch}）：CellViT 语义损失 + sem_tensor 注入"
         )
     else:
-        print("模式：仅重建 SR（hovernet=None；语义损失与注入均关闭）")
+        print("模式：仅重建 SR（cellvit=None；语义损失与注入均关闭）")
 
     # ── 优化器 ──────────────────────────────────────────────────────
     def _make_adamw(params):
@@ -194,9 +190,7 @@ def train(
     start_in_stage2 = (
         (loss_fn is not None)
         and (start_epoch >= semantic_start_epoch)
-        and (start_epoch < semantic_end_epoch)
     )
-    start_in_stage3 = (loss_fn is not None) and (start_epoch >= semantic_end_epoch)
 
     optimizer_full = _make_adamw(unet.parameters())
     if ckpt_optimizer_state is not None:
@@ -206,7 +200,7 @@ def train(
         except Exception as e:
             print(f"⚠️  优化器状态加载失败，将从头初始化：{e}")
 
-    if start_in_stage2 or start_in_stage3:
+    if start_in_stage2:
         optimizer = optimizer_full
         optimizer_is_full = True
     else:
@@ -252,7 +246,7 @@ def train(
             blur_sigma_range=blur_sigma_range,
             noise_std_range=noise_std_range,
             stain_jitter=stain_jitter,
-            target_size=256,
+            target_size=target_size,
         )
         if pannuke_val_fold_dir:
             val_ds = build_dataset(
@@ -262,7 +256,7 @@ def train(
                 blur_sigma_range=blur_sigma_range,
                 noise_std_range=noise_std_range,
                 stain_jitter=stain_jitter,
-                target_size=256,
+                target_size=target_size,
             )
             val_dl = DataLoader(
                 val_ds,
@@ -285,7 +279,7 @@ def train(
             blur_sigma_range=blur_sigma_range,
             noise_std_range=noise_std_range,
             stain_jitter=stain_jitter,
-            target_size=256,
+            target_size=target_size,
         )
         val_dl = create_val_dataloader(
             val_vis_dir, batch_size, device, scale=scale,
@@ -308,7 +302,7 @@ def train(
     print(f"总训练轮数：{epochs} 个 epoch...")
     global_step = 0
 
-    # Stage 1 或 Stage 3 续训：关闭语义注入 hooks
+    # Stage 1 开始时关闭语义注入 hooks
     if (
         loss_fn is not None
         and hasattr(unet, "disable_semantic_modulation")
@@ -321,13 +315,12 @@ def train(
         unet.train()
 
         sem_scale   = semantic_weight_scale(epoch, semantic_start_epoch, semantic_warmup_epochs)
-        in_stage2   = (epoch >= semantic_start_epoch) and (epoch < semantic_end_epoch) and (loss_fn is not None)
-        in_stage3   = epoch >= semantic_end_epoch
+        in_stage2   = (epoch >= semantic_start_epoch) and (loss_fn is not None)
         semantic_on = in_stage2
 
-        stage_name     = '1' if epoch < semantic_start_epoch else ('2' if epoch < semantic_end_epoch else '3')
-        sem_scale_log  = sem_scale if in_stage2 else 0.0
-        stage_label    = f"Stage{stage_name} sem={sem_scale_log:.2f}"
+        stage_name    = '1' if epoch < semantic_start_epoch else '2'
+        sem_scale_log = sem_scale if in_stage2 else 0.0
+        stage_label   = f"Stage{stage_name} sem={sem_scale_log:.2f}"
 
         # Stage 2：开启语义调制 + 扩展优化器到全参数
         if in_stage2:
@@ -339,16 +332,10 @@ def train(
                 optimizer = new_opt
                 optimizer_is_full = True
 
-        # Stage 3：关闭语义调制
-        if in_stage3:
-            if hasattr(unet, "disable_semantic_modulation") and getattr(unet, "use_semantic", False):
-                unet.disable_semantic_modulation()
-
         # 每 epoch 累计器
         acc = {k: 0.0 for k in (
             'total', 'noise', 'rec', 'grad', 'sem', 'tv',
-            'sem_cls',
-            'sem_mae', 'dir_acc', 'sem_mae_n', 'dir_acc_n',
+            'sem_cls', 'sem_mae', 'dir_acc', 'sem_mae_n', 'dir_acc_n',
         )}
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} | {stage_label}")
@@ -363,13 +350,11 @@ def train(
             timesteps = torch.randint(0, t_max, (bs,), device=device).long()
             noisy_hr  = scheduler.add_noise(hr, noise, timesteps)
 
-            # ── GT 字段（来自 PanNuke Dataset，NCT 时不存在）────────
-            gt_nuc_mask  = batch.get('gt_nuc_mask')    # [B, H, W]    or None
-            gt_label_map = batch.get('gt_label_map')   # [B, H, W]    or None
+            # ── GT 字段 ─────────────────────────────────────────────
+            gt_nuc_mask  = batch.get('gt_nuc_mask')    # [B, H, W] or None
+            gt_label_map = batch.get('gt_label_map')   # [B, H, W] or None
 
             # ── Stage 2：构造 GT sem_tensor 用于架构注入 ──────────
-            # sem_tensor = [gt_tp_onehot(6), gt_nuc_mask(1)]，共 7 通道
-            # gt_tp_onehot 由 build_gt_sem_tensor 内部用 F.one_hot 生成
             sem_tensor = None
             if semantic_on and (gt_label_map is not None) and (gt_nuc_mask is not None):
                 sem_tensor = build_gt_sem_tensor(
@@ -386,8 +371,8 @@ def train(
 
             # ── 损失计算 ───────────────────────────────────────────
             if loss_fn is not None:
-                if semantic_on and (gt_label_map is not None):
-                    # Stage 2：GT mask 驱动的完整语义损失
+                if semantic_on and (gt_nuc_mask is not None):
+                    # Stage 2：CellViT 双侧语义损失
                     total_loss, bd = loss_fn(
                         noise_pred   = noise_pred,
                         noise        = noise,
@@ -395,18 +380,22 @@ def train(
                         hr           = hr,
                         t            = timesteps,
                         gt_nuc_mask  = gt_nuc_mask.to(device),
-                        gt_label_map = gt_label_map.to(device),
+                        gt_label_map = (gt_label_map.to(device)
+                                        if gt_label_map is not None
+                                        else torch.zeros(bs, hr.shape[2], hr.shape[3],
+                                                         device=device, dtype=torch.long)),
                         lambda_sem   = lambda_sem * sem_scale,
                         semantic_on  = True,
                     )
                 else:
-                    # Stage 1 / Stage 3：仅主干损失（semantic_on=False）
+                    # Stage 1：仅主干损失
                     _dummy_nuc = (gt_nuc_mask.to(device)
                                   if gt_nuc_mask is not None
                                   else torch.zeros(bs, hr.shape[2], hr.shape[3], device=device))
                     _dummy_lbl = (gt_label_map.to(device)
                                   if gt_label_map is not None
-                                  else torch.zeros(bs, hr.shape[2], hr.shape[3], device=device, dtype=torch.long))
+                                  else torch.zeros(bs, hr.shape[2], hr.shape[3],
+                                                   device=device, dtype=torch.long))
                     total_loss, bd = loss_fn(
                         noise_pred   = noise_pred,
                         noise        = noise,
@@ -419,7 +408,7 @@ def train(
                         semantic_on  = False,
                     )
             else:
-                # 无 HoVer-Net 的纯重建回退分支
+                # 无 CellViT 的纯重建回退分支
                 x0_hat  = predict_x0_from_noise_shared(noisy_hr, noise_pred, timesteps, scheduler)
                 l_noise = F.mse_loss(noise_pred, noise)
                 l_rec   = F.l1_loss(x0_hat, hr)
@@ -515,6 +504,9 @@ def train(
                         cls_pred_lr=result.get('cls_pred_lr'),
                         conf_pred_lr=result.get('conf_pred_lr'),
                         nuc_mask_pred_lr=result.get('nuc_mask_pred_lr'),
+                        cls_hr=result.get('cls_hr'),
+                        conf_hr=result.get('conf_hr'),
+                        nuc_mask_hr=result.get('nuc_mask_hr'),
                     )
                     if logger and grid is not None:
                         logger.log_images('Validation/SR_Comparison',
@@ -550,22 +542,21 @@ def train(
             csv.writer(f).writerow([
                 epoch + 1, stage_name,
                 avg['total'], avg['noise'], avg['rec'], avg['grad'],
-                avg['sem'], avg['tv'],
-                avg_sem_cls,
+                avg['sem'], avg['tv'], avg_sem_cls,
                 avg_sem_mae, avg_dir_acc, sem_scale_log,
             ])
 
         # ── 定量验证（PanNuke val fold）──────────────────────────
         if val_dl is not None:
             unet.eval()
-            v_psnr = v_ssim = v_l1 = v_art = v_sem_mae = 0.0
+            v_psnr = v_ssim = v_l1 = v_art = v_sem_mae = v_dir_acc = 0.0
             v_n = 0
 
             with torch.no_grad():
                 for vb in val_dl:
-                    vhr    = vb['hr'].to(device)
-                    vlr    = vb['lr'].to(device)
-                    vbs    = vhr.shape[0]
+                    vhr  = vb['hr'].to(device)
+                    vlr  = vb['lr'].to(device)
+                    vbs  = vhr.shape[0]
 
                     vnoise    = torch.randn_like(vhr)
                     vts       = torch.randint(0, t_max, (vbs,), device=device).long()
@@ -580,27 +571,30 @@ def train(
                     v_l1   += F.l1_loss(vx0, vhr).item()
                     v_art  += compute_artifact_penalty(vx0, vhr)
 
-                    # 语义 MAE：pred_prob vs GT one-hot（由 gt_label_map 按需生成）
+                    # 语义验证：CellViT(pred) vs CellViT(HR) 一致率
                     if loss_fn is not None and semantic_on:
-                        vgt_lbl = vb.get('gt_label_map')
                         vgt_nuc = vb.get('gt_nuc_mask')
-                        if vgt_lbl is not None and vgt_nuc is not None:
-                            vgt_lbl = vgt_lbl.to(device)
+                        if vgt_nuc is not None:
                             vgt_nuc = vgt_nuc.to(device)
                             valid_mask = (vgt_nuc > loss_fn.tau_nuc).float()
                             denom      = valid_mask.sum().clamp(min=1.0)
 
-                            pred_out  = loss_fn._run_hovernet(vx0)
-                            pred_prob = pred_out['tp_prob']   # [B, 6, H, W]
-                            H, W      = vhr.shape[2], vhr.shape[3]
-                            if pred_prob.shape[-2:] != (H, W):
-                                pred_prob = F.interpolate(
-                                    pred_prob, size=(H, W), mode='bilinear', align_corners=False
-                                )
-                            # GT one-hot 按需生成，不存储
-                            vgt_onehot = F.one_hot(vgt_lbl.long(), num_classes=6) \
-                                          .permute(0, 3, 1, 2).float()
-                            mae_map   = (pred_prob - vgt_onehot).abs().mean(dim=1)
+                            from semantic_sr_loss import run_cellvit
+                            # pred侧
+                            pred_out  = run_cellvit(loss_fn.cellvit, vx0)
+                            pred_prob = pred_out['nuclei_type_prob']   # [B,6,H,W]
+                            pred_lbl  = pred_out['nuclei_type_label']  # [B,H,W]
+                            # HR侧（伪标签）
+                            hr_out   = run_cellvit(loss_fn.cellvit, vhr)
+                            hr_prob  = hr_out['nuclei_type_prob']
+                            hr_lbl   = hr_out['nuclei_type_label']
+
+                            # dir_acc：pred和HR伪标签的一致率
+                            da = ((pred_lbl == hr_lbl).float() * valid_mask).sum() / denom
+                            v_dir_acc += da.item()
+
+                            # sem_mae：pred_prob和hr_prob的MAE
+                            mae_map = (pred_prob - hr_prob).abs().mean(dim=1)
                             v_sem_mae += ((mae_map * valid_mask).sum() / denom).item()
 
                     v_n += 1
@@ -611,6 +605,7 @@ def train(
                 vl  = v_l1    / v_n
                 va  = v_art   / v_n
                 vsm = v_sem_mae / v_n if semantic_on else -1.0
+                vda = v_dir_acc / v_n if semantic_on else -1.0
 
                 comp = compute_composite_score(
                     psnr=vp, ssim=vs,
@@ -620,13 +615,15 @@ def train(
 
                 print(f"  [Val] PSNR={vp:.2f}dB  SSIM={vs:.4f}  "
                       f"L1={vl:.4f}  ArtifactRatio={va:.3f}")
-                print(f"  [Val] Semantic_MAE={vsm:.4f}  Composite={comp:.4f}")
+                print(f"  [Val] Semantic_MAE={vsm:.4f}  Dir_Acc={vda:.4f}  "
+                      f"Composite={comp:.4f}")
 
                 if logger:
                     logger.log_metrics(dict(
                         PSNR=vp, SSIM=vs, L1=vl,
                         Artifact_Penalty=va,
                         Semantic_MAE=vsm,
+                        Dir_Acc=vda,
                         Composite_Score=comp,
                     ), step=epoch + 1, prefix='Val')
 
@@ -639,6 +636,7 @@ def train(
                         optimizer_state_dict=optimizer.state_dict(),
                         val_psnr=vp, val_ssim=vs,
                         val_semantic_mae=vsm,
+                        val_dir_acc=vda,
                         val_composite=comp,
                     ), best_path)
                     print(f"  🔥 New best model saved → {best_path}  "
@@ -681,7 +679,7 @@ def _add_bool_mutex(parser, dest: str, default: bool, opt_name: str, help_on: st
 
 def main():
     cfg = get_default_config()
-    p = argparse.ArgumentParser(description='SPM-UNet 语义引导 SR DDPM 训练（GT mask 驱动）')
+    p = argparse.ArgumentParser(description='SPM-UNet 语义引导 SR DDPM 训练（CellViT 双侧推理版）')
     p.add_argument('--dataset_type', type=str, default=getattr(cfg, 'dataset_type', 'pannuke'),
                    choices=['nct', 'pannuke'])
     p.add_argument('--tum_dir',  default=getattr(cfg, 'tum_dir', None))
@@ -690,10 +688,12 @@ def main():
     p.add_argument('--pannuke_train_fold_dir',  default=getattr(cfg, 'pannuke_train_fold_dir', None))
     p.add_argument('--pannuke_val_fold_dir',    default=getattr(cfg, 'pannuke_val_fold_dir', None))
     p.add_argument('--pannuke_test_fold_dir',   default=getattr(cfg, 'pannuke_test_fold_dir', None))
-    p.add_argument('--hovernet_path',           default=cfg.hovernet_path)
-    p.add_argument('--hovernet_upsample_factor', type=float,
-                   default=getattr(cfg, "hovernet_upsample_factor", 1.0),
-                   help='对 x0_hat 跑 HoVer-Net 前的上采样倍率（pred 侧；PanNuke 256 通常为 1.0）')
+    p.add_argument('--cellvit_path',
+                   default=cfg.cellvit_path,
+                   help='CellViT 权重文件路径')
+    p.add_argument('--cellvit_repo',
+                   default=cfg.cellvit_repo,
+                   help='CellViT 代码仓库根目录')
     p.add_argument('--epochs',     type=int,   default=cfg.epochs)
     p.add_argument('--batch_size', type=int,   default=cfg.batch_size)
     p.add_argument('--lr',         type=float, default=cfg.lr)
@@ -707,18 +707,17 @@ def main():
     p.add_argument('--lambda_sem',   type=float, default=cfg.lambda_sem)
     p.add_argument('--lambda_tv',    type=float, default=cfg.lambda_tv)
     # Semantic
-    p.add_argument('--tau_nuc',            type=float, default=cfg.tau_nuc)
-    p.add_argument('--lambda_sem_cls',     type=float, default=cfg.lambda_sem_cls)
-    p.add_argument('--semantic_start_epoch',   type=int, default=cfg.semantic_start_epoch)
-    p.add_argument('--semantic_end_epoch',     type=int, default=cfg.semantic_end_epoch)
-    p.add_argument('--semantic_warmup_epochs', type=int, default=cfg.semantic_warmup_epochs)
+    p.add_argument('--tau_nuc',                type=float, default=cfg.tau_nuc)
+    p.add_argument('--lambda_sem_cls',         type=float, default=cfg.lambda_sem_cls)
+    p.add_argument('--semantic_start_epoch',   type=int,   default=cfg.semantic_start_epoch)
+    p.add_argument('--semantic_warmup_epochs', type=int,   default=cfg.semantic_warmup_epochs)
     # Degradation
-    p.add_argument('--scale', type=int, default=cfg.scale)
-    p.add_argument('--blur_sigma_range',  type=float, nargs=2, metavar=('MIN', 'MAX'),
-                   default=list(cfg.blur_sigma_range))
-    p.add_argument('--noise_std_range',   type=float, nargs=2, metavar=('MIN', 'MAX'),
-                   default=list(cfg.noise_std_range))
-    p.add_argument('--stain_jitter',      type=float, default=cfg.stain_jitter)
+    p.add_argument('--scale',              type=int,   default=cfg.scale)
+    p.add_argument('--blur_sigma_range',   type=float, nargs=2,
+                   metavar=('MIN', 'MAX'), default=list(cfg.blur_sigma_range))
+    p.add_argument('--noise_std_range',    type=float, nargs=2,
+                   metavar=('MIN', 'MAX'), default=list(cfg.noise_std_range))
+    p.add_argument('--stain_jitter',       type=float, default=cfg.stain_jitter)
     # Optimizer & DataLoader
     p.add_argument('--weight_decay',   type=float, default=cfg.weight_decay)
     p.add_argument('--max_grad_norm',  type=float, default=cfg.max_grad_norm)
@@ -734,13 +733,16 @@ def main():
     p.add_argument('--exp_name',           default=None)
     p.add_argument('--val_vis_dir',        default=cfg.val_vis_dir)
     p.add_argument('--t_max',             type=int, default=cfg.t_max)
+    p.add_argument('--num_train_timesteps', type=int, default=cfg.num_train_timesteps)
+    _ts_default = cfg.target_size if cfg.target_size is not None else 256
+    p.add_argument('--target_size',       type=int, default=_ts_default)
     p.add_argument('--create_semantic_branch', action='store_true')
 
     args = p.parse_args()
     print_gpu_info()
 
     if args.exp_name is None:
-        args.exp_name = 'SR_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.exp_name = 'SR_CellViT_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 
     logger = ExperimentLogger(
         use_tensorboard=not args.no_tb,
@@ -751,12 +753,16 @@ def main():
     device = (get_device(gpu_id=args.gpu_id) if args.gpu_id is not None
               else args.device or get_device())
 
-    hovernet = None
-    if args.hovernet_path:
-        hovernet = load_hovernet(args.hovernet_path, device=device)
+    cellvit = None
+    if args.cellvit_path:
+        cellvit = load_cellvit(
+            model_path=args.cellvit_path,
+            cellvit_repo_path=args.cellvit_repo,
+            device=device,
+        )
 
     train(
-        hovernet=hovernet,
+        cellvit=cellvit,
         dataset_type=args.dataset_type,
         tum_dir=args.tum_dir, norm_dir=args.norm_dir,
         pannuke_root=args.pannuke_root,
@@ -771,13 +777,11 @@ def main():
         tau_nuc=args.tau_nuc,
         lambda_sem_cls=args.lambda_sem_cls,
         semantic_start_epoch=args.semantic_start_epoch,
-        semantic_end_epoch=args.semantic_end_epoch,
         semantic_warmup_epochs=args.semantic_warmup_epochs,
         scale=args.scale,
         blur_sigma_range=tuple(args.blur_sigma_range),
         noise_std_range=tuple(args.noise_std_range),
         stain_jitter=args.stain_jitter,
-        hovernet_upsample_factor=args.hovernet_upsample_factor,
         accumulation_steps=args.accumulation_steps,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
@@ -786,8 +790,10 @@ def main():
         oversample=args.oversample,
         train_drop_last=args.train_drop_last,
         resume_path=args.resume_path,
-        logger=logger, val_vis_dir=args.val_vis_dir,
+        logger=logger,         val_vis_dir=args.val_vis_dir,
         t_max=args.t_max,
+        num_train_timesteps=args.num_train_timesteps,
+        target_size=args.target_size,
         create_semantic_branch=args.create_semantic_branch,
     )
 
