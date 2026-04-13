@@ -29,7 +29,7 @@ import datetime
 from typing import Optional
 from tqdm import tqdm
 
-from ddpm_dataset import build_dataset
+from ddpm_dataset import build_dataset, PanNukeDataset, split_train_val
 from unet_wrapper import create_model, count_parameters
 from semantic_sr_loss import (SemanticSRLoss, build_sem_tensor_from_cellvit,
                                run_cellvit)
@@ -54,9 +54,10 @@ def train(
     tum_dir                = _DEFAULT_CFG.tum_dir,
     norm_dir               = _DEFAULT_CFG.norm_dir,
     pannuke_root           = _DEFAULT_CFG.pannuke_root,
-    pannuke_train_fold_dir = _DEFAULT_CFG.pannuke_train_fold_dir,
-    pannuke_val_fold_dir   = _DEFAULT_CFG.pannuke_val_fold_dir,
+    pannuke_fold_dirs      = None,    # 训练折列表，如 [Fold1, Fold2]
     pannuke_test_fold_dir  = _DEFAULT_CFG.pannuke_test_fold_dir,
+    n_val                  = 100,     # 分层抽样验证集数量
+    val_seed               = 42,      # 验证集抽样随机种子
     epochs                 = _DEFAULT_CFG.epochs,
     batch_size             = _DEFAULT_CFG.batch_size,
     lr                     = _DEFAULT_CFG.lr,
@@ -183,28 +184,34 @@ def train(
     val_dl = None
 
     if dataset_type == 'pannuke':
-        if pannuke_train_fold_dir is None and pannuke_root is None:
-            raise ValueError('请提供 pannuke_train_fold_dir 或 pannuke_root。')
+        if not pannuke_fold_dirs and pannuke_root is None:
+            raise ValueError('请提供 --pannuke_fold_dirs 或 --pannuke_root。')
 
-        dataset = build_dataset(
-            dataset_type  = 'pannuke',
-            pannuke_root  = None if pannuke_train_fold_dir else pannuke_root,
-            pannuke_folds = [pannuke_train_fold_dir] if pannuke_train_fold_dir else None,
-            target_size   = target_size,
+        # 加载全部训练折（如 Fold1 + Fold2）
+        full_dataset = PanNukeDataset(
+            fold_dirs   = pannuke_fold_dirs,
+            root_dir    = pannuke_root if not pannuke_fold_dirs else None,
+            target_size = target_size,
+            verbose     = True,
         )
-        if pannuke_val_fold_dir:
-            val_ds = build_dataset(
-                dataset_type  = 'pannuke',
-                pannuke_folds = [pannuke_val_fold_dir],
-                target_size   = target_size,
-            )
-            val_dl = DataLoader(
-                val_ds, batch_size=batch_size, shuffle=False,
-                num_workers=num_workers, pin_memory=_pin, drop_last=False,
-            )
-            print(f"验证集：{len(val_ds)} patch | fold={pannuke_val_fold_dir}")
-        else:
-            print('⚠️  未提供 pannuke_val_fold_dir，跳过定量验证。')
+
+        # 分层抽样：从合并数据中抽出验证集，其余作为训练集
+        train_ds, val_ds = split_train_val(
+            dataset = full_dataset,
+            n_val   = n_val,
+            seed    = val_seed,
+            verbose = True,
+        )
+
+        val_dl = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=_pin, drop_last=False,
+        )
+        print(f"训练集：{len(train_ds)} 张  验证集：{len(val_ds)} 张  "
+              f"（分层抽样，seed={val_seed}）")
+
+        dataset = train_ds   # 后续 dataloader 用 train_ds
+
     else:
         dataset = build_dataset(
             dataset_type = 'nct',
@@ -216,7 +223,7 @@ def train(
         dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=_pin, drop_last=train_drop_last,
     )
-    print(f"训练集：{len(dataset)} 张，共 {epochs} 个 epoch")
+    print(f"训练集共 {len(dataset)} 张，共 {epochs} 个 epoch")
 
     # ── 训练循环 ─────────────────────────────────────────────────────
     global_step = 0
@@ -587,10 +594,15 @@ def main():
                    choices=['nct', 'pannuke'])
     p.add_argument('--tum_dir',  default=cfg.tum_dir)
     p.add_argument('--norm_dir', default=cfg.norm_dir)
-    p.add_argument('--pannuke_root',            default=cfg.pannuke_root)
-    p.add_argument('--pannuke_train_fold_dir',  default=cfg.pannuke_train_fold_dir)
-    p.add_argument('--pannuke_val_fold_dir',    default=cfg.pannuke_val_fold_dir)
-    p.add_argument('--pannuke_test_fold_dir',   default=cfg.pannuke_test_fold_dir)
+    p.add_argument('--pannuke_root',       default=cfg.pannuke_root)
+    p.add_argument('--pannuke_fold_dirs',  nargs='+', default=None,
+                   metavar='FOLD_DIR',
+                   help='训练用的折目录列表，如 Fold1 Fold2（支持多个）')
+    p.add_argument('--pannuke_test_fold_dir', default=cfg.pannuke_test_fold_dir)
+    p.add_argument('--n_val',   type=int, default=100,
+                   help='从训练数据中分层抽取的验证集样本数（默认100）')
+    p.add_argument('--val_seed', type=int, default=42,
+                   help='验证集抽样随机种子（保证可复现，默认42）')
     p.add_argument('--cellvit_path', default=cfg.cellvit_path)
     p.add_argument('--cellvit_repo', default=cfg.cellvit_repo)
     p.add_argument('--epochs',       type=int,   default=cfg.epochs)
@@ -660,9 +672,10 @@ def main():
         tum_dir                = args.tum_dir,
         norm_dir               = args.norm_dir,
         pannuke_root           = args.pannuke_root,
-        pannuke_train_fold_dir = args.pannuke_train_fold_dir,
-        pannuke_val_fold_dir   = args.pannuke_val_fold_dir,
+        pannuke_fold_dirs      = args.pannuke_fold_dirs,
         pannuke_test_fold_dir  = args.pannuke_test_fold_dir,
+        n_val                  = args.n_val,
+        val_seed               = args.val_seed,
         epochs                 = args.epochs,
         batch_size             = args.batch_size,
         lr                     = args.lr,

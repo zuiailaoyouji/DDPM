@@ -7,36 +7,32 @@ PanNuke 数据集读取（判别器标签纠正任务版）。
 - 去掉 LR 字段：任务不再需要超分，推理时直接输入 HR
 - 去掉 degradation 调用：不做任何图像退化或颜色增广
 - 保留 GT label_map 和 nuc_mask：用于训练时的交集监督
-- NCTDataset 保留以兼容旧代码，但不推荐使用
+- 新增 split_train_val()：从合并的多折数据中按 tissue type 分层抽样，
+  保证验证集每种类别都有代表，抽出的样本从训练集中剔除
+- NCTDataset 保留以兼容旧代码
 """
 
 import os
 import cv2
 import random
-from typing import List, Optional, Sequence, Tuple
+import math
+from typing import List, Optional, Sequence, Tuple, Dict
+from collections import defaultdict
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 
 
 _VALID_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 _PANNUKE_REQUIRED_FILES = ("images.npy", "types.npy", "masks.npy")
 
 
-def _find_pannuke_fold_files(folder: str) -> Optional[Tuple[str, str, str]]:
-    """
-    在给定目录下递归查找 PanNuke fold 对应的 npy 文件。
+# ─────────────────────────────────────────────────────────────────────────────
+# 折目录查找工具
+# ─────────────────────────────────────────────────────────────────────────────
 
-    兼容两类结构：
-    1) 规整结构：
-       Fold 1/
-         images.npy / types.npy / masks.npy
-    2) 嵌套结构：
-       Fold 1/images/fold1/images.npy
-       Fold 1/images/fold1/types.npy
-       Fold 1/masks/fold1/masks.npy
-    """
+def _find_pannuke_fold_files(folder: str) -> Optional[Tuple[str, str, str]]:
     if not folder or not os.path.isdir(folder):
         return None
 
@@ -58,11 +54,11 @@ def _find_pannuke_fold_files(folder: str) -> Optional[Tuple[str, str, str]]:
         img_dir  = os.path.dirname(img_p)
         type_dir = os.path.dirname(type_p)
         mask_dir = os.path.dirname(mask_p)
-        same_img_type   = 0 if img_dir == type_dir else 1
+        same_img_type    = 0 if img_dir == type_dir else 1
         has_images_token = 0 if "images" in img_dir.lower() else 1
         has_masks_token  = 0 if "masks"  in mask_dir.lower() else 1
-        common_all      = os.path.commonpath([img_p, type_p, mask_p])
-        common_img_type = os.path.commonpath([img_p, type_p])
+        common_all       = os.path.commonpath([img_p, type_p, mask_p])
+        common_img_type  = os.path.commonpath([img_p, type_p])
         return (same_img_type,
                 has_images_token + has_masks_token,
                 -len(common_all),
@@ -107,7 +103,7 @@ def _normalize_fold_dirs(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PanNuke masks.npy → 语义空间转换
+# PanNuke masks → 语义空间
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pannuke_mask_to_semantic(
@@ -117,22 +113,13 @@ def pannuke_mask_to_semantic(
     """
     将 PanNuke masks.npy 单个样本转换为像素级标签图与核掩膜。
 
-    PanNuke masks 格式：(H, W, 6) 或 (H, W, 5)
-      ch 0: Neoplastic   → class 1
-      ch 1: Inflammatory → class 2
-      ch 2: Connective   → class 3
-      ch 3: Dead         → class 4
-      ch 4: Epithelial   → class 5
-      ch 5: 背景通道（若存在），忽略
-
     返回：
-      label_map : [H, W] int32  0=背景, 1-5=细胞类型
-      nuc_mask  : [H, W] float32  有核像素为 1.0
+      label_map : [H, W] int32   0=背景, 1-5=细胞类型
+      nuc_mask  : [H, W] float32 有核像素为 1.0
     """
     m = np.asarray(mask)
     if m.ndim != 3:
         raise ValueError(f"PanNuke mask 期望 3 维，得到 shape={m.shape}")
-
     if m.shape[0] in (5, 6) and m.shape[-1] not in (5, 6):
         m = np.transpose(m, (1, 2, 0))
 
@@ -165,19 +152,138 @@ def pannuke_mask_to_semantic(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PanNukeDataset（主数据集，判别器标签纠正任务版）
+# 分层抽样工具
+# ─────────────────────────────────────────────────────────────────────────────
+
+def split_train_val(
+    dataset: 'PanNukeDataset',
+    n_val:   int  = 100,
+    seed:    int  = 42,
+    verbose: bool = True,
+) -> Tuple[Subset, Subset]:
+    """
+    从 PanNukeDataset 中按 tissue type 分层抽样 n_val 张作为验证集，
+    其余作为训练集。验证集样本从训练集中剔除。
+
+    分层策略：
+      1. 统计每种 tissue type 的样本数
+      2. 每种 type 按比例分配验证集数量，至少分配 1 张
+      3. 若某类样本数不足，取该类全部样本
+      4. 总数凑到 n_val（从样本最多的类中补充或裁剪）
+
+    Args:
+        dataset : PanNukeDataset 实例（包含全部折数据）
+        n_val   : 验证集总样本数
+        seed    : 随机种子，保证可复现
+        verbose : 是否打印分层信息
+
+    Returns:
+        train_subset : Subset（训练集，已剔除验证集样本）
+        val_subset   : Subset（验证集）
+    """
+    rng = random.Random(seed)
+    n_total = len(dataset)
+
+    # ── 1. 按 tissue type 分组，收集每组的全局索引 ──────────────────
+    type_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for global_idx in range(n_total):
+        fold_id, local_idx = dataset.index[global_idx]
+        type_arr  = np.asarray(dataset.types[fold_id][local_idx])
+        type_name = dataset._normalize_type_name(type_arr)
+        type_to_indices[type_name].append(global_idx)
+
+    all_types   = sorted(type_to_indices.keys())
+    n_types     = len(all_types)
+    n_val_real  = min(n_val, n_total)
+
+    if verbose:
+        print(f"\n分层抽样：共 {n_total} 张，目标验证集 {n_val_real} 张，"
+              f"tissue type 数量 {n_types}")
+
+    # ── 2. 按比例分配验证集数量，每类至少 1 张 ──────────────────────
+    type_counts = {t: len(idxs) for t, idxs in type_to_indices.items()}
+    total_count = sum(type_counts.values())
+
+    # 初始分配（按比例，向下取整，至少 1）
+    alloc: Dict[str, int] = {}
+    for t in all_types:
+        quota = max(1, int(math.floor(n_val_real * type_counts[t] / total_count)))
+        alloc[t] = min(quota, type_counts[t])  # 不超过该类总数
+
+    # ── 3. 调整总数到 n_val_real ─────────────────────────────────────
+    current_total = sum(alloc.values())
+
+    if current_total < n_val_real:
+        # 不足则从样本最多的类中依次补充
+        deficit = n_val_real - current_total
+        sorted_by_remaining = sorted(
+            all_types,
+            key=lambda t: type_counts[t] - alloc[t],
+            reverse=True,
+        )
+        for t in sorted_by_remaining:
+            if deficit <= 0:
+                break
+            can_add = type_counts[t] - alloc[t]
+            add     = min(can_add, deficit)
+            alloc[t] += add
+            deficit  -= add
+
+    elif current_total > n_val_real:
+        # 超出则从样本最多的类中依次裁剪（但每类至少保留 1）
+        surplus = current_total - n_val_real
+        sorted_by_alloc = sorted(
+            all_types,
+            key=lambda t: alloc[t],
+            reverse=True,
+        )
+        for t in sorted_by_alloc:
+            if surplus <= 0:
+                break
+            can_remove = alloc[t] - 1   # 至少保留 1
+            remove     = min(can_remove, surplus)
+            alloc[t]  -= remove
+            surplus   -= remove
+
+    # ── 4. 从每类中随机抽样 ─────────────────────────────────────────
+    val_indices  = []
+    for t in all_types:
+        pool     = list(type_to_indices[t])
+        rng.shuffle(pool)
+        selected = pool[:alloc[t]]
+        val_indices.extend(selected)
+        if verbose:
+            print(f"  {t:<20} total={type_counts[t]:>5}  "
+                  f"val_alloc={alloc[t]:>3}  "
+                  f"train_remain={type_counts[t]-alloc[t]:>5}")
+
+    val_set  = set(val_indices)
+    train_indices = [i for i in range(n_total) if i not in val_set]
+
+    actual_val = len(val_indices)
+    if verbose:
+        print(f"\n实际验证集：{actual_val} 张  训练集：{len(train_indices)} 张")
+        print(f"验证集随机种子：{seed}（固定种子保证可复现）")
+
+    train_subset = Subset(dataset, train_indices)
+    val_subset   = Subset(dataset, val_indices)
+    return train_subset, val_subset
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PanNukeDataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PanNukeDataset(Dataset):
     """
-    PanNuke 数据集。
+    PanNuke 数据集，支持多折合并加载。
 
     返回字段：
-      hr           : [3, H, W] float32 [0,1]  原始 HR 图像（模型唯一图像输入）
-      label        : int  patch 级组织类型标签
-      type_name    : str  patch 级组织类型名称
-      gt_label_map : [H, W] int64  像素级细胞类型（0=bg, 1-5）
-      gt_nuc_mask  : [H, W] float32  核掩膜
+      hr           : [3, H, W] float32 [0,1]
+      label        : int   patch 级组织类型标签
+      type_name    : str   patch 级组织类型名称
+      gt_label_map : [H, W] int64   像素级细胞类型（0=bg, 1-5）
+      gt_nuc_mask  : [H, W] float32 核掩膜
 
     注意：不再返回 lr 字段。
     """
@@ -189,7 +295,7 @@ class PanNukeDataset(Dataset):
         target_size: Optional[int] = 256,
         max_samples: Optional[int] = None,
         verbose:     bool = True,
-        # 以下参数保留接口兼容，但不再使用
+        # 以下参数保留接口兼容，不再使用
         scale:             int   = 4,
         blur_sigma_range:  tuple = (2.0, 3.0),
         noise_std_range:   tuple = (0.03, 0.08),
@@ -318,7 +424,6 @@ class PanNukeDataset(Dataset):
     def __getitem__(self, idx):
         fold_id, local_idx = self.index[idx]
 
-        # ── 图像 ─────────────────────────────────────────────────────
         img      = self._to_hwc3_uint8(self.images[fold_id][local_idx])
         type_arr = np.asarray(self.types[fold_id][local_idx])
 
@@ -333,21 +438,21 @@ class PanNukeDataset(Dataset):
         hr = torch.from_numpy(img).float() / 255.0
         hr = hr.permute(2, 0, 1).contiguous()   # [3, H, W]
 
-        # ── Patch 级标签 ──────────────────────────────────────────────
         label_id, type_name = self._to_patch_label(type_arr)
 
-        # ── 像素级 GT mask ────────────────────────────────────────────
-        raw_mask = np.asarray(self.masks[fold_id][local_idx])
+        raw_mask  = np.asarray(self.masks[fold_id][local_idx])
         target_hw = (self.target_size, self.target_size) \
                     if self.target_size is not None else None
-        gt_label_map, gt_nuc_mask = pannuke_mask_to_semantic(raw_mask, target_hw=target_hw)
+        gt_label_map, gt_nuc_mask = pannuke_mask_to_semantic(
+            raw_mask, target_hw=target_hw
+        )
 
         return {
-            "hr":           hr,                                          # [3, H, W]
+            "hr":           hr,
             "label":        torch.tensor(label_id, dtype=torch.long),
             "type_name":    type_name,
-            "gt_label_map": torch.from_numpy(gt_label_map).long(),      # [H, W]
-            "gt_nuc_mask":  torch.from_numpy(gt_nuc_mask).float(),      # [H, W]
+            "gt_label_map": torch.from_numpy(gt_label_map).long(),
+            "gt_nuc_mask":  torch.from_numpy(gt_nuc_mask).float(),
         }
 
 
@@ -362,16 +467,16 @@ class NCTDataset(Dataset):
         self,
         tum_dir,
         norm_dir,
-        oversample: bool = True,
+        oversample:  bool          = True,
         target_size: Optional[int] = 256,
-        # 以下参数保留接口兼容，不再使用
-        scale: int = 2,
-        blur_sigma_range: tuple = (0.5, 1.5),
-        noise_std_range:  tuple = (0.0, 0.02),
-        stain_jitter:     float = 0.05,
+        scale:             int   = 2,
+        blur_sigma_range:  tuple = (0.5, 1.5),
+        noise_std_range:   tuple = (0.0, 0.02),
+        stain_jitter:      float = 0.05,
     ):
         self.target_size = target_size
-        self.files = []
+        self.files  = []
+        self.labels = []
 
         tum_files = []
         if tum_dir and os.path.exists(tum_dir):
@@ -399,9 +504,10 @@ class NCTDataset(Dataset):
             elif ratio < 0.67:
                 norm_files = norm_files * int(round(1.0 / ratio))
 
-        self.files = tum_files + norm_files
-        self.labels = ([1] * len(tum_files)) + ([0] * len(norm_files))
-        random.shuffle(list(zip(self.files, self.labels)))
+        pairs = list(zip(tum_files + norm_files,
+                         [1] * len(tum_files) + [0] * len(norm_files)))
+        random.shuffle(pairs)
+        self.files, self.labels = zip(*pairs) if pairs else ([], [])
 
     def __len__(self):
         return len(self.files)
@@ -418,10 +524,7 @@ class NCTDataset(Dataset):
                              interpolation=cv2.INTER_LANCZOS4)
         hr = torch.from_numpy(img).float() / 255.0
         hr = hr.permute(2, 0, 1).contiguous()
-        return {
-            "hr":    hr,
-            "label": torch.tensor(label, dtype=torch.long),
-        }
+        return {"hr": hr, "label": torch.tensor(label, dtype=torch.long)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,7 +541,7 @@ def build_dataset(
     pannuke_folds: Optional[Sequence[str]] = None,
     target_size:   Optional[int] = 256,
     max_samples:   Optional[int] = None,
-    # 以下参数保留接口兼容，不再使用
+    # 保留接口兼容，不再使用
     scale:             int   = 4,
     blur_sigma_range:  tuple = (2.0, 3.0),
     noise_std_range:   tuple = (0.03, 0.08),
@@ -448,18 +551,18 @@ def build_dataset(
 
     if dataset_type == "pannuke":
         return PanNukeDataset(
-            fold_dirs=pannuke_folds,
-            root_dir=pannuke_root,
-            target_size=target_size,
-            max_samples=max_samples,
+            fold_dirs   = pannuke_folds,
+            root_dir    = pannuke_root,
+            target_size = target_size,
+            max_samples = max_samples,
         )
 
     if dataset_type == "nct":
         return NCTDataset(
-            tum_dir=tum_dir,
-            norm_dir=norm_dir,
-            oversample=oversample,
-            target_size=target_size,
+            tum_dir     = tum_dir,
+            norm_dir    = norm_dir,
+            oversample  = oversample,
+            target_size = target_size,
         )
 
     raise ValueError(f"Unsupported dataset_type: {dataset_type}")
