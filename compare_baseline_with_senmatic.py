@@ -1,109 +1,100 @@
 """
-compare_baseline_vs_semantic.py
-在相同推理条件下对比：
-  - LR 直接送 CellViT
-  - 纯像素 SR（Stage 1 best，无语义监督）
-  - 语义引导 SR（Stage 2 best）
+compare_baseline_with_semantic.py
+在相同推理条件下对比三组：
+  - HR 基线：HR 直接送 CellViT，不经过任何纠正
+  - 消融模型：无语义监督（只有 L_noise+L_rec+L_grad+L_tv，无 sem_tensor）
+  - 本文方法：交集 Focal-CE + CellViT 软标签 sem_tensor
 
-输出指标：
-  Dir_Acc  : CellViT(pred) vs CellViT(HR) 的类别一致率（GT核区域内）
-  PSNR     : pred vs HR
-  SSIM     : pred vs HR
-  Sem_MAE  : CellViT(pred) 和 CellViT(HR) 概率分布的 MAE
+消融模型和本文方法使用完全相同的超参数，只有语义监督开关不同。
+
+输出指标（均在 GT 核区域内计算）：
+  Dir_Acc       : CellViT(pred) vs GT 的类别一致率
+  Intersect_Acc : 仅在交集区域（GT∩CellViT(HR)判对）的一致率
+  Sem_MAE       : CellViT(pred) 和 CellViT(HR) 概率分布的 MAE
+  PSNR / SSIM   : pred vs HR（衡量图像修改幅度）
 """
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import sys
 sys.path.insert(0, '/home/xuwen/DDPM/CellViT')
 sys.path.insert(0, '/home/xuwen/DDPM')
 
-from models.segmentation.cell_segmentation.cellvit import CellViT256
-from ddpm_dataset import PanNukeDataset
-from degradation import degrade
-from unet_wrapper import create_model
-from ddpm_utils import predict_x0_from_noise_shared
-from metrics import compute_psnr, compute_ssim
 from diffusers import DDPMScheduler
+
+from ddpm_dataset import PanNukeDataset
+from unet_wrapper import create_model
+from ddpm_utils import load_cellvit, predict_x0_from_noise_shared
+from semantic_sr_loss import run_cellvit, build_sem_tensor_from_cellvit
+from metrics import compute_psnr, compute_ssim
 
 device = 'cuda'
 
-# ── CellViT 加载 ────────────────────────────────────────────────────
+# ── CellViT ─────────────────────────────────────────────────────────
 print("加载 CellViT...")
-ckpt_cv = torch.load(
-    '/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth',
-    map_location='cpu',
+cellvit = load_cellvit(
+    model_path        = '/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth',
+    cellvit_repo_path = '/home/xuwen/DDPM/CellViT',
+    device            = device,
 )
-run_conf = ckpt_cv.get('config', {})
-cellvit = CellViT256(
-    model256_path=None,
-    num_nuclei_classes=int(run_conf.get('data.num_nuclei_classes', 6)),
-    num_tissue_classes=int(run_conf.get('data.num_tissue_classes', 19)),
-).to(device)
-cellvit.load_state_dict(ckpt_cv['model_state_dict'], strict=True)
-cellvit.eval()
-for p in cellvit.parameters():
-    p.requires_grad = False
-print("✓ CellViT 加载完成")
 
 
-def run_cellvit(img_01: torch.Tensor):
-    """返回 (type_label [B,H,W], type_prob [B,6,H,W], nuc_prob [B,H,W])"""
-    out       = cellvit(img_01)
-    type_prob = F.softmax(out['nuclei_type_map'], dim=1)   # [B,6,H,W]
-    type_lbl  = type_prob.argmax(dim=1)                    # [B,H,W]
-    return type_lbl, type_prob
-
-
-# ── UNet 加载 ───────────────────────────────────────────────────────
-def load_unet(ckpt_path: str, use_semantic: bool = True):
+# ── UNet ────────────────────────────────────────────────────────────
+def load_unet(ckpt_path: str, use_semantic: bool) -> torch.nn.Module:
     unet = create_model(use_semantic=use_semantic).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
     unet.load_state_dict(ckpt['model_state_dict'])
     unet.eval()
-    epoch = ckpt.get('epoch', '?')
-    psnr  = ckpt.get('val_psnr', '?')
-    print(f"  加载 {ckpt_path}  epoch={epoch}  val_psnr={psnr}")
+    print(f"  加载 {ckpt_path}  epoch={ckpt.get('epoch', '?')}  "
+          f"use_semantic={use_semantic}")
     return unet
 
 
 print("\n加载 UNet 模型...")
-# Stage 1 best（纯像素基线，无语义监督）
-unet_baseline = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_cellvit/unet_sr_epoch_20.pth",
-    use_semantic=True,
+unet_ablation = load_unet(
+    "/home/xuwen/DDPM/logs/checkpoints_correction/best_unet_ablation.pth",
+    use_semantic=False,
 )
-# 语义监督 best
-unet_semantic = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_cellvit/unet_sr_epoch_180.pth",
+unet_full = load_unet(
+    "/home/xuwen/DDPM/logs/checkpoints_correction/best_unet_correction.pth",
     use_semantic=True,
 )
 
 # ── 调度器与数据集 ──────────────────────────────────────────────────
 scheduler = DDPMScheduler(num_train_timesteps=1000)
-
-dataset = PanNukeDataset(
-    fold_dirs=['/data/xuwen/PanNuke/Fold 3'],
-    target_size=256,
+dataset   = PanNukeDataset(
+    fold_dirs   = ['/data/xuwen/PanNuke/Fold 3'],
+    target_size = 256,
 )
-print(f"\n验证集大小: {len(dataset)} 张")
+print(f"\n测试集大小: {len(dataset)} 张")
 
-# ── 固定推理参数 ────────────────────────────────────────────────────
-FIXED_T   = 50      # 固定时间步，保证两个模型推理条件一致
-N_SAMPLES = 200     # 评估样本数（建议至少100）
+INFER_T   = 100
+N_SAMPLES = 200
 torch.manual_seed(42)
 
-# ── 结果容器 ────────────────────────────────────────────────────────
-keys = ['lr', 'baseline', 'semantic']
-dir_acc  = {k: [] for k in keys}
-sem_mae  = {k: [] for k in keys}
-psnr_d   = {k: [] for k in ['baseline', 'semantic']}
-ssim_d   = {k: [] for k in ['baseline', 'semantic']}
 
-print(f"\n开始评估（固定 t={FIXED_T}，样本数={N_SAMPLES}）...")
-print(f"{'idx':>4}  {'LR_acc':>7}  {'BL_acc':>7}  {'SM_acc':>7}  "
-      f"{'BL_PSNR':>8}  {'SM_PSNR':>8}")
+def infer_once(unet, hr, sem=None):
+    """单步推理，返回纠正后图像 x0。"""
+    noise    = torch.randn_like(hr)
+    t        = torch.tensor([INFER_T], device=device)
+    noisy_hr = scheduler.add_noise(hr, noise, t)
+    with torch.no_grad():
+        noise_pred = unet(torch.cat([hr, noisy_hr], dim=1),
+                          t, semantic=sem).sample
+    return predict_x0_from_noise_shared(noisy_hr, noise_pred, t, scheduler)
+
+
+# ── 结果容器 ────────────────────────────────────────────────────────
+keys      = ['hr', 'ablation', 'full']
+dir_acc   = {k: [] for k in keys}
+inter_acc = {k: [] for k in keys}
+sem_mae   = {k: [] for k in ['ablation', 'full']}
+psnr_d    = {k: [] for k in ['ablation', 'full']}
+ssim_d    = {k: [] for k in ['ablation', 'full']}
+
+print(f"\n开始评估（INFER_T={INFER_T}，样本数={N_SAMPLES}）...")
+print(f"{'idx':>4}  {'HR_acc':>8}  {'Abl_acc':>9}  {'Full_acc':>9}  "
+      f"{'Abl_PSNR':>10}  {'Full_PSNR':>10}")
 
 n_valid = 0
 for i in range(len(dataset)):
@@ -111,113 +102,114 @@ for i in range(len(dataset)):
         break
 
     sample  = dataset[i]
-    hr_cpu  = sample['hr']                    # [3,256,256]
-    gt_nuc  = sample['gt_nuc_mask'].bool()    # [256,256]
+    hr_cpu  = sample['hr']
+    gt_lbl  = sample['gt_label_map']
+    gt_nuc  = sample['gt_nuc_mask'].bool()
 
     if gt_nuc.sum() < 10:
         continue
 
-    hr = hr_cpu.unsqueeze(0).to(device)       # [1,3,256,256]
-
-    # 退化生成 LR（与训练时完全相同的参数）
-    lr_cpu = degrade(
-        hr_cpu,
-        scale=4,
-        blur_sigma_range=(2.0, 3.0),
-        noise_std_range=(0.03, 0.08),
-        stain_jitter_strength=0.15,
-    )
-    lr = lr_cpu.unsqueeze(0).to(device)       # [1,3,256,256]
-
-    # 固定噪声和时间步
-    noise    = torch.randn_like(hr)
-    t        = torch.tensor([FIXED_T], device=device)
-    noisy_hr = scheduler.add_noise(hr, noise, t)
+    hr = hr_cpu.unsqueeze(0).to(device)
 
     with torch.no_grad():
-        # ── CellViT(HR) 伪标签 ─────────────────────────────────────
-        hr_lbl, hr_prob = run_cellvit(hr)
-        hr_lbl_cpu = hr_lbl.squeeze(0).cpu()   # [256,256]
+        # CellViT(HR)：评估基准 + 完整模型的 sem_tensor
+        hr_cv   = run_cellvit(cellvit, hr)
+        hr_lbl  = hr_cv['nuclei_type_label'].squeeze(0).cpu()
+        hr_prob = hr_cv['nuclei_type_prob']
 
-        # ── CellViT(LR) ───────────────────────────────────────────
-        lr_lbl, lr_prob = run_cellvit(lr)
-        lr_lbl_cpu = lr_lbl.squeeze(0).cpu()
+        sem = build_sem_tensor_from_cellvit(
+            hr_cv['nuclei_type_prob'],
+            hr_cv['nuclei_nuc_prob'],
+        )
 
-        # ── 基线 SR ────────────────────────────────────────────────
-        inp_b  = torch.cat([lr, noisy_hr], dim=1)
-        np_b   = unet_baseline(inp_b, t).sample
-        x0_b   = predict_x0_from_noise_shared(noisy_hr, np_b, t, scheduler)
-        bl_lbl, bl_prob = run_cellvit(x0_b)
-        bl_lbl_cpu = bl_lbl.squeeze(0).cpu()
+        # 消融模型：无 sem_tensor
+        x0_abl  = infer_once(unet_ablation, hr, sem=None)
+        abl_cv  = run_cellvit(cellvit, x0_abl)
+        abl_lbl = abl_cv['nuclei_type_label'].squeeze(0).cpu()
 
-        # ── 语义 SR ────────────────────────────────────────────────
-        inp_s  = torch.cat([lr, noisy_hr], dim=1)
-        np_s   = unet_semantic(inp_s, t).sample
-        x0_s   = predict_x0_from_noise_shared(noisy_hr, np_s, t, scheduler)
-        sm_lbl, sm_prob = run_cellvit(x0_s)
-        sm_lbl_cpu = sm_lbl.squeeze(0).cpu()
+        # 完整模型：有 sem_tensor
+        x0_full  = infer_once(unet_full, hr, sem=sem)
+        full_cv  = run_cellvit(cellvit, x0_full)
+        full_lbl = full_cv['nuclei_type_label'].squeeze(0).cpu()
 
-    # ── 计算指标 ───────────────────────────────────────────────────
-    def cls_acc(pred_lbl, ref_lbl, mask):
-        return (pred_lbl[mask] == ref_lbl[mask]).float().mean().item()
+    gt_np     = gt_lbl.numpy()
+    gt_nuc_np = gt_nuc.numpy()
+    hr_np     = hr_lbl.numpy()
 
-    def prob_mae(pred_prob, ref_prob, mask):
-        # pred_prob: [1,6,H,W], ref_prob: [1,6,H,W]
-        mae_map = (pred_prob.squeeze(0) - ref_prob.squeeze(0)).abs().mean(dim=0)  # [H,W]
-        return mae_map[mask].mean().item()
+    cell_mask  = gt_nuc_np & (gt_np > 0)
+    inter_mask = cell_mask & (hr_np == gt_np)
 
-    dir_acc['lr'].append(cls_acc(lr_lbl_cpu, hr_lbl_cpu, gt_nuc))
-    dir_acc['baseline'].append(cls_acc(bl_lbl_cpu, hr_lbl_cpu, gt_nuc))
-    dir_acc['semantic'].append(cls_acc(sm_lbl_cpu, hr_lbl_cpu, gt_nuc))
+    def cls_acc(pred_np, mask):
+        if mask.sum() == 0:
+            return float('nan')
+        return (pred_np[mask] == gt_np[mask]).mean()
 
-    sem_mae['lr'].append(prob_mae(lr_prob.cpu(), hr_prob.cpu(), gt_nuc))
-    sem_mae['baseline'].append(prob_mae(bl_prob.cpu(), hr_prob.cpu(), gt_nuc))
-    sem_mae['semantic'].append(prob_mae(sm_prob.cpu(), hr_prob.cpu(), gt_nuc))
+    def prob_mae_fn(pred_prob_gpu, mask):
+        mae = (pred_prob_gpu.cpu() - hr_prob.cpu()).abs().mean(dim=1).squeeze(0).numpy()
+        if mask.sum() == 0:
+            return float('nan')
+        return mae[mask].mean()
 
-    psnr_d['baseline'].append(compute_psnr(x0_b.cpu(), hr.cpu()))
-    psnr_d['semantic'].append(compute_psnr(x0_s.cpu(), hr.cpu()))
-    ssim_d['baseline'].append(compute_ssim(x0_b.cpu(), hr.cpu()))
-    ssim_d['semantic'].append(compute_ssim(x0_s.cpu(), hr.cpu()))
+    dir_acc['hr'].append(cls_acc(hr_np, cell_mask))
+    dir_acc['ablation'].append(cls_acc(abl_lbl.numpy(), cell_mask))
+    dir_acc['full'].append(cls_acc(full_lbl.numpy(), cell_mask))
+
+    inter_acc['hr'].append(cls_acc(hr_np, inter_mask))
+    inter_acc['ablation'].append(cls_acc(abl_lbl.numpy(), inter_mask))
+    inter_acc['full'].append(cls_acc(full_lbl.numpy(), inter_mask))
+
+    sem_mae['ablation'].append(prob_mae_fn(abl_cv['nuclei_type_prob'], gt_nuc_np))
+    sem_mae['full'].append(prob_mae_fn(full_cv['nuclei_type_prob'], gt_nuc_np))
+
+    psnr_d['ablation'].append(compute_psnr(x0_abl.cpu(), hr.cpu()))
+    psnr_d['full'].append(compute_psnr(x0_full.cpu(), hr.cpu()))
+    ssim_d['ablation'].append(compute_ssim(x0_abl.cpu(), hr.cpu()))
+    ssim_d['full'].append(compute_ssim(x0_full.cpu(), hr.cpu()))
 
     if n_valid % 20 == 0:
         print(f"{n_valid:>4}  "
-              f"{dir_acc['lr'][-1]:>7.4f}  "
-              f"{dir_acc['baseline'][-1]:>7.4f}  "
-              f"{dir_acc['semantic'][-1]:>7.4f}  "
-              f"{psnr_d['baseline'][-1]:>8.2f}  "
-              f"{psnr_d['semantic'][-1]:>8.2f}")
-
+              f"{dir_acc['hr'][-1]:>8.4f}  "
+              f"{dir_acc['ablation'][-1]:>9.4f}  "
+              f"{dir_acc['full'][-1]:>9.4f}  "
+              f"{psnr_d['ablation'][-1]:>10.2f}  "
+              f"{psnr_d['full'][-1]:>10.2f}")
     n_valid += 1
 
-# ── 汇总结果 ────────────────────────────────────────────────────────
-print("\n" + "=" * 65)
-print(f"{'指标':<20} {'LR':>10} {'Baseline':>10} {'Semantic':>10}")
-print("-" * 65)
-print(f"{'Dir_Acc (vs HR)':<20} "
-      f"{np.mean(dir_acc['lr']):>10.4f} "
-      f"{np.mean(dir_acc['baseline']):>10.4f} "
-      f"{np.mean(dir_acc['semantic']):>10.4f}")
-print(f"{'Sem_MAE (vs HR)':<20} "
-      f"{np.mean(sem_mae['lr']):>10.4f} "
-      f"{np.mean(sem_mae['baseline']):>10.4f} "
-      f"{np.mean(sem_mae['semantic']):>10.4f}")
-print(f"{'PSNR (dB)':<20} "
-      f"{'—':>10} "
-      f"{np.mean(psnr_d['baseline']):>10.2f} "
-      f"{np.mean(psnr_d['semantic']):>10.2f}")
-print(f"{'SSIM':<20} "
-      f"{'—':>10} "
-      f"{np.mean(ssim_d['baseline']):>10.4f} "
-      f"{np.mean(ssim_d['semantic']):>10.4f}")
-print("=" * 65)
+# ── 汇总 ────────────────────────────────────────────────────────────
+def _mean(lst):
+    vals = [v for v in lst if not (isinstance(v, float) and v != v)]
+    return np.mean(vals) if vals else float('nan')
 
-print(f"\n语义 vs 基线  Dir_Acc 提升: "
-      f"{np.mean(dir_acc['semantic']) - np.mean(dir_acc['baseline']):+.4f}")
-print(f"语义 vs 基线  Sem_MAE 降低: "
-      f"{np.mean(sem_mae['baseline']) - np.mean(sem_mae['semantic']):+.4f}")
-print(f"语义 vs 基线  PSNR   变化: "
-      f"{np.mean(psnr_d['semantic']) - np.mean(psnr_d['baseline']):+.2f} dB")
-print(f"语义 vs 基线  SSIM   变化: "
-      f"{np.mean(ssim_d['semantic']) - np.mean(ssim_d['baseline']):+.4f}")
-print(f"\n语义 vs LR   Dir_Acc 提升: "
-      f"{np.mean(dir_acc['semantic']) - np.mean(dir_acc['lr']):+.4f}")
+print("\n" + "=" * 75)
+print(f"{'指标':<22} {'HR基线':>12} {'消融模型':>12} {'本文方法':>12}")
+print("-" * 75)
+print(f"{'Dir_Acc (vs GT)':<22} "
+      f"{_mean(dir_acc['hr']):>12.4f} "
+      f"{_mean(dir_acc['ablation']):>12.4f} "
+      f"{_mean(dir_acc['full']):>12.4f}")
+print(f"{'Intersect_Acc':<22} "
+      f"{_mean(inter_acc['hr']):>12.4f} "
+      f"{_mean(inter_acc['ablation']):>12.4f} "
+      f"{_mean(inter_acc['full']):>12.4f}")
+print(f"{'Sem_MAE (vs HR prob)':<22} "
+      f"{'0.0000':>12} "
+      f"{_mean(sem_mae['ablation']):>12.4f} "
+      f"{_mean(sem_mae['full']):>12.4f}")
+print(f"{'PSNR (dB)':<22} "
+      f"{'—':>12} "
+      f"{_mean(psnr_d['ablation']):>12.2f} "
+      f"{_mean(psnr_d['full']):>12.2f}")
+print(f"{'SSIM':<22} "
+      f"{'—':>12} "
+      f"{_mean(ssim_d['ablation']):>12.4f} "
+      f"{_mean(ssim_d['full']):>12.4f}")
+print("=" * 75)
+
+print(f"\n本文 vs HR基线   Dir_Acc   提升: "
+      f"{_mean(dir_acc['full']) - _mean(dir_acc['hr']):+.4f}")
+print(f"本文 vs 消融模型 Dir_Acc   提升: "
+      f"{_mean(dir_acc['full']) - _mean(dir_acc['ablation']):+.4f}")
+print(f"本文 vs HR基线   Intersect 提升: "
+      f"{_mean(inter_acc['full']) - _mean(inter_acc['hr']):+.4f}")
+print(f"本文 vs 消融模型 Sem_MAE   降低: "
+      f"{_mean(sem_mae['ablation']) - _mean(sem_mae['full']):+.4f}")
