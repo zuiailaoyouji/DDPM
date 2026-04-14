@@ -153,8 +153,10 @@ class SemanticSRLoss(nn.Module):
 
     # PanNuke 各类别近似像素频率
     # 0:bg   1:Neo  2:Inf   3:Con   4:Dead  5:Epi
+    # Inflammatory 频率从 0.02 调低到 0.01，使其逆频率权重加倍，
+    # 加强对该最难分类别的梯度
     _DEFAULT_CLASS_FREQ = torch.tensor(
-        [0.85, 0.07, 0.02, 0.04, 0.005, 0.015],
+        [0.85, 0.07, 0.01, 0.04, 0.005, 0.015],
         dtype=torch.float32,
     )
 

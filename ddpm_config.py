@@ -68,15 +68,15 @@ class TrainingConfig:
 
     # ── 损失权重 ─────────────────────────────────────────────────────
     lambda_noise: float = 1.0
-    lambda_rec:   float = 3.0    # 像素保真：防止过度修改图像外观
+    lambda_rec:   float = 2.0    # 从3.0降到2.0，给语义损失更多空间
     lambda_grad:  float = 0.8    # 边缘保真：防止模糊
     lambda_sem:   float = 2.0    # 语义纠正：向交集目标靠近
     lambda_tv:    float = 0.0005 # 抑制幻觉伪影
 
     # ── 语义损失参数 ─────────────────────────────────────────────────
     lambda_sem_cls:   float = 1.0
-    correction_boost: float = 2.0   # 纠正候选区额外像素权重
-    focal_gamma:      float = 2.0   # Focal Loss gamma
+    correction_boost: float = 3.0   # 从2.0升到3.0，加强对难纠正区域的梯度
+    focal_gamma:      float = 3.0   # 从2.0升到3.0，加强对难分样本的惩罚
 
     # ── 优化器 ───────────────────────────────────────────────────────
     weight_decay:       float = 0.01

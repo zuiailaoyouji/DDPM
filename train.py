@@ -18,6 +18,7 @@ SPM-UNet 训练循环（判别器标签纠正版，单阶段）。
 两种模式超参数完全一致，只有语义监督开关不同。
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -427,6 +428,8 @@ def train(
         if val_dl is not None and (epoch + 1) % 5 == 0:
             unet.eval()
             vp_l, vs_l, vl_l, va_l, vda_l, vsm_l = [], [], [], [], [], []
+            # overall_acc：整个 GT 核区域内的准确率（正确的模型选择指标）
+            all_gt_val, all_pred_val = [], []
 
             with torch.no_grad():
                 for vb in val_dl:
@@ -462,12 +465,16 @@ def train(
                     # 注意：消融模式训练时无 CellViT，但验证时需要外部传入
                     if cellvit_for_val is not None:
                         vgt_lbl = vb.get('gt_label_map')
-                        if vgt_lbl is not None:
+                        vgt_nuc = vb.get('gt_nuc_mask')
+                        if vgt_lbl is not None and vgt_nuc is not None:
                             vgt_lbl  = vgt_lbl.to(device)
+                            vgt_nuc  = vgt_nuc.to(device).bool()
                             vhr_cv2  = run_cellvit(cellvit_for_val, vhr)
                             vpred_cv = run_cellvit(cellvit_for_val, vx0)
                             hr_lbl   = vhr_cv2['nuclei_type_label']
                             pred_lbl = vpred_cv['nuclei_type_label']
+
+                            # Dir_Acc：交集区域（GT∩CellViT(HR)判对）
                             inter    = (vgt_lbl > 0) & (hr_lbl == vgt_lbl)
                             if inter.sum() > 0:
                                 vda_l.append(
@@ -480,6 +487,18 @@ def train(
                                     .abs().mean(dim=1)[inter].mean().item()
                                 )
 
+                            # Overall_Acc：整个 GT 核区域内（正确的模型选择指标）
+                            cell_mask = vgt_nuc & (vgt_lbl > 0)
+                            for b in range(vhr.shape[0]):
+                                m = cell_mask[b].cpu().numpy()
+                                if m.sum() > 0:
+                                    all_gt_val.append(
+                                        vgt_lbl[b].cpu().numpy()[m]
+                                    )
+                                    all_pred_val.append(
+                                        pred_lbl[b].cpu().numpy()[m]
+                                    )
+
             vp   = sum(vp_l)  / max(len(vp_l),  1)
             vs   = sum(vs_l)  / max(len(vs_l),  1)
             vl   = sum(vl_l)  / max(len(vl_l),  1)
@@ -488,14 +507,26 @@ def train(
             vsm  = sum(vsm_l) / max(len(vsm_l), 1) if vsm_l else -1.0
             comp = compute_composite_score(vp, vs, max(vsm, 0.0), va)
 
+            # Overall_Acc：整个 GT 核区域内的准确率
+            if all_gt_val:
+                gt_cat   = _np.concatenate(all_gt_val)
+                pred_cat = _np.concatenate(all_pred_val)
+                v_overall_acc = float((gt_cat == pred_cat).mean())
+            else:
+                v_overall_acc = -1.0
+
             print(f"  [Val] PSNR={vp:.2f}  SSIM={vs:.4f}  "
                   f"L1={vl:.4f}  Artifact={va:.3f}")
+            if v_overall_acc >= 0:
+                print(f"  [Val] Overall_Acc={v_overall_acc:.4f}")
             if vda >= 0:
                 print(f"  [Val] Dir_Acc(intersect)={vda:.4f}  "
                       f"Sem_MAE(intersect)={vsm:.4f}  Composite={comp:.4f}")
 
             if logger:
                 log_d = dict(PSNR=vp, SSIM=vs, L1=vl, Artifact=va)
+                if v_overall_acc >= 0:
+                    log_d['Overall_Acc'] = v_overall_acc
                 if vda >= 0:
                     log_d.update(dict(
                         Dir_Acc_intersect=vda,
@@ -506,9 +537,10 @@ def train(
                                    prefix=f'Val_{mode_name}')
 
             # ── 模型选择指标 ─────────────────────────────────────────
-            # 两种模式统一用 dir_acc 作为主要指标（公平对比）
-            # 若 dir_acc 不可用（理论上不会发生），回退到 -L1
-            cur_metric = vda if vda >= 0 else -vl
+            # 两种模式统一用 overall_acc 作为主要指标（公平对比）
+            # overall_acc 衡量整个 GT 核区域内的准确率，比 dir_acc 更合理
+            # 回退：若 overall_acc 不可用则用 -L1
+            cur_metric = v_overall_acc if v_overall_acc >= 0 else -vl
             if cur_metric > best_metric:
                 best_metric = cur_metric
                 save_dict = dict(
@@ -518,6 +550,7 @@ def train(
                     val_psnr             = vp,
                     val_ssim             = vs,
                     val_l1               = vl,
+                    val_overall_acc      = v_overall_acc,
                     val_dir_acc          = vda,
                     val_sem_mae          = vsm,
                     val_composite        = comp,
@@ -526,7 +559,7 @@ def train(
                 torch.save(save_dict,
                            os.path.join(save_dir, best_ckpt_name))
                 print(f"  🔥 New best → {best_ckpt_name}  "
-                      f"(dir_acc={vda:.4f})")
+                      f"(overall_acc={v_overall_acc:.4f})")
 
             unet.train()
 
