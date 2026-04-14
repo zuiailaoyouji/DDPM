@@ -87,9 +87,25 @@ def train(
     if target_size is None:
         target_size = _DEFAULT_CFG.target_size or 256
 
-    # 消融模式下不需要 CellViT
+    # 消融模式下训练不需要 CellViT，但验证时仍需要评估 Dir_Acc
+    # 用 _cellvit_val 保存一个只用于验证评估的 CellViT 实例
+    _cellvit_val = cellvit   # 完整模式：直接复用
     if not use_semantic:
-        cellvit = None
+        # 消融模式：训练不用 CellViT，但验证仍需要
+        # 从 cellvit_path 加载一个专用于验证的实例
+        cfg_cellvit_path = _DEFAULT_CFG.cellvit_path
+        cfg_cellvit_repo = _DEFAULT_CFG.cellvit_repo
+        if cfg_cellvit_path and os.path.exists(cfg_cellvit_path):
+            print("消融模式：加载 CellViT 用于验证评估...")
+            _cellvit_val = load_cellvit(
+                model_path        = cfg_cellvit_path,
+                cellvit_repo_path = cfg_cellvit_repo,
+                device            = device,
+            )
+        else:
+            print("⚠️  消融模式：未找到 CellViT 权重，验证时跳过 Dir_Acc 计算")
+            _cellvit_val = None
+        cellvit = None   # 训练时不使用
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -428,6 +444,8 @@ def train(
                         )
                     else:
                         vsem = None
+                    # 消融模式下 cellvit 为 None，用 cellvit_for_val 替代
+                    cellvit_for_val = cellvit if use_semantic else _cellvit_val
 
                     vnp  = unet(torch.cat([vhr, vnoisy], dim=1),
                                 vt, semantic=vsem).sample
@@ -438,13 +456,16 @@ def train(
                     vl_l.append(F.l1_loss(vx0, vhr).item())
                     va_l.append(compute_artifact_penalty(vx0.cpu(), vhr.cpu()))
 
-                    # 语义指标仅在完整模式下计算
-                    if use_semantic:
+                    # 语义指标：两种模式都计算，消融模式也需要评估 Dir_Acc
+                    # 完整模式：CellViT 已在上方调用过，直接复用 vhr_cv
+                    # 消融模式：需要临时加载 CellViT 进行评估
+                    # 注意：消融模式训练时无 CellViT，但验证时需要外部传入
+                    if cellvit_for_val is not None:
                         vgt_lbl = vb.get('gt_label_map')
                         if vgt_lbl is not None:
                             vgt_lbl  = vgt_lbl.to(device)
-                            vhr_cv2  = run_cellvit(cellvit, vhr)
-                            vpred_cv = run_cellvit(cellvit, vx0)
+                            vhr_cv2  = run_cellvit(cellvit_for_val, vhr)
+                            vpred_cv = run_cellvit(cellvit_for_val, vx0)
                             hr_lbl   = vhr_cv2['nuclei_type_label']
                             pred_lbl = vpred_cv['nuclei_type_label']
                             inter    = (vgt_lbl > 0) & (hr_lbl == vgt_lbl)
@@ -469,13 +490,13 @@ def train(
 
             print(f"  [Val] PSNR={vp:.2f}  SSIM={vs:.4f}  "
                   f"L1={vl:.4f}  Artifact={va:.3f}")
-            if use_semantic:
+            if vda >= 0:
                 print(f"  [Val] Dir_Acc(intersect)={vda:.4f}  "
                       f"Sem_MAE(intersect)={vsm:.4f}  Composite={comp:.4f}")
 
             if logger:
                 log_d = dict(PSNR=vp, SSIM=vs, L1=vl, Artifact=va)
-                if use_semantic:
+                if vda >= 0:
                     log_d.update(dict(
                         Dir_Acc_intersect=vda,
                         Sem_MAE_intersect=vsm,
@@ -485,8 +506,9 @@ def train(
                                    prefix=f'Val_{mode_name}')
 
             # ── 模型选择指标 ─────────────────────────────────────────
-            # 完整模式：以 dir_acc 为主；消融模式：以 -L1 为主（L1越小越好）
-            cur_metric = vda if use_semantic else -vl
+            # 两种模式统一用 dir_acc 作为主要指标（公平对比）
+            # 若 dir_acc 不可用（理论上不会发生），回退到 -L1
+            cur_metric = vda if vda >= 0 else -vl
             if cur_metric > best_metric:
                 best_metric = cur_metric
                 save_dict = dict(
@@ -503,9 +525,8 @@ def train(
                 )
                 torch.save(save_dict,
                            os.path.join(save_dir, best_ckpt_name))
-                metric_str = (f"dir_acc={vda:.4f}" if use_semantic
-                              else f"L1={vl:.4f}")
-                print(f"  🔥 New best → {best_ckpt_name}  ({metric_str})")
+                print(f"  🔥 New best → {best_ckpt_name}  "
+                      f"(dir_acc={vda:.4f})")
 
             unet.train()
 
