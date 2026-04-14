@@ -11,10 +11,15 @@ ddpm_config.py
 - 监督区域：GT ∩ CellViT(HR) 交集
 - 损失：Focal-CE + 类别逆频率权重 + correction_boost
 - 单阶段训练：从第一个 epoch 起全量开启语义监督
+
+【数据集划分】
+- 训练集：Fold 1 + Fold 2 合并，从中分层抽样 100 张作为验证集
+- 验证集：按 tissue type 分层抽样，每种类型都有覆盖，从训练集剔除
+- 测试集：Fold 3（不参与训练和验证）
 """
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List
 
 
 @dataclass
@@ -23,11 +28,17 @@ class TrainingConfig:
     # ── 数据集 ──────────────────────────────────────────────────────
     dataset_type: str = 'pannuke'
 
-    pannuke_root:           Optional[str] = '/data/xuwen/PanNuke'
-    pannuke_train_fold_dir: Optional[str] = '/data/xuwen/PanNuke/Fold 1'
-    pannuke_val_fold_dir:   Optional[str] = '/data/xuwen/PanNuke/Fold 2'
-    pannuke_test_fold_dir:  Optional[str] = '/data/xuwen/PanNuke/Fold 3'
-    pannuke_folds:          Optional[Tuple[str, ...]] = None
+    pannuke_root:          Optional[str]       = '/data/xuwen/PanNuke'
+    # 训练用折目录列表（支持多折合并，如 Fold1 + Fold2）
+    pannuke_fold_dirs:     Optional[List[str]] = field(default_factory=lambda: [
+        '/data/xuwen/PanNuke/Fold 1',
+        '/data/xuwen/PanNuke/Fold 2',
+    ])
+    pannuke_test_fold_dir: Optional[str]       = '/data/xuwen/PanNuke/Fold 3'
+
+    # 验证集分层抽样参数
+    n_val:    int = 100   # 从训练数据中抽取的验证集样本数
+    val_seed: int = 42    # 随机种子，保证可复现
 
     tum_dir:    str  = '/data/xuwen/NCT-CRC-HE-100K/TUM'
     norm_dir:   str  = '/data/xuwen/NCT-CRC-HE-100K/NORM'
@@ -36,8 +47,6 @@ class TrainingConfig:
     # ── CellViT ─────────────────────────────────────────────────────
     cellvit_path: Optional[str] = '/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth'
     cellvit_repo: str           = '/home/xuwen/DDPM/CellViT'
-
-    val_vis_dir: Optional[str] = '/data/xuwen/PanNuke/Fold 2'
 
     # ── 基础训练 ─────────────────────────────────────────────────────
     epochs:     int   = 200
@@ -51,9 +60,9 @@ class TrainingConfig:
 
     # ── 扩散 ─────────────────────────────────────────────────────────
     num_train_timesteps: int          = 1000
-    t_max:               int          = 150
+    t_max:               int          = 200
     sample_size:         int          = 256
-    in_channels:         int          = 6     # [HR(3), noisy_HR(3)]
+    in_channels:         int          = 6      # [HR(3), noisy_HR(3)]
     out_channels:        int          = 3
     target_size:         Optional[int] = 256
 
