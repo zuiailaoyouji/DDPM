@@ -509,8 +509,8 @@ def train(
 
             # Overall_Acc：整个 GT 核区域内的准确率
             if all_gt_val:
-                gt_cat   = _np.concatenate(all_gt_val)
-                pred_cat = _np.concatenate(all_pred_val)
+                gt_cat   = np.concatenate(all_gt_val)
+                pred_cat = np.concatenate(all_pred_val)
                 v_overall_acc = float((gt_cat == pred_cat).mean())
             else:
                 v_overall_acc = -1.0
