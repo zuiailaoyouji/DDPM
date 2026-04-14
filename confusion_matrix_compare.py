@@ -106,6 +106,8 @@ def infer_ensemble(unet, hr, t, sem=None):
 
 # ── 推理 ────────────────────────────────────────────────────────────
 all_gt, all_hr, all_abl, all_full = [], [], [], []
+# 用于退步分析：保留逐像素对齐的四路预测（在 gt_nuc 区域内，形状保持一维展平）
+regress_gt, regress_hr, regress_abl, regress_full = [], [], [], []
 n_valid = 0
 
 print(f"\n开始推理（INFER_T={INFER_T}，N_RUNS={N_RUNS}，最多 {N_SAMPLES} 个有效样本）...")
@@ -146,6 +148,12 @@ for i in range(len(dataset)):
     all_hr.append(hr_lbl.numpy()[mask])
     all_abl.append(abl_lbl.numpy()[mask])
     all_full.append(full_lbl.numpy()[mask])
+
+    # 退步分析：同一 mask，单独存一份（与上面完全一致，便于后续独立分析）
+    regress_gt.append(gt_lbl.numpy()[mask])
+    regress_hr.append(hr_lbl.numpy()[mask])
+    regress_abl.append(abl_lbl.numpy()[mask])
+    regress_full.append(full_lbl.numpy()[mask])
 
     if n_valid % 20 == 0:
         print(f"  [{n_valid:>3}/{N_SAMPLES}] 样本 {i:>4}")
@@ -190,6 +198,67 @@ print(f"\n整体准确率："
       f"HR={( all_hr  ==all_gt).mean():.4f}  "
       f"消融={(all_abl ==all_gt).mean():.4f}  "
       f"本文={(all_full==all_gt).mean():.4f}")
+
+# ── 退步分析 ─────────────────────────────────────────────────────────
+# 定义：HR基线 AND 消融模型 均预测正确，但本文方法预测错误的像素
+# 即：both_correct_but_full_wrong
+print(f"\n{'='*80}")
+print("退步分析：HR基线 & 消融模型 均答对，但本文方法答错的像素")
+print(f"{'='*80}")
+
+rg   = np.concatenate(regress_gt)
+rhr  = np.concatenate(regress_hr)
+rabl = np.concatenate(regress_abl)
+rfull= np.concatenate(regress_full)
+
+# 三路掩码
+hr_correct   = (rhr   == rg)
+abl_correct  = (rabl  == rg)
+full_correct = (rfull == rg)
+
+# 退步：前两个都对，本文错
+both_correct_full_wrong = hr_correct & abl_correct & ~full_correct
+
+# 只有本文对（供参考对比，即进步案例）
+only_full_correct = ~hr_correct & ~abl_correct & full_correct
+
+total_nuc = len(rg)
+n_regress  = both_correct_full_wrong.sum()
+n_improve  = only_full_correct.sum()
+
+print(f"\n  核区域总像素数       : {total_nuc:>10,}")
+print(f"  退步像素数 (两者对本文错): {n_regress:>10,}  "
+      f"({100*n_regress/total_nuc:.2f}%)")
+print(f"  进步像素数 (仅本文对)    : {n_improve:>10,}  "
+      f"({100*n_improve/total_nuc:.2f}%)")
+
+print(f"\n  按GT类别细分退步情况：")
+print(f"  {'类别':>14}  {'GT像素':>8}  {'退步像素':>8}  {'退步率':>8}  "
+      f"{'退步时被误分为（Top-3）'}")
+print(f"  {'-'*75}")
+
+for cls_id, name in enumerate(CLASS_NAMES):
+    gt_cls_mask   = (rg == cls_id)
+    regress_mask  = both_correct_full_wrong & gt_cls_mask
+    n_gt_cls      = gt_cls_mask.sum()
+    n_regress_cls = regress_mask.sum()
+
+    if n_gt_cls == 0 or n_regress_cls == 0:
+        continue
+
+    # 退步时，本文方法把该类误分成了哪些类
+    wrong_preds = rfull[regress_mask]
+    unique, counts = np.unique(wrong_preds, return_counts=True)
+    top3 = sorted(zip(counts, unique), reverse=True)[:3]
+    top3_str = "  ".join(
+        f"{CLASS_NAMES[c]}({cnt})" for cnt, c in top3
+    )
+
+    print(f"  {name:>14}  {n_gt_cls:>8,}  {n_regress_cls:>8,}  "
+          f"{100*n_regress_cls/n_gt_cls:>7.2f}%  {top3_str}")
+
+print(f"\n  说明：退步 = HR基线正确 AND 消融模型正确 AND 本文方法错误")
+print(f"        进步 = HR基线错误 AND 消融模型错误 AND 本文方法正确")
 
 # ── 可视化 ───────────────────────────────────────────────────────────
 def plot_cm_normalized(ax, cm, title, class_names):
