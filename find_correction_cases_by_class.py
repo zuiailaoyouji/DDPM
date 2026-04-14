@@ -7,6 +7,11 @@ find_correction_cases_by_class.py
   消融模型 : 无语义监督（只有重建损失）
   本文方法 : 交集 Focal-CE + CellViT 软标签 sem_tensor
 
+【推理配置 · 可视化版】
+  INFER_T = 200，单步确定性推理（固定随机种子）
+  t=200 加噪幅度适中，图像改动清晰可见，overlay 对比效果好。
+  不做集成，保留单次推理图像的真实感，避免均值模糊。
+
 筛选策略：
   对每个目标类别 c，找满足以下条件的 patch：
     1. GT 核区域内该类别像素数 > min_pixels
@@ -55,7 +60,7 @@ TARGET_CLASSES = {
     1: dict(name='Neoplastic',   min_pixels=300, max_hr_recall=0.75,
             min_improve=0.02, min_cls_ratio=0.35),
     2: dict(name='Inflammatory', min_pixels=50,  max_hr_recall=0.50,
-            min_improve=0.02, min_cls_ratio=0.05),
+            min_improve=0.02, min_cls_ratio=0.10),
     3: dict(name='Connective',   min_pixels=300, max_hr_recall=0.80,
             min_improve=0.02, min_cls_ratio=0.35),
     5: dict(name='Epithelial',   min_pixels=300, max_hr_recall=0.80,
@@ -97,7 +102,7 @@ dataset   = PanNukeDataset(
 )
 print(f"测试集大小: {len(dataset)} 张\n")
 
-INFER_T = 100
+INFER_T = 200   # 可视化：适中加噪幅度，图像改动清晰可见
 torch.manual_seed(42)
 
 
@@ -121,17 +126,20 @@ def make_overlay(img_rgb, label_map, nuc_prob, alpha=0.65):
 def to_rgb(t):
     return t.squeeze(0).detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
 
-def to_lbl(t):
-    return t.squeeze(0).detach().cpu().numpy().astype(np.int32)
 
-def to_nuc(t):
-    return t.squeeze(0).detach().cpu().numpy()
-
-
+# ── 单步推理（可视化） ───────────────────────────────────────────────
 def infer_once(unet, hr, noisy_hr, t, sem=None):
+    """固定加噪输入，单步确定性推理，返回 x0 和 CellViT 结果。"""
     with torch.no_grad():
-        np_out = unet(torch.cat([hr, noisy_hr], dim=1), t, semantic=sem).sample
-    return predict_x0_from_noise_shared(noisy_hr, np_out, t, scheduler)
+        x0  = predict_x0_from_noise_shared(
+            noisy_hr,
+            unet(torch.cat([hr, noisy_hr], dim=1), t, semantic=sem).sample,
+            t, scheduler,
+        )
+        cv  = run_cellvit(cellvit, x0)
+    lbl      = cv['nuclei_type_label'].squeeze(0).cpu().numpy().astype(np.int32)
+    nuc_prob = cv['nuclei_nuc_prob'].squeeze().cpu().numpy()
+    return x0, lbl, nuc_prob
 
 
 # ── 按类别定向筛选 ───────────────────────────────────────────────────
@@ -156,34 +164,25 @@ for i in range(len(dataset)):
     gt_nuc_np = gt_nuc.numpy()
 
     hr = hr_cpu.unsqueeze(0).to(device)
+    t  = torch.tensor([INFER_T], device=device)
 
+    # 消融和完整模型共用同一次加噪，保证对比公平
     noise    = torch.randn_like(hr)
-    t        = torch.tensor([INFER_T], device=device)
     noisy_hr = scheduler.add_noise(hr, noise, t)
 
     with torch.no_grad():
         hr_cv  = run_cellvit(cellvit, hr)
         hr_lbl = hr_cv['nuclei_type_label'].squeeze(0).cpu()
-        hr_nuc = hr_cv['nuclei_nuc_prob'].squeeze(0).cpu()
-
-        sem = build_sem_tensor_from_cellvit(
+        hr_nuc = hr_cv['nuclei_nuc_prob'].squeeze().cpu().numpy()
+        sem    = build_sem_tensor_from_cellvit(
             hr_cv['nuclei_type_prob'],
             hr_cv['nuclei_nuc_prob'],
         )
 
-        x0_abl   = infer_once(unet_ablation, hr, noisy_hr, t, sem=None)
-        abl_cv   = run_cellvit(cellvit, x0_abl)
-        abl_lbl  = abl_cv['nuclei_type_label'].squeeze(0).cpu()
-        abl_nuc  = abl_cv['nuclei_nuc_prob'].squeeze(0).cpu()
+    hr_np = hr_lbl.numpy()
 
-        x0_full  = infer_once(unet_full, hr, noisy_hr, t, sem=sem)
-        full_cv  = run_cellvit(cellvit, x0_full)
-        full_lbl = full_cv['nuclei_type_label'].squeeze(0).cpu()
-        full_nuc = full_cv['nuclei_nuc_prob'].squeeze(0).cpu()
-
-    hr_np   = hr_lbl.numpy()
-    abl_np  = abl_lbl.numpy()
-    full_np = full_lbl.numpy()
+    x0_abl,  abl_np,  abl_nuc  = infer_once(unet_ablation, hr, noisy_hr, t, sem=None)
+    x0_full, full_np, full_nuc = infer_once(unet_full,     hr, noisy_hr, t, sem=sem)
 
     for cls_id, cfg in TARGET_CLASSES.items():
         cls_pixels = ((gt_np == cls_id) & gt_nuc_np).sum()
@@ -221,11 +220,11 @@ for i in range(len(dataset)):
                 gt_lbl      = gt_np,
                 gt_nuc      = gt_nuc_np.astype(np.float32),
                 hr_lbl      = hr_np,
-                hr_nuc      = hr_nuc.numpy(),
+                hr_nuc      = hr_nuc,
                 abl_lbl     = abl_np,
-                abl_nuc     = abl_nuc.numpy(),
+                abl_nuc     = abl_nuc,
                 full_lbl    = full_np,
-                full_nuc    = full_nuc.numpy(),
+                full_nuc    = full_nuc,
             )
             print(f"  更新 {cfg['name']:>14} 最佳案例 | 样本{i:>4} | "
                   f"ratio={cls_ratio:.2f}  "
@@ -249,8 +248,8 @@ print(f"\n共找到 {len(found_cases)} 个典型案例，开始绘图...")
 
 # ── 绘图 ────────────────────────────────────────────────────────────
 col_titles = [
-    'HR', '消融模型', '本文方法', '',
-    'GT overlay', 'HR pred', '消融 pred', '本文 pred',
+    'HR', 'Ablation', 'Full model (ours)', '',
+    'GT overlay', 'HR pred', 'Ablation pred', 'Full pred (ours)',
 ]
 n_cols = len(col_titles)
 n_rows = len(found_cases)
@@ -261,8 +260,8 @@ fig, axes = plt.subplots(
     squeeze=False,
 )
 fig.suptitle(
-    'Per-class correction cases: Full model improves over ablation\n'
-    '(evaluated on GT nucleus region vs GT label)',
+    f'Per-class correction cases — t={INFER_T}, single-step inference\n'
+    'Full model improves over ablation (evaluated on GT nucleus region vs GT label)',
     fontsize=13, y=1.01,
 )
 
@@ -337,7 +336,7 @@ fig.legend(
 
 plt.tight_layout(rect=[0.0, 0.04, 1.0, 1.0])
 os.makedirs('./logs', exist_ok=True)
-save_path = './logs/correction_cases_by_class.png'
+save_path = './logs/correction_cases_by_class_ablation.png'
 plt.savefig(save_path, dpi=150, bbox_inches='tight')
 plt.close()
 print(f"按类别典型案例图已保存到: {save_path}")

@@ -7,6 +7,11 @@ confusion_matrix_compare.py
   消融模型   : 无语义监督（只有重建损失，use_semantic=False）
   本文方法   : 交集 Focal-CE + CellViT 软标签 sem_tensor
 
+推理策略：
+  对同一张 HR 用 N_RUNS 组不同随机噪声分别做单步推理，
+  将 N_RUNS 次 CellViT 概率图在通道维度取平均后 argmax，
+  得到最终分类预测（概率空间集成）。
+
 类别定义：
   0: Background  1: Neoplastic  2: Inflammatory
   3: Connective  4: Dead        5: Epithelial
@@ -69,15 +74,41 @@ dataset   = PanNukeDataset(
 )
 print(f"\n测试集大小: {len(dataset)} 张")
 
-INFER_T   = 100
+INFER_T   = 200
+N_RUNS    = 5    # 每张图推理次数，概率图取平均后 argmax
 N_SAMPLES = 200
 torch.manual_seed(42)
+
+
+# ── 集成推理 ─────────────────────────────────────────────────────────
+def infer_ensemble(unet, hr, t, sem=None):
+    """
+    对同一张 HR 用 N_RUNS 组不同随机噪声做单步推理，
+    返回 N_RUNS 次 CellViT 概率图均值 argmax 得到的分类图 (H, W)。
+    """
+    prob_sum = None
+    for _ in range(N_RUNS):
+        noise    = torch.randn_like(hr)
+        noisy_hr = scheduler.add_noise(hr, noise, t)
+        inp      = torch.cat([hr, noisy_hr], dim=1)
+        with torch.no_grad():
+            x0   = predict_x0_from_noise_shared(
+                noisy_hr,
+                unet(inp, t, semantic=sem).sample,
+                t, scheduler,
+            )
+            prob = run_cellvit(cellvit, x0)['nuclei_type_prob']   # (1, C, H, W)
+        prob_sum = prob if prob_sum is None else prob_sum + prob
+
+    mean_prob = prob_sum / N_RUNS
+    return mean_prob.argmax(dim=1).squeeze(0).cpu()               # (H, W)
+
 
 # ── 推理 ────────────────────────────────────────────────────────────
 all_gt, all_hr, all_abl, all_full = [], [], [], []
 n_valid = 0
 
-print(f"\n开始推理（INFER_T={INFER_T}，最多 {N_SAMPLES} 个有效样本）...")
+print(f"\n开始推理（INFER_T={INFER_T}，N_RUNS={N_RUNS}，最多 {N_SAMPLES} 个有效样本）...")
 
 for i in range(len(dataset)):
     if n_valid >= N_SAMPLES:
@@ -92,14 +123,10 @@ for i in range(len(dataset)):
         continue
 
     hr = hr_cpu.unsqueeze(0).to(device)
-
-    noise    = torch.randn_like(hr)
-    t        = torch.tensor([INFER_T], device=device)
-    noisy_hr = scheduler.add_noise(hr, noise, t)
-    inp      = torch.cat([hr, noisy_hr], dim=1)
+    t  = torch.tensor([INFER_T], device=device)
 
     with torch.no_grad():
-        # CellViT(HR)
+        # CellViT(HR)：直接推理，无需集成（确定性输出）
         hr_cv  = run_cellvit(cellvit, hr)
         hr_lbl = hr_cv['nuclei_type_label'].squeeze(0).cpu()
 
@@ -108,21 +135,11 @@ for i in range(len(dataset)):
             hr_cv['nuclei_nuc_prob'],
         )
 
-        # 消融模型：无 sem_tensor
-        x0_abl  = predict_x0_from_noise_shared(
-            noisy_hr,
-            unet_ablation(inp, t, semantic=None).sample,
-            t, scheduler,
-        )
-        abl_lbl = run_cellvit(cellvit, x0_abl)['nuclei_type_label'].squeeze(0).cpu()
+    # 消融模型集成推理（无 sem_tensor）
+    abl_lbl  = infer_ensemble(unet_ablation, hr, t, sem=None)
 
-        # 完整模型：有 sem_tensor
-        x0_full  = predict_x0_from_noise_shared(
-            noisy_hr,
-            unet_full(inp, t, semantic=sem).sample,
-            t, scheduler,
-        )
-        full_lbl = run_cellvit(cellvit, x0_full)['nuclei_type_label'].squeeze(0).cpu()
+    # 完整模型集成推理（有 sem_tensor）
+    full_lbl = infer_ensemble(unet_full, hr, t, sem=sem)
 
     mask = gt_nuc.numpy()
     all_gt.append(gt_lbl.numpy()[mask])
@@ -198,7 +215,8 @@ def plot_cm_normalized(ax, cm, title, class_names):
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 fig.suptitle(
-    'Confusion Matrices (normalized by GT class, nucleus region only)',
+    f'Confusion Matrices — ensemble N={N_RUNS} runs '
+    f'(normalized by GT class, nucleus region only)',
     fontsize=13, y=1.02,
 )
 plot_cm_normalized(axes[0], cm_hr,   'HR (baseline)',        CLASS_NAMES)
@@ -208,7 +226,7 @@ plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04, label='Recall')
 plt.tight_layout()
 
 os.makedirs('./logs', exist_ok=True)
-save_path = './logs/confusion_matrix_comparison.png'
+save_path = './logs/confusion_matrix_comparison_ablation_v3.png'
 plt.savefig(save_path, dpi=150, bbox_inches='tight')
 plt.close()
 print(f"\n混淆矩阵图已保存到: {save_path}")
