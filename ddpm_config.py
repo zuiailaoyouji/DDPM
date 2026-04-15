@@ -49,7 +49,7 @@ class TrainingConfig:
     cellvit_repo: str           = '/home/xuwen/DDPM/CellViT'
 
     # ── 基础训练 ─────────────────────────────────────────────────────
-    epochs:     int   = 200
+    epochs:     int   = 20
     batch_size: int   = 4
     lr:         float = 1e-4
     device:     str   = 'cuda'
