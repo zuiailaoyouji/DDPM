@@ -270,8 +270,106 @@ def split_train_val(
     return train_subset, val_subset
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PanNukeDataset
+def oversample_minority_classes(
+    train_subset:     Subset,
+    dataset:          'PanNukeDataset',
+    target_classes:   List[int] = [2],    # 默认只对 Inflammatory(2) 过采样
+    oversample_ratio: float = 3.0,        # 过采样倍率
+    min_pixels:       int   = 500,        # 目标类别像素数超过此值才纳入过采样
+    seed:             int   = 42,
+    verbose:          bool  = True,
+) -> Subset:
+    """
+    对训练集中含稀少类别（像素数 > min_pixels）的 patch 进行过采样。
+
+    直接读取底层 npy 文件判断像素数，不走 __getitem__，避免内存溢出。
+
+    策略：
+      找出训练集中目标类别像素数 > min_pixels 的 patch，
+      将其索引额外重复 (oversample_ratio - 1) 次追加到训练索引列表。
+      原始 patch 仍然保留，不做替换。
+
+    Args:
+        train_subset    : split_train_val 返回的训练 Subset
+        dataset         : 底层 PanNukeDataset 实例
+        target_classes  : 需要过采样的细胞类别索引列表（从1开始，0=背景）
+        oversample_ratio: 过采样倍率，含目标类别的 patch 总共出现几次
+        min_pixels      : 目标类别像素数阈值，低于此值的 patch 不纳入过采样
+                          设为500可筛选出 Inflammatory 细胞相对集中的 patch
+        seed            : 随机种子
+        verbose         : 是否打印过采样信息
+
+    Returns:
+        新的 Subset，包含原始训练集 + 过采样的少数类 patch
+    """
+    _CLS_NAMES = ['Background', 'Neoplastic', 'Inflammatory',
+                  'Connective', 'Dead', 'Epithelial']
+    rng = random.Random(seed)
+
+    if verbose:
+        print(f"\n过采样：扫描训练集（共 {len(train_subset)} 张），"
+              f"统计目标类别像素数...")
+        print(f"  目标类别：{[_CLS_NAMES[c] for c in target_classes]}  "
+              f"min_pixels={min_pixels}  ratio={oversample_ratio}x")
+
+    # ── 直接读 npy 文件判断各 patch 的目标类别像素数 ─────────────────
+    # 先按 (fold_id, fold_masks_array) 建立查找表，避免重复打开文件
+    # dataset.masks[fold_id] 已经是 mmap，直接按索引取即可
+    minority_global_indices: List[int] = []
+
+    for pos, global_idx in enumerate(train_subset.indices):
+        fold_id, local_idx = dataset.index[global_idx]
+        mask_raw = np.array(dataset.masks[fold_id][local_idx])  # 实际读取单张
+
+        # 兼容 (H,W,C) 和 (C,H,W)
+        if mask_raw.ndim == 3:
+            if mask_raw.shape[0] in (5, 6) and mask_raw.shape[-1] not in (5, 6):
+                mask_raw = np.transpose(mask_raw, (1, 2, 0))
+        m = mask_raw.astype(np.int32)
+        n_ch = min(m.shape[-1], 5)
+
+        # 构建 label_map 和 nuc_mask（与 pannuke_mask_to_semantic 逻辑一致）
+        h, w = m.shape[:2]
+        label_map  = np.zeros((h, w), dtype=np.int32)
+        nuc_binary = np.zeros((h, w), dtype=bool)
+        for ch in range(n_ch):
+            cell = m[..., ch] > 0
+            label_map[cell]  = ch + 1
+            nuc_binary[cell] = True
+
+        # 判断是否满足过采样条件
+        for cls in target_classes:
+            cls_pixels = int(((label_map == cls) & nuc_binary).sum())
+            if cls_pixels >= min_pixels:
+                minority_global_indices.append(global_idx)
+                break   # 满足任意一个目标类别即可，避免重复计数
+
+        if verbose and (pos + 1) % 1000 == 0:
+            print(f"  扫描进度：{pos+1}/{len(train_subset)}")
+
+    # ── 过采样：额外重复 (ratio-1) 次 ────────────────────────────────
+    n_repeat   = max(1, int(oversample_ratio) - 1)
+    extra_idxs = minority_global_indices * n_repeat
+    rng.shuffle(extra_idxs)
+
+    all_global_indices = list(train_subset.indices) + extra_idxs
+
+    if verbose:
+        print(f"\n过采样完成：")
+        print(f"  满足条件的 patch 数：{len(minority_global_indices)}")
+        print(f"  额外重复次数：{n_repeat}")
+        print(f"  原始训练集大小：{len(train_subset)}")
+        print(f"  过采样后训练集大小：{len(all_global_indices)}")
+        # 估算过采样后目标类别的像素占比变化
+        orig_ratio = len(minority_global_indices) / max(len(train_subset), 1)
+        new_ratio  = (len(minority_global_indices) * oversample_ratio) / \
+                     max(len(all_global_indices), 1)
+        print(f"  含目标类别 patch 原始占比：{orig_ratio*100:.1f}%  "
+              f"→ 过采样后：{new_ratio*100:.1f}%")
+
+    return Subset(dataset, all_global_indices)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PanNukeDataset(Dataset):

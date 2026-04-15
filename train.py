@@ -30,7 +30,8 @@ import datetime
 from typing import Optional
 from tqdm import tqdm
 
-from ddpm_dataset import build_dataset, PanNukeDataset, split_train_val
+from ddpm_dataset import (build_dataset, PanNukeDataset,
+                          split_train_val, oversample_minority_classes)
 from unet_wrapper import create_model, count_parameters
 from semantic_sr_loss import (SemanticSRLoss, build_sem_tensor_from_cellvit,
                                run_cellvit)
@@ -84,6 +85,10 @@ def train(
     pin_memory: bool       = _DEFAULT_CFG.pin_memory,
     oversample: bool       = _DEFAULT_CFG.oversample,
     train_drop_last: bool  = _DEFAULT_CFG.train_drop_last,
+    oversample_minority:    bool  = False,  # 是否对少数类过采样
+    oversample_ratio:       float = 3.0,    # 过采样倍率
+    oversample_classes:     list  = None,   # 默认 [2] 即 Inflammatory
+    oversample_min_pixels:  int   = 500,    # 目标类别像素数阈值
 ):
     if target_size is None:
         target_size = _DEFAULT_CFG.target_size or 256
@@ -226,6 +231,18 @@ def train(
         )
         print(f"训练集：{len(train_ds)} 张  验证集：{len(val_ds)} 张  "
               f"（分层抽样，seed={val_seed}）")
+
+        # 少数类过采样（可选）
+        if oversample_minority:
+            _cls = oversample_classes if oversample_classes else [2, 3]
+            train_ds = oversample_minority_classes(
+                train_subset    = train_ds,
+                dataset         = full_dataset,
+                target_classes  = _cls,
+                oversample_ratio= oversample_ratio,
+                min_pixels      = oversample_min_pixels,
+                verbose         = True,
+            )
 
         dataset = train_ds   # 后续 dataloader 用 train_ds
 
@@ -688,6 +705,13 @@ def main():
     _add_bool_mutex(p, 'pin_memory',      cfg.pin_memory,      'pin-memory')
     _add_bool_mutex(p, 'oversample',      cfg.oversample,      'oversample')
     _add_bool_mutex(p, 'train_drop_last', cfg.train_drop_last, 'train-drop-last')
+    _add_bool_mutex(p, 'oversample_minority', False, 'oversample-minority')
+    p.add_argument('--oversample_ratio',   type=float, default=2.0,
+                   help='少数类过采样倍率（默认2.0）')
+    p.add_argument('--oversample_classes', type=int, nargs='+', default=None,
+                   help='过采样的类别索引，默认[2]即Inflammatory')
+    p.add_argument('--oversample_min_pixels', type=int, default=500,
+                   help='目标类别像素数阈值，超过此值才纳入过采样（默认500）')
 
     args         = p.parse_args()
     use_semantic = not args.no_semantic
@@ -750,6 +774,10 @@ def main():
         pin_memory             = args.pin_memory,
         oversample             = args.oversample,
         train_drop_last        = args.train_drop_last,
+        oversample_minority    = args.oversample_minority,
+        oversample_ratio       = args.oversample_ratio,
+        oversample_classes     = args.oversample_classes,
+        oversample_min_pixels  = args.oversample_min_pixels,
         resume_path            = args.resume_path,
         logger                 = logger,
         t_max                  = args.t_max,
