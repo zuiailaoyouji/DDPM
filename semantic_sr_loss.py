@@ -5,36 +5,35 @@ semantic_sr_loss.py
 【任务定义】
 ─────────────────────────────────────────────────────────────────────────────
 对 HR 病理切片做微小修改，使 CellViT 对修改后图像的预测结果更接近 GT。
-推理时没有 GT，只有 HR 和 CellViT。训练时用 PanNuke（有 GT）来监督。
+核心命题：诊断准确性与视觉感知质量是可分离的——模型可以修改人眼不敏感
+但 CellViT 敏感的特征，在视觉质量略有下降的情况下提升诊断准确性。
 
 【核心设计】
 ─────────────────────────────────────────────────────────────────────────────
 1. 监督目标 = GT ∩ CellViT(HR) 的交集区域
    intersect_mask = (gt_label > 0) & (cellvit_hr_label == gt_label)
-   含义：GT 有细胞标注，且 CellViT(HR) 也判对了的像素。
-   这是有意义的监督信号：模型学习让 CellViT(pred) 在这些区域也判对。
-   交集之外（CellViT 连 HR 都判错的区域）不施加语义监督，
-   因为模型无法从 CellViT 的错误预测中学到正确的细胞外观。
 
-2. 额外在"纠正候选区域"施加更强监督
-   correction_mask = intersect_mask & (pred_label != gt_label)
-   即 CellViT(HR) 判对但 CellViT(pred) 还判错的区域，
-   给予 correction_boost 倍像素权重。
+2. correction_boost：交集中 pred 仍判错的区域给更高权重
 
-3. Focal CE + 类别逆频率权重
-   解决 Neoplastic 主导、少数类（Inflammatory/Dead）梯度不足的问题。
+3. confusion_penalty：对特定混淆方向额外惩罚
+   默认惩罚退步分析中最主要的两个方向：
+   - Connective(3)→Epithelial(5)：3倍惩罚
+   - Neoplastic(1)→Connective(3)：2倍惩罚
+   这些方向的错误不需要视觉上明显的修改，只需要改变
+   CellViT 敏感的微小特征（纹理频率、局部颜色分布等）
 
-4. sem_tensor 用 CellViT(HR) 软标签构建，训练推理一致
-   [cellvit_hr_type_prob(6), cellvit_hr_nuc_prob(1)] → 7 通道
+4. Focal CE + 类别逆频率权重（Inflammatory 权重加倍）
+
+5. lambda_rec 降低到 1.5，给模型更大的像素修改空间，
+   支持"诊断准确性与视觉感知质量可分离"的命题
 
 【损失组成】
 ─────────────────────────────────────────────────────────────────────────────
-L_noise : MSE(noise_pred, noise)               — 扩散骨干稳定性
-L_rec   : L1(x0_hat, hr)                      — 像素保真（防过度修改）
-L_grad  : L1(∇x0_hat, ∇hr)                   — 边缘保真（防模糊）
-L_sem   : Focal-CE(CellViT(x0_hat), gt_label) — 向交集目标靠近
-          仅在 intersect_mask 内有效，correction_mask 额外加权
-L_tv    : 相对 TV 惩罚                         — 抑制幻觉伪影
+L_noise : MSE(noise_pred, noise)
+L_rec   : L1(x0_hat, hr)
+L_grad  : L1(∇x0_hat, ∇hr)
+L_sem   : Focal-CE with confusion_penalty + correction_boost
+L_tv    : 相对 TV 惩罚
 """
 
 import torch
@@ -44,22 +43,15 @@ from typing import Dict, Optional, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# sem_tensor 构建（CellViT 软标签，训练推理一致）
+# sem_tensor 构建
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_sem_tensor_from_cellvit(
-    cellvit_type_prob: torch.Tensor,  # [B, 6, H, W]  CellViT(HR) softmax 概率
-    cellvit_nuc_prob:  torch.Tensor,  # [B, H, W]     CellViT(HR) 核概率
+    cellvit_type_prob: torch.Tensor,
+    cellvit_nuc_prob:  torch.Tensor,
 ) -> torch.Tensor:
-    """
-    用 CellViT(HR) 软标签构建 sem_tensor [B, 7, H, W]。
-    通道：[cellvit_hr_type_prob(6), cellvit_hr_nuc_prob(1)]
-    全部为连续概率值，不做 argmax 硬化。
-    训练和推理均调用此函数，保证一致性。
-    与 unet_wrapper.SemanticEncoder(in_channels=7) 接口兼容。
-    """
-    nuc = cellvit_nuc_prob.unsqueeze(1)                  # [B, 1, H, W]
-    return torch.cat([cellvit_type_prob, nuc], dim=1)    # [B, 7, H, W]
+    nuc = cellvit_nuc_prob.unsqueeze(1)
+    return torch.cat([cellvit_type_prob, nuc], dim=1)
 
 
 def build_gt_sem_tensor(
@@ -67,10 +59,6 @@ def build_gt_sem_tensor(
     gt_nuc_mask:  torch.Tensor,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
-    """
-    旧接口保留，仅在无 CellViT 时降级回退使用。
-    正常训练流程应使用 build_sem_tensor_from_cellvit。
-    """
     if device is None:
         device = gt_label_map.device
     onehot = F.one_hot(gt_label_map.to(device).long(), num_classes=6) \
@@ -85,20 +73,13 @@ def build_gt_sem_tensor(
 
 def run_cellvit(
     cellvit: nn.Module,
-    img_01:  torch.Tensor,  # [B, 3, H, W] in [0, 1]
+    img_01:  torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
-    """
-    对输入图像运行 CellViT，返回：
-      nuclei_type_prob  : [B, 6, H, W]  softmax 概率
-      nuclei_type_label : [B, H, W]     argmax 类别索引
-      nuclei_binary_prob: [B, 2, H, W]  核/非核 softmax 概率
-      nuclei_nuc_prob   : [B, H, W]     核概率（binary[:,1]）
-    """
     out        = cellvit(img_01)
-    type_prob  = F.softmax(out['nuclei_type_map'], dim=1)    # [B, 6, H, W]
-    type_label = type_prob.argmax(dim=1)                     # [B, H, W]
-    bin_prob   = F.softmax(out['nuclei_binary_map'], dim=1)  # [B, 2, H, W]
-    nuc_prob   = bin_prob[:, 1]                              # [B, H, W]
+    type_prob  = F.softmax(out['nuclei_type_map'], dim=1)
+    type_label = type_prob.argmax(dim=1)
+    bin_prob   = F.softmax(out['nuclei_binary_map'], dim=1)
+    nuc_prob   = bin_prob[:, 1]
     return dict(
         nuclei_type_prob   = type_prob,
         nuclei_type_label  = type_label,
@@ -112,20 +93,15 @@ def run_cellvit(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def focal_ce_loss(
-    log_prob:       torch.Tensor,                    # [N, C]  log softmax
-    target:         torch.Tensor,                    # [N]     int64
+    log_prob:       torch.Tensor,
+    target:         torch.Tensor,
     gamma:          float = 2.0,
-    class_weights:  Optional[torch.Tensor] = None,   # [C]  逐类别权重
-    sample_weights: Optional[torch.Tensor] = None,   # [N]  逐像素权重
+    class_weights:  Optional[torch.Tensor] = None,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    Focal Cross-Entropy：(1 - p_t)^gamma * CE
-    class_weights  处理类别不平衡，
-    sample_weights 用于 correction_boost。
-    """
-    log_pt  = log_prob.gather(1, target.unsqueeze(1)).squeeze(1)  # [N]
-    pt      = log_pt.exp()                                         # [N]
-    focal_w = (1.0 - pt) ** gamma                                  # [N]
+    log_pt  = log_prob.gather(1, target.unsqueeze(1)).squeeze(1)
+    pt      = log_pt.exp()
+    focal_w = (1.0 - pt) ** gamma
 
     if class_weights is not None:
         focal_w = focal_w * class_weights.to(target.device)[target]
@@ -141,20 +117,8 @@ def focal_ce_loss(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SemanticSRLoss(nn.Module):
-    """
-    面向"判别器标签纠正"的完整损失模块。
 
-    模型输入约定（与 train.py 对应）
-    ──────────────────────────────────
-    model_input : [HR, noisy_HR]（6 通道，不再有 LR）
-    sem_tensor  : build_sem_tensor_from_cellvit(cellvit_hr_prob, cellvit_hr_nuc)
-    监督区域    : intersect_mask = (gt_label>0) & (cellvit_hr_label==gt_label)
-    """
-
-    # PanNuke 各类别近似像素频率
-    # 0:bg   1:Neo  2:Inf   3:Con   4:Dead  5:Epi
-    # Inflammatory 频率从 0.02 调低到 0.01，使其逆频率权重加倍，
-    # 加强对该最难分类别的梯度
+    # Inflammatory 频率调低到 0.01，逆频率权重加倍
     _DEFAULT_CLASS_FREQ = torch.tensor(
         [0.85, 0.07, 0.01, 0.04, 0.005, 0.015],
         dtype=torch.float32,
@@ -164,26 +128,24 @@ class SemanticSRLoss(nn.Module):
         self,
         cellvit,
         noise_scheduler,
-        # 语义子项
         lambda_sem_cls:    float = 1.0,
-        correction_boost:  float = 2.0,
-        # Focal Loss
-        focal_gamma:       float = 2.0,
+        correction_boost:  float = 3.0,
+        # 混淆方向惩罚表：{(gt_cls, pred_cls): penalty_weight}
+        # 对特定错误分类方向额外加权
+        # None 时使用默认值（惩罚主要退步方向）
+        confusion_penalty: Optional[dict] = None,
+        focal_gamma:       float = 3.0,
         use_class_weights: bool  = True,
-        # 各项总体权重
         lambda_noise: float = 1.0,
-        lambda_rec:   float = 3.0,
+        lambda_rec:   float = 1.5,   # 降低像素保真约束，给模型更大修改空间
         lambda_grad:  float = 0.8,
         lambda_sem:   float = 2.0,
         lambda_tv:    float = 0.0005,
-        # 时间步配置
-        t_max:            int   = 150,
+        t_max:            int   = 200,
         tv_margin_factor: float = 1.05,
         tv_leaky_alpha:   float = 0.10,
-        # 自定义类别频率
         class_freq: Optional[torch.Tensor] = None,
-        # 旧接口兼容（不再使用）
-        tau_nuc:        float = 0.4,
+        tau_nuc:    float = 0.4,
         lambda_sem_cls_compat: float = None,
     ):
         super().__init__()
@@ -195,6 +157,16 @@ class SemanticSRLoss(nn.Module):
         self.focal_gamma      = focal_gamma
         self.use_class_weights = use_class_weights
 
+        # 混淆方向惩罚表：默认惩罚退步分析中最主要的两个方向
+        # Connective→Epithelial 和 Neoplastic→Connective
+        if confusion_penalty is None:
+            self.confusion_penalty = {
+                (3, 5): 3.0,   # Connective→Epithelial
+                (1, 3): 2.0,   # Neoplastic→Connective
+            }
+        else:
+            self.confusion_penalty = confusion_penalty
+
         self.lambda_noise = lambda_noise
         self.lambda_rec   = lambda_rec
         self.lambda_grad  = lambda_grad
@@ -205,12 +177,10 @@ class SemanticSRLoss(nn.Module):
         self.tv_margin_factor = tv_margin_factor
         self.tv_leaky_alpha   = tv_leaky_alpha
 
-        # 类别逆频率权重，归一化到均值 = 1
         freq = class_freq if class_freq is not None else self._DEFAULT_CLASS_FREQ
         inv_freq = 1.0 / (freq + 1e-6)
         self.register_buffer('class_weights', (inv_freq / inv_freq.mean()).float())
 
-        # 冻结 CellViT
         if self.cellvit is not None:
             for p in self.cellvit.parameters():
                 p.requires_grad = False
@@ -222,32 +192,25 @@ class SemanticSRLoss(nn.Module):
 
     def forward(
         self,
-        noise_pred:    torch.Tensor,  # [B, 3, H, W]
-        noise:         torch.Tensor,  # [B, 3, H, W]
-        noisy_hr:      torch.Tensor,  # [B, 3, H, W]  x_t
-        hr:            torch.Tensor,  # [B, 3, H, W]  clean HR [0,1]
-        t:             torch.Tensor,  # [B]
-        gt_nuc_mask:   torch.Tensor,  # [B, H, W]  保留接口兼容，内部不再用于定义监督区域
-        gt_label_map:  torch.Tensor,  # [B, H, W]  0=bg, 1-5=细胞类型
+        noise_pred:    torch.Tensor,
+        noise:         torch.Tensor,
+        noisy_hr:      torch.Tensor,
+        hr:            torch.Tensor,
+        t:             torch.Tensor,
+        gt_nuc_mask:   torch.Tensor,
+        gt_label_map:  torch.Tensor,
         lambda_sem:    Optional[float] = None,
         semantic_on:   bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         lam_sem = lambda_sem if lambda_sem is not None else self.lambda_sem
 
-        # ── 1. 扩散噪声损失 ────────────────────────────────────────
         l_noise = F.mse_loss(noise_pred, noise)
+        x0_hat  = self._predict_x0(noisy_hr, noise_pred, t)
+        l_rec   = F.l1_loss(x0_hat, hr)
+        l_grad  = self._gradient_loss(x0_hat, hr)
 
-        # ── 2. 重建 x0_hat ─────────────────────────────────────────
-        x0_hat = self._predict_x0(noisy_hr, noise_pred, t)
-
-        # ── 3. 像素保真损失 ────────────────────────────────────────
-        l_rec  = F.l1_loss(x0_hat, hr)
-        l_grad = self._gradient_loss(x0_hat, hr)
-
-        # ── 4. 语义损失（t < t_max 且 semantic_on）─────────────────
         valid_idx = (t < self.t_max).nonzero(as_tuple=True)[0]
-
         l_sem     = hr.new_zeros(())
         l_tv      = hr.new_zeros(())
         l_sem_cls = hr.new_zeros(())
@@ -268,7 +231,6 @@ class SemanticSRLoss(nn.Module):
                     x0_v, hr_v, lbl_v,
                 )
 
-        # ── 5. 加权汇总 ────────────────────────────────────────────
         total = (
             self.lambda_noise * l_noise
             + self.lambda_rec  * l_rec
@@ -289,21 +251,21 @@ class SemanticSRLoss(nn.Module):
         return total, breakdown
 
     # ─────────────────────────────────────────────────────────────────────
-    # 核心：基于交集 mask 的语义损失
+    # 核心：基于交集 mask 的语义损失 + 混淆方向惩罚
     # ─────────────────────────────────────────────────────────────────────
 
     def _semantic_losses_intersection(
         self,
-        x0_hat:   torch.Tensor,  # [N, 3, H, W]
-        hr:       torch.Tensor,  # [N, 3, H, W]
-        gt_label: torch.Tensor,  # [N, H, W]  0=bg
+        x0_hat:   torch.Tensor,
+        hr:       torch.Tensor,
+        gt_label: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
-        1. CellViT(HR) no_grad → hr_label
-        2. intersect_mask = (gt_label>0) & (hr_label==gt_label)
-        3. correction_mask = intersect_mask & (pred_label!=gt_label)
-        4. Focal-CE(CellViT(x0_hat), gt_label) 在 intersect_mask 内，
-           correction_mask 区域给 correction_boost 倍像素权重
+        在交集 mask 内计算语义损失，加入三层权重：
+          1. correction_boost：pred 判错的区域权重更高
+          2. confusion_penalty：特定混淆方向额外惩罚
+             Connective→Epithelial(3x) 和 Neoplastic→Connective(2x)
+          3. class_weights + focal_gamma：类别不平衡处理
         """
         N, _, H, W = x0_hat.shape
 
@@ -313,16 +275,16 @@ class SemanticSRLoss(nn.Module):
                 size=(H, W), mode='nearest',
             ).squeeze(1).long()
 
-        # ── CellViT(HR) no_grad ───────────────────────────────────
+        # CellViT(HR) no_grad
         with torch.no_grad():
             hr_out   = run_cellvit(self.cellvit, hr)
-            hr_label = hr_out['nuclei_type_label']   # [N, H, W]
-            hr_prob  = hr_out['nuclei_type_prob']    # [N, 6, H, W]
+            hr_label = hr_out['nuclei_type_label']
+            hr_prob  = hr_out['nuclei_type_prob']
 
-        # ── 交集 mask ─────────────────────────────────────────────
+        # 交集 mask
         gt_has_cell    = (gt_label > 0)
         hr_correct     = (hr_label == gt_label)
-        intersect_mask = gt_has_cell & hr_correct    # [N, H, W]
+        intersect_mask = gt_has_cell & hr_correct
 
         n_intersect = intersect_mask.sum().item()
         if n_intersect < 1:
@@ -332,17 +294,28 @@ class SemanticSRLoss(nn.Module):
                 intersect_ratio=0.0, correction_ratio=0.0,
             )
 
-        # ── CellViT(x0_hat) 需要梯度 ─────────────────────────────
+        # CellViT(x0_hat) 需要梯度
         pred_out   = run_cellvit(self.cellvit, x0_hat)
-        pred_prob  = pred_out['nuclei_type_prob']    # [N, 6, H, W]
-        pred_label = pred_out['nuclei_type_label']   # [N, H, W]
+        pred_prob  = pred_out['nuclei_type_prob']
+        pred_label = pred_out['nuclei_type_label']
 
-        # ── correction_mask + 像素权重 ────────────────────────────
+        # ── 像素权重：三层叠加 ────────────────────────────────────────
+        pixel_weight = torch.ones(N, H, W, dtype=torch.float32, device=hr.device)
+
+        # 第一层：correction_boost（pred 判错的区域）
         correction_mask = intersect_mask & (pred_label != gt_label)
-        pixel_weight    = torch.ones(N, H, W, dtype=torch.float32, device=hr.device)
-        pixel_weight[correction_mask] = self.correction_boost
+        pixel_weight[correction_mask] *= self.correction_boost
 
-        # ── Focal-CE 在 intersect_mask 内 ────────────────────────
+        # 第二层：confusion_penalty（特定混淆方向额外惩罚）
+        for (gt_cls, pred_cls), penalty in self.confusion_penalty.items():
+            # 在交集内，GT 是 gt_cls 且 pred 判成 pred_cls 的像素
+            conf_mask = (intersect_mask
+                         & (gt_label == gt_cls)
+                         & (pred_label == pred_cls))
+            if conf_mask.sum() > 0:
+                pixel_weight[conf_mask] *= penalty
+
+        # ── Focal-CE 在 intersect_mask 内 ────────────────────────────
         mask_flat   = intersect_mask.reshape(-1)
         prob_flat   = pred_prob.permute(0, 2, 3, 1).reshape(-1, 6)
         target_flat = gt_label.reshape(-1)
@@ -363,7 +336,7 @@ class SemanticSRLoss(nn.Module):
         )
         l_sem = self.lambda_sem_cls * l_sem_cls
 
-        # ── 监控指标（无梯度）────────────────────────────────────
+        # 监控指标
         with torch.no_grad():
             dir_acc = (
                 (pred_label[intersect_mask] == gt_label[intersect_mask])
@@ -388,19 +361,14 @@ class SemanticSRLoss(nn.Module):
     # 辅助函数
     # ─────────────────────────────────────────────────────────────────────
 
-    def _predict_x0(
-        self,
-        x_t:        torch.Tensor,
-        noise_pred: torch.Tensor,
-        t:          torch.Tensor,
-    ) -> torch.Tensor:
+    def _predict_x0(self, x_t, noise_pred, t):
         dev   = x_t.device
         dtype = x_t.dtype
         alpha = self.scheduler.alphas_cumprod.to(dev)[t].to(dtype).view(-1, 1, 1, 1)
         beta  = 1.0 - alpha
         return ((x_t - beta ** 0.5 * noise_pred) / (alpha ** 0.5 + 1e-8)).clamp(0.0, 1.0)
 
-    def _gradient_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _gradient_loss(self, pred, target):
         def _grad(x):
             return (x[:, :, 1:, :] - x[:, :, :-1, :],
                     x[:, :, :, 1:] - x[:, :, :, :-1])
@@ -408,7 +376,7 @@ class SemanticSRLoss(nn.Module):
         th, tw = _grad(target)
         return (ph - th).abs().mean() + (pw - tw).abs().mean()
 
-    def _tv_loss(self, x0_hat: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
+    def _tv_loss(self, x0_hat, hr):
         def _tv(img):
             dh = (img[:, :, 1:, :] - img[:, :, :-1, :]).abs()
             dw = (img[:, :, :, 1:] - img[:, :, :, :-1]).abs()
