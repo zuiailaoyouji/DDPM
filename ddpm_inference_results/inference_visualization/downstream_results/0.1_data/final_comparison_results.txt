@@ -1,5 +1,0 @@
-Full Comparison Results
-============================================================
-Exp 1 (Noisy): Acc=0.9038
-Exp 2 (Clean): Acc=0.9241
-Exp 3 (Ours) : Acc=0.8937
