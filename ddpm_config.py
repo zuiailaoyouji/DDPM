@@ -68,7 +68,7 @@ class TrainingConfig:
 
     # ── 损失权重 ─────────────────────────────────────────────────────
     lambda_noise: float = 1.0
-    lambda_rec:   float = 1.5    # 降低像素保真约束，给模型更大修改空间
+    lambda_rec:   float = 2.0    # 降低像素保真约束，给模型更大修改空间
     lambda_grad:  float = 0.8
     lambda_sem:   float = 2.0
     lambda_tv:    float = 0.0005

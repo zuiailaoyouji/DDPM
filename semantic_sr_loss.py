@@ -161,8 +161,8 @@ class SemanticSRLoss(nn.Module):
         # Connective→Epithelial 和 Neoplastic→Connective
         if confusion_penalty is None:
             self.confusion_penalty = {
-                (3, 5): 3.0,   # Connective→Epithelial
-                (1, 3): 2.0,   # Neoplastic→Connective
+                (3, 5): 1.5,   # Connective→Epithelial
+                (1, 3): 1.5,   # Neoplastic→Connective
             }
         else:
             self.confusion_penalty = confusion_penalty
