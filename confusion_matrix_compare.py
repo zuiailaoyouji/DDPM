@@ -15,6 +15,8 @@ confusion_matrix_compare.py
 类别定义：
   0: Background  1: Neoplastic  2: Inflammatory
   3: Connective  4: Dead        5: Epithelial
+
+新增：按 tissue type 分组输出各组的召回率和整体准确率。
 """
 
 import numpy as np
@@ -22,6 +24,7 @@ import torch
 import sys
 import os
 import matplotlib.pyplot as plt
+from collections import defaultdict
 sys.path.insert(0, '/home/xuwen/DDPM/CellViT')
 sys.path.insert(0, '/home/xuwen/DDPM')
 
@@ -75,17 +78,13 @@ dataset   = PanNukeDataset(
 print(f"\n测试集大小: {len(dataset)} 张")
 
 INFER_T   = 200
-N_RUNS    = 5    # 每张图推理次数，概率图取平均后 argmax
+N_RUNS    = 5
 N_SAMPLES = 200
 torch.manual_seed(42)
 
 
 # ── 集成推理 ─────────────────────────────────────────────────────────
 def infer_ensemble(unet, hr, t, sem=None):
-    """
-    对同一张 HR 用 N_RUNS 组不同随机噪声做单步推理，
-    返回 N_RUNS 次 CellViT 概率图均值 argmax 得到的分类图 (H, W)。
-    """
     prob_sum = None
     for _ in range(N_RUNS):
         noise    = torch.randn_like(hr)
@@ -105,21 +104,28 @@ def infer_ensemble(unet, hr, t, sem=None):
 
 
 # ── 推理 ────────────────────────────────────────────────────────────
+# 全局像素列表
 all_gt, all_hr, all_abl, all_full = [], [], [], []
-# 用于退步分析：保留逐像素对齐的四路预测（在 gt_nuc 区域内，形状保持一维展平）
-regress_gt, regress_hr, regress_abl, regress_full = [], [], [], []
-n_valid = 0
 
+# 退步分析像素列表
+regress_gt, regress_hr, regress_abl, regress_full = [], [], [], []
+
+# Per-tissue 像素列表：tissue_name -> {'gt': [], 'hr': [], 'abl': [], 'full': []}
+tissue_pixels = defaultdict(lambda: {'gt': [], 'hr': [], 'abl': [], 'full': []})
+tissue_n      = defaultdict(int)
+
+n_valid = 0
 print(f"\n开始推理（INFER_T={INFER_T}，N_RUNS={N_RUNS}，最多 {N_SAMPLES} 个有效样本）...")
 
 for i in range(len(dataset)):
     if n_valid >= N_SAMPLES:
         break
 
-    sample  = dataset[i]
-    hr_cpu  = sample['hr']
-    gt_lbl  = sample['gt_label_map']
-    gt_nuc  = sample['gt_nuc_mask'].bool()
+    sample    = dataset[i]
+    hr_cpu    = sample['hr']
+    gt_lbl    = sample['gt_label_map']
+    gt_nuc    = sample['gt_nuc_mask'].bool()
+    type_name = sample['type_name']           # patch 级 tissue type
 
     if gt_nuc.sum() < 10:
         continue
@@ -128,45 +134,50 @@ for i in range(len(dataset)):
     t  = torch.tensor([INFER_T], device=device)
 
     with torch.no_grad():
-        # CellViT(HR)：直接推理，无需集成（确定性输出）
         hr_cv  = run_cellvit(cellvit, hr)
         hr_lbl = hr_cv['nuclei_type_label'].squeeze(0).cpu()
-
-        sem = build_sem_tensor_from_cellvit(
+        sem    = build_sem_tensor_from_cellvit(
             hr_cv['nuclei_type_prob'],
             hr_cv['nuclei_nuc_prob'],
         )
 
-    # 消融模型集成推理（无 sem_tensor）
     abl_lbl  = infer_ensemble(unet_ablation, hr, t, sem=None)
-
-    # 完整模型集成推理（有 sem_tensor）
-    full_lbl = infer_ensemble(unet_full, hr, t, sem=sem)
+    full_lbl = infer_ensemble(unet_full,     hr, t, sem=sem)
 
     mask = gt_nuc.numpy()
+
+    # 全局
     all_gt.append(gt_lbl.numpy()[mask])
     all_hr.append(hr_lbl.numpy()[mask])
     all_abl.append(abl_lbl.numpy()[mask])
     all_full.append(full_lbl.numpy()[mask])
 
-    # 退步分析：同一 mask，单独存一份（与上面完全一致，便于后续独立分析）
+    # 退步分析
     regress_gt.append(gt_lbl.numpy()[mask])
     regress_hr.append(hr_lbl.numpy()[mask])
     regress_abl.append(abl_lbl.numpy()[mask])
     regress_full.append(full_lbl.numpy()[mask])
 
+    # Per-tissue
+    tissue_pixels[type_name]['gt'].append(gt_lbl.numpy()[mask])
+    tissue_pixels[type_name]['hr'].append(hr_lbl.numpy()[mask])
+    tissue_pixels[type_name]['abl'].append(abl_lbl.numpy()[mask])
+    tissue_pixels[type_name]['full'].append(full_lbl.numpy()[mask])
+    tissue_n[type_name] += 1
+
     if n_valid % 20 == 0:
-        print(f"  [{n_valid:>3}/{N_SAMPLES}] 样本 {i:>4}")
+        print(f"  [{n_valid:>3}/{N_SAMPLES}] 样本 {i:>4}  tissue={type_name}")
     n_valid += 1
 
 print(f"\n有效样本数: {n_valid}")
 
+# ── 拼接 ────────────────────────────────────────────────────────────
 all_gt   = np.concatenate(all_gt)
 all_hr   = np.concatenate(all_hr)
 all_abl  = np.concatenate(all_abl)
 all_full = np.concatenate(all_full)
 
-# ── 混淆矩阵 ────────────────────────────────────────────────────────
+# ── 全局混淆矩阵 ────────────────────────────────────────────────────
 labels  = list(range(6))
 cm_hr   = confusion_matrix(all_gt, all_hr,   labels=labels)
 cm_abl  = confusion_matrix(all_gt, all_abl,  labels=labels)
@@ -176,9 +187,9 @@ recall_hr   = np.diag(cm_hr)   / cm_hr.sum(axis=1).clip(min=1)
 recall_abl  = np.diag(cm_abl)  / cm_abl.sum(axis=1).clip(min=1)
 recall_full = np.diag(cm_full) / cm_full.sum(axis=1).clip(min=1)
 
-# ── 文字汇总 ────────────────────────────────────────────────────────
+# ── 全局文字汇总 ────────────────────────────────────────────────────
 print(f"\n{'='*80}")
-print("各类召回率对比（GT 核区域内）")
+print("各类召回率对比（GT 核区域内）—— 全局")
 print(f"{'='*80}")
 print(f"{'类别':>14}  {'HR基线':>10}  {'消融模型':>10}  "
       f"{'本文方法':>10}  {'Δ(本文-HR)':>12}")
@@ -200,37 +211,29 @@ print(f"\n整体准确率："
       f"本文={(all_full==all_gt).mean():.4f}")
 
 # ── 退步分析 ─────────────────────────────────────────────────────────
-# 定义：HR基线 AND 消融模型 均预测正确，但本文方法预测错误的像素
-# 即：both_correct_but_full_wrong
 print(f"\n{'='*80}")
 print("退步分析：HR基线 & 消融模型 均答对，但本文方法答错的像素")
 print(f"{'='*80}")
 
-rg   = np.concatenate(regress_gt)
-rhr  = np.concatenate(regress_hr)
-rabl = np.concatenate(regress_abl)
-rfull= np.concatenate(regress_full)
+rg    = np.concatenate(regress_gt)
+rhr   = np.concatenate(regress_hr)
+rabl  = np.concatenate(regress_abl)
+rfull = np.concatenate(regress_full)
 
-# 三路掩码
 hr_correct   = (rhr   == rg)
 abl_correct  = (rabl  == rg)
 full_correct = (rfull == rg)
 
-# 退步：前两个都对，本文错
 both_correct_full_wrong = hr_correct & abl_correct & ~full_correct
-
-# 只有本文对（供参考对比，即进步案例）
-only_full_correct = ~hr_correct & ~abl_correct & full_correct
+only_full_correct       = ~hr_correct & ~abl_correct & full_correct
 
 total_nuc = len(rg)
 n_regress  = both_correct_full_wrong.sum()
 n_improve  = only_full_correct.sum()
 
-print(f"\n  核区域总像素数       : {total_nuc:>10,}")
-print(f"  退步像素数 (两者对本文错): {n_regress:>10,}  "
-      f"({100*n_regress/total_nuc:.2f}%)")
-print(f"  进步像素数 (仅本文对)    : {n_improve:>10,}  "
-      f"({100*n_improve/total_nuc:.2f}%)")
+print(f"\n  核区域总像素数           : {total_nuc:>10,}")
+print(f"  退步像素数 (两者对本文错) : {n_regress:>10,}  ({100*n_regress/total_nuc:.2f}%)")
+print(f"  进步像素数 (仅本文对)     : {n_improve:>10,}  ({100*n_improve/total_nuc:.2f}%)")
 
 print(f"\n  按GT类别细分退步情况：")
 print(f"  {'类别':>14}  {'GT像素':>8}  {'退步像素':>8}  {'退步率':>8}  "
@@ -242,23 +245,82 @@ for cls_id, name in enumerate(CLASS_NAMES):
     regress_mask  = both_correct_full_wrong & gt_cls_mask
     n_gt_cls      = gt_cls_mask.sum()
     n_regress_cls = regress_mask.sum()
-
     if n_gt_cls == 0 or n_regress_cls == 0:
         continue
-
-    # 退步时，本文方法把该类误分成了哪些类
     wrong_preds = rfull[regress_mask]
     unique, counts = np.unique(wrong_preds, return_counts=True)
     top3 = sorted(zip(counts, unique), reverse=True)[:3]
-    top3_str = "  ".join(
-        f"{CLASS_NAMES[c]}({cnt})" for cnt, c in top3
-    )
-
+    top3_str = "  ".join(f"{CLASS_NAMES[c]}({cnt})" for cnt, c in top3)
     print(f"  {name:>14}  {n_gt_cls:>8,}  {n_regress_cls:>8,}  "
           f"{100*n_regress_cls/n_gt_cls:>7.2f}%  {top3_str}")
 
 print(f"\n  说明：退步 = HR基线正确 AND 消融模型正确 AND 本文方法错误")
 print(f"        进步 = HR基线错误 AND 消融模型错误 AND 本文方法正确")
+
+# ── Per-tissue 汇总 ─────────────────────────────────────────────────
+print(f"\n{'='*95}")
+print("按 Tissue Type 分组 —— 整体准确率 & 各类召回率（GT 核区域内）")
+print(f"{'='*95}")
+
+all_tissues = sorted(tissue_pixels.keys())
+
+# 输出每个 tissue 的整体准确率（三组对比）
+print(f"\n── 整体准确率（Overall Accuracy）──")
+print(f"{'Tissue':<22} {'N':>4}  {'HR基线':>8}  {'消融模型':>9}  {'本文方法':>9}  "
+      f"{'Δ(本文-HR)':>12}")
+print("-" * 80)
+
+for tname in all_tissues:
+    tp = tissue_pixels[tname]
+    tgt  = np.concatenate(tp['gt'])
+    thr  = np.concatenate(tp['hr'])
+    tabl = np.concatenate(tp['abl'])
+    tful = np.concatenate(tp['full'])
+    n    = tissue_n[tname]
+
+    oa_hr  = (thr  == tgt).mean()
+    oa_abl = (tabl == tgt).mean()
+    oa_ful = (tful == tgt).mean()
+    delta  = oa_ful - oa_hr
+    arrow  = '↑' if delta > 0.001 else ('↓' if delta < -0.001 else '—')
+
+    print(f"{tname:<22} {n:>4}  {oa_hr:>8.4f}  {oa_abl:>9.4f}  {oa_ful:>9.4f}  "
+          f"{delta:>+10.4f} {arrow}")
+
+# 输出每个 tissue 的各细胞类别召回率（仅展示本文方法，Δ vs HR基线）
+print(f"\n── 各细胞类别召回率：本文方法（Δ = 本文 − HR基线）──")
+
+# 表头：每列是一个细胞类别
+cell_classes_to_show = [c for c in range(1, 6)]   # 跳过 Background
+header_cls = "  ".join(f"{CLASS_NAMES[c]:>16}" for c in cell_classes_to_show)
+print(f"\n{'Tissue':<22} {'N':>4}  {header_cls}")
+print("-" * (26 + 18 * len(cell_classes_to_show)))
+
+for tname in all_tissues:
+    tp   = tissue_pixels[tname]
+    tgt  = np.concatenate(tp['gt'])
+    thr  = np.concatenate(tp['hr'])
+    tful = np.concatenate(tp['full'])
+    n    = tissue_n[tname]
+
+    tcm_hr   = confusion_matrix(tgt, thr,  labels=labels)
+    tcm_full = confusion_matrix(tgt, tful, labels=labels)
+    tr_hr    = np.diag(tcm_hr)   / tcm_hr.sum(axis=1).clip(min=1)
+    tr_full  = np.diag(tcm_full) / tcm_full.sum(axis=1).clip(min=1)
+
+    cls_str = ""
+    for c in cell_classes_to_show:
+        n_gt_c = tcm_hr.sum(axis=1)[c]
+        if n_gt_c == 0:
+            cls_str += f"{'  N/A':>16}  "
+        else:
+            delta = tr_full[c] - tr_hr[c]
+            arrow = '↑' if delta > 0.001 else ('↓' if delta < -0.001 else '—')
+            cls_str += f"{tr_full[c]:>6.4f}({delta:>+.4f}{arrow})  "
+
+    print(f"{tname:<22} {n:>4}  {cls_str}")
+
+print(f"\n{'='*95}")
 
 # ── 可视化 ───────────────────────────────────────────────────────────
 def plot_cm_normalized(ax, cm, title, class_names):
@@ -282,6 +344,7 @@ def plot_cm_normalized(ax, cm, title, class_names):
                     fontsize=7, color='white' if val > 0.5 else 'black')
     return im
 
+# 全局混淆矩阵（三合一）
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 fig.suptitle(
     f'Confusion Matrices — ensemble N={N_RUNS} runs '
@@ -298,4 +361,37 @@ os.makedirs('./logs', exist_ok=True)
 save_path = './logs/confusion_matrix_comparison_ablation_v3.png'
 plt.savefig(save_path, dpi=150, bbox_inches='tight')
 plt.close()
-print(f"\n混淆矩阵图已保存到: {save_path}")
+print(f"\n全局混淆矩阵图已保存到: {save_path}")
+
+# Per-tissue 整体准确率对比条形图
+n_tissues = len(all_tissues)
+fig, ax = plt.subplots(figsize=(max(10, n_tissues * 1.2), 5))
+
+x      = np.arange(n_tissues)
+width  = 0.25
+oa_hr_list, oa_abl_list, oa_ful_list = [], [], []
+
+for tname in all_tissues:
+    tp   = tissue_pixels[tname]
+    tgt  = np.concatenate(tp['gt'])
+    oa_hr_list.append((np.concatenate(tp['hr'])  == tgt).mean())
+    oa_abl_list.append((np.concatenate(tp['abl']) == tgt).mean())
+    oa_ful_list.append((np.concatenate(tp['full'])== tgt).mean())
+
+ax.bar(x - width, oa_hr_list,  width, label='HR baseline', color='#4878D0')
+ax.bar(x,         oa_abl_list, width, label='Ablation',    color='#EE854A')
+ax.bar(x + width, oa_ful_list, width, label='Full (ours)', color='#6ACC65')
+
+ax.set_xticks(x)
+ax.set_xticklabels(all_tissues, rotation=35, ha='right', fontsize=9)
+ax.set_ylabel('Overall Accuracy (nucleus region)')
+ax.set_title(f'Per-tissue Overall Accuracy — ensemble N={N_RUNS}')
+ax.legend()
+ax.set_ylim(0, 1.05)
+ax.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+
+tissue_bar_path = './logs/per_tissue_accuracy_comparison.png'
+plt.savefig(tissue_bar_path, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"Per-tissue 准确率条形图已保存到: {tissue_bar_path}")
