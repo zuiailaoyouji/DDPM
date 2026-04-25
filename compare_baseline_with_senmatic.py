@@ -61,11 +61,11 @@ def load_unet(ckpt_path: str, use_semantic: bool) -> torch.nn.Module:
 
 print("\n加载 UNet 模型...")
 unet_ablation = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_correction/best_unet_ablation.pth",
+    "/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_ablation.pth",
     use_semantic=False,
 )
 unet_full = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_correction/best_unet_correction.pth",
+    "/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_correction.pth",
     use_semantic=True,
 )
 
@@ -81,6 +81,38 @@ INFER_T   = 200
 N_RUNS    = 5    # 每张图推理次数，概率图取平均后 argmax
 N_SAMPLES = 200
 torch.manual_seed(42)
+
+# ── 分层采样：按 tissue type 均匀取样，避免顺序偏差 ────────────────
+import random, math
+random.seed(42)
+
+# 收集每个 tissue type 的有效索引（gt_nuc >= 10）
+from collections import defaultdict as _dd
+_type_to_idx = _dd(list)
+for _i in range(len(dataset)):
+    _s = dataset[_i]
+    if _s['gt_nuc_mask'].bool().sum() < 10:
+        continue
+    _type_to_idx[_s['type_name']].append(_i)
+
+_n_types = len(_type_to_idx)
+_per_type = max(1, math.ceil(N_SAMPLES / _n_types))   # 每类至多取几张
+
+sampled_indices = []
+for _tname, _idxs in sorted(_type_to_idx.items()):
+    _chosen = random.sample(_idxs, min(_per_type, len(_idxs)))
+    sampled_indices.extend(_chosen)
+
+# 打乱后截断到 N_SAMPLES
+random.shuffle(sampled_indices)
+sampled_indices = sampled_indices[:N_SAMPLES]
+
+_type_counts = {t: 0 for t in _type_to_idx}
+for _i in sampled_indices:
+    _type_counts[dataset[_i]['type_name']] += 1
+print(f"\n分层采样结果（共 {len(sampled_indices)} 张，覆盖 {_n_types} 种 tissue）：")
+for _t, _c in sorted(_type_counts.items(), key=lambda x: -x[1]):
+    print(f"  {_t:<25} {_c:>4} 张")
 
 
 # ── 集成推理 ─────────────────────────────────────────────────────────
@@ -137,18 +169,13 @@ print(f"{'idx':>4}  {'Tissue':<18}  {'HR_acc':>8}  {'Abl_acc':>9}  {'Full_acc':>
       f"{'Abl_PSNR':>10}  {'Full_PSNR':>10}")
 
 n_valid = 0
-for i in range(len(dataset)):
-    if n_valid >= N_SAMPLES:
-        break
+for i in sampled_indices:   # 分层采样索引，已预筛选 gt_nuc >= 10
 
     sample     = dataset[i]
     hr_cpu     = sample['hr']
     gt_lbl     = sample['gt_label_map']
     gt_nuc     = sample['gt_nuc_mask'].bool()
     type_name  = sample['type_name']          # patch 级 tissue type
-
-    if gt_nuc.sum() < 10:
-        continue
 
     hr = hr_cpu.unsqueeze(0).to(device)
 

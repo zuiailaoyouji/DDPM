@@ -61,11 +61,11 @@ def load_unet(ckpt_path: str, use_semantic: bool) -> torch.nn.Module:
 
 print("\n加载 UNet 模型...")
 unet_ablation = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_correction/best_unet_ablation.pth",
+    "/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_ablation.pth",
     use_semantic=False,
 )
 unet_full = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_correction/best_unet_correction.pth",
+    "/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_correction.pth",
     use_semantic=True,
 )
 
@@ -81,6 +81,36 @@ INFER_T   = 200
 N_RUNS    = 5
 N_SAMPLES = 200
 torch.manual_seed(42)
+
+# ── 分层采样：按 tissue type 均匀取样，避免顺序偏差 ────────────────
+import random, math
+random.seed(42)
+
+from collections import defaultdict as _dd
+_type_to_idx = _dd(list)
+for _i in range(len(dataset)):
+    _s = dataset[_i]
+    if _s['gt_nuc_mask'].bool().sum() < 10:
+        continue
+    _type_to_idx[_s['type_name']].append(_i)
+
+_n_types = len(_type_to_idx)
+_per_type = max(1, math.ceil(N_SAMPLES / _n_types))
+
+sampled_indices = []
+for _tname, _idxs in sorted(_type_to_idx.items()):
+    _chosen = random.sample(_idxs, min(_per_type, len(_idxs)))
+    sampled_indices.extend(_chosen)
+
+random.shuffle(sampled_indices)
+sampled_indices = sampled_indices[:N_SAMPLES]
+
+_type_counts = {t: 0 for t in _type_to_idx}
+for _i in sampled_indices:
+    _type_counts[dataset[_i]['type_name']] += 1
+print(f'\n分层采样结果（共 {len(sampled_indices)} 张，覆盖 {_n_types} 种 tissue）：')
+for _t, _c in sorted(_type_counts.items(), key=lambda x: -x[1]):
+    print(f'  {_t:<25} {_c:>4} 张')
 
 
 # ── 集成推理 ─────────────────────────────────────────────────────────
@@ -115,20 +145,15 @@ tissue_pixels = defaultdict(lambda: {'gt': [], 'hr': [], 'abl': [], 'full': []})
 tissue_n      = defaultdict(int)
 
 n_valid = 0
-print(f"\n开始推理（INFER_T={INFER_T}，N_RUNS={N_RUNS}，最多 {N_SAMPLES} 个有效样本）...")
+print(f"\n开始推理（INFER_T={INFER_T}，N_RUNS={N_RUNS}，共 {len(sampled_indices)} 个分层采样样本）...")
 
-for i in range(len(dataset)):
-    if n_valid >= N_SAMPLES:
-        break
+for i in sampled_indices:   # 分层采样索引，已预筛选 gt_nuc >= 10
 
     sample    = dataset[i]
     hr_cpu    = sample['hr']
     gt_lbl    = sample['gt_label_map']
     gt_nuc    = sample['gt_nuc_mask'].bool()
     type_name = sample['type_name']           # patch 级 tissue type
-
-    if gt_nuc.sum() < 10:
-        continue
 
     hr = hr_cpu.unsqueeze(0).to(device)
     t  = torch.tensor([INFER_T], device=device)
