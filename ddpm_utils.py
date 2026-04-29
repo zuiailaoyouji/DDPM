@@ -15,55 +15,87 @@ def load_cellvit(
     model_path: str,
     cellvit_repo_path: str = '/home/xuwen/DDPM/CellViT',
     device: str = 'cuda',
+    variant: str = 'sam_h',          # 'cellvit_256' 或 'sam_h'
 ):
     """
-    加载 CellViT-256 模型并冻结参数。
+    加载 CellViT 模型并冻结参数。支持 CellViT-256 与 CellViT-SAM-H。
 
     Args:
-        model_path       : 权重文件路径（.pth）
-        cellvit_repo_path: CellViT 代码仓库根目录
-        device           : 设备
-
-    Returns:
-        cellvit: 加载好并冻结参数的 CellViT 模型
+        model_path        : PanNuke fine-tuned 权重 (.pth)
+        cellvit_repo_path : CellViT 代码仓库根目录
+        device            : 'cuda' / 'cpu'
+        variant           : 'cellvit_256' 或 'sam_h'
     """
+    import inspect
+
     if cellvit_repo_path not in sys.path:
         sys.path.insert(0, cellvit_repo_path)
-
-    from models.segmentation.cell_segmentation.cellvit import CellViT256
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"CellViT 权重文件未找到: {model_path}")
 
-    print(f"正在加载 CellViT: {model_path} ...")
-
+    print(f"正在加载 CellViT[{variant}]: {model_path} ...")
     checkpoint = torch.load(model_path, map_location='cpu')
 
-    # 从 checkpoint 的 config 里读取类别数
-    run_conf          = checkpoint.get('config', {})
+    run_conf           = checkpoint.get('config', {})
     num_nuclei_classes = int(run_conf.get('data.num_nuclei_classes', 6))
     num_tissue_classes = int(run_conf.get('data.num_tissue_classes', 19))
 
-    model = CellViT256(
-        model256_path=model_path,
-        num_nuclei_classes=num_nuclei_classes,
-        num_tissue_classes=num_tissue_classes,
-    )
+    if variant == 'cellvit_256':
+        from models.segmentation.cell_segmentation.cellvit import CellViT256
+        model = CellViT256(
+            model256_path      = model_path,
+            num_nuclei_classes = num_nuclei_classes,
+            num_tissue_classes = num_tissue_classes,
+        )
 
-    msg = model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    elif variant == 'sam_h':
+        # CellViTSAM 与 CellViT256 在同一个文件
+        from models.segmentation.cell_segmentation.cellvit import CellViTSAM
+
+        # 自动签名匹配:不同版本 CellViT 仓库对参数名命名不同
+        # 这套逻辑沿用 test_cellvit_sam_h_standalone.py 中已验证可跑的方案
+        sig = inspect.signature(CellViTSAM.__init__)
+        params = sig.parameters
+        common_values = {
+            'model_path':         model_path,
+            'model256_path':      model_path,
+            'model_sam_path':     model_path,
+            'sam_model_path':     model_path,
+            'pretrained_encoder': model_path,
+            'num_nuclei_classes': num_nuclei_classes,
+            'num_tissue_classes': num_tissue_classes,
+            'nuclei_classes':     num_nuclei_classes,
+            'tissue_classes':     num_tissue_classes,
+            'vit_structure':      'SAM-H',
+        }
+        kwargs = {n: common_values[n] for n in params
+                  if n != 'self' and n in common_values}
+        print(f"  CellViTSAM kwargs: {list(kwargs.keys())}")
+        model = CellViTSAM(**kwargs)
+
+    else:
+        raise ValueError(f"未知 variant: {variant}, 应为 'cellvit_256' 或 'sam_h'")
+
+    # SAM-H checkpoint 可能有少量键不完全匹配,用 strict=False
+    state = checkpoint.get('model_state_dict', checkpoint)
+    msg   = model.load_state_dict(state, strict=False)
     if msg.missing_keys:
-        print(f"  缺失键: {len(msg.missing_keys)} 个")
+        print(f"  缺失键: {len(msg.missing_keys)} 个 "
+              f"(前5: {msg.missing_keys[:5]})")
     if msg.unexpected_keys:
-        print(f"  多余键: {len(msg.unexpected_keys)} 个")
+        print(f"  多余键: {len(msg.unexpected_keys)} 个 "
+              f"(前5: {msg.unexpected_keys[:5]})")
+    if len(msg.missing_keys) > 50 or len(msg.unexpected_keys) > 50:
+        print("  ⚠️ missing/unexpected 数量异常,请检查权重文件是否匹配")
 
     model = model.to(device)
     model.eval()
-
-    # 冻结所有参数
     for p in model.parameters():
         p.requires_grad = False
 
-    print(f"✓ CellViT 加载完成并已冻结 (num_nuclei_classes={num_nuclei_classes})")
+    print(f"✓ CellViT[{variant}] 加载完成并已冻结 "
+          f"(num_nuclei_classes={num_nuclei_classes})")
     return model
 
 

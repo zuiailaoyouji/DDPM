@@ -45,8 +45,11 @@ class TrainingConfig:
     oversample: bool = False
 
     # ── CellViT ─────────────────────────────────────────────────────
-    cellvit_path: Optional[str] = '/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth'
-    cellvit_repo: str           = '/home/xuwen/DDPM/CellViT'
+    # 'cellvit_256' = 旧 CellViT-256 教师
+    # 'sam_h'       = CellViT-SAM-H 教师(更强,约 25× 参数,但准确率更高)
+    cellvit_variant: str           = 'sam_h'
+    cellvit_path:    Optional[str] = '/home/xuwen/DDPM/CellViT/CellViT-SAM-H-x40.pth'
+    cellvit_repo:    str           = '/home/xuwen/DDPM/CellViT'
 
     # ── 基础训练 ─────────────────────────────────────────────────────
     epochs:     int   = 20
@@ -55,7 +58,7 @@ class TrainingConfig:
     device:     str   = 'cuda'
 
     # ── 保存 ─────────────────────────────────────────────────────────
-    save_dir:      str = './logs/checkpoints_correction'
+    save_dir:      str = './logs/checkpoints_correction_samh'
     save_interval: int = 10
 
     # ── 扩散 ─────────────────────────────────────────────────────────

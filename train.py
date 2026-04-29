@@ -107,6 +107,7 @@ def train(
                 model_path        = cfg_cellvit_path,
                 cellvit_repo_path = cfg_cellvit_repo,
                 device            = device,
+                variant           = _DEFAULT_CFG.cellvit_variant,   # ← 新增
             )
         else:
             print("⚠️  消融模式：未找到 CellViT 权重，验证时跳过 Dir_Acc 计算")
@@ -712,6 +713,9 @@ def main():
                    help='过采样的类别索引，默认[2]即Inflammatory')
     p.add_argument('--oversample_min_pixels', type=int, default=500,
                    help='目标类别像素数阈值，超过此值才纳入过采样（默认500）')
+    p.add_argument('--cellvit_variant', default=cfg.cellvit_variant,
+               choices=['cellvit_256', 'sam_h'],
+               help='教师判别器版本 (默认 sam_h)')
 
     args         = p.parse_args()
     use_semantic = not args.no_semantic
@@ -739,6 +743,7 @@ def main():
             model_path        = args.cellvit_path,
             cellvit_repo_path = args.cellvit_repo,
             device            = device,
+            variant           = _DEFAULT_CFG.cellvit_variant,
         )
     else:
         print(f"消融模式：跳过 CellViT 加载")
