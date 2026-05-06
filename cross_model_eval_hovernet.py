@@ -49,6 +49,7 @@ SPM-UNet 训练时使用 CellViT 作为语义教师（判别器），
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -63,10 +64,10 @@ import torch.nn.functional as F
 # ── 路径配置（可通过命令行覆盖） ────────────────────────────────────
 HOVERNET_REPO   = '/home/xuwen/DDPM/HoVer-net'
 HOVERNET_CKPT   = '/home/xuwen/DDPM/HoVer-net/hovernet_fast_pannuke_type_tf2pytorch.tar'
-CELLVIT_PATH    = '/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth'
+CELLVIT_PATH    = '/home/xuwen/DDPM/CellViT/CellViT-SAM-H-x40.pth'
 CELLVIT_REPO    = '/home/xuwen/DDPM/CellViT'
-UNET_ABL_PATH   = '/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_ablation.pth'
-UNET_FULL_PATH  = '/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_correction.pth'
+UNET_ABL_PATH   = '/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_ablation.pth'
+UNET_FULL_PATH  = '/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_correction.pth'
 PANNUKE_FOLD3   = '/data/xuwen/PanNuke/Fold 3'
 
 CLASS_NAMES = ['Background', 'Neoplastic', 'Inflammatory',
@@ -243,6 +244,12 @@ def main():
     parser.add_argument('--n_runs',    type=int, default=5)
     parser.add_argument('--infer_t',   type=int, default=200)
     parser.add_argument('--device',    default='cuda')
+    parser.add_argument(
+        '--cellvit_results_json',
+        default='./logs/downstream_Cellvitsamh/cellvit_results.json',
+        help='CellViT 评估结果 JSON 路径(由 compare_baseline_with_senmatic.py + '
+             'confusion_matrix_compare.py 产出)。若文件不存在,跳过反差列。'
+    )
     args = parser.parse_args()
 
     device    = args.device
@@ -250,6 +257,33 @@ def main():
     N_RUNS    = args.n_runs
     INFER_T   = args.infer_t
     OUT_SIZE  = HOVERNET_OUTPUT_SIZE
+
+    # ── 改善率工具 ──────────────────────────────────────────────────
+    def _improvement_ratio(hr_val, full_val, upper=1.0):
+        """适用于"越高越好"的指标。Δ / (上限 − HR)。"""
+        gap = upper - hr_val
+        if gap <= 1e-8 or hr_val != hr_val:
+            return float('nan')
+        return (full_val - hr_val) / gap
+
+    def _fmt_pct(r):
+        if isinstance(r, float) and r != r:
+            return f"{'N/A':>7}"
+        return f"{r*100:>+6.1f}%"
+
+    # ── 加载 CellViT 评估结果 JSON(可选)─────────────────────────────
+    cellvit_json = None
+    if os.path.exists(args.cellvit_results_json):
+        try:
+            with open(args.cellvit_results_json, 'r', encoding='utf-8') as f:
+                cellvit_json = json.load(f)
+            print(f"\n  ✅ 已加载 CellViT 评估结果: {args.cellvit_results_json}")
+        except Exception as e:
+            print(f"\n  ⚠️ 无法读取 CellViT JSON ({e}),将跳过反差列")
+            cellvit_json = None
+    else:
+        print(f"\n  ⚠️ 未找到 CellViT JSON ({args.cellvit_results_json}),"
+              f"将只显示 HoVer-Net 自己的指标")
 
     # ── 添加项目路径 ─────────────────────────────────────────────────
     sys.path.insert(0, CELLVIT_REPO)
@@ -278,6 +312,7 @@ def main():
         model_path        = CELLVIT_PATH,
         cellvit_repo_path = CELLVIT_REPO,
         device            = device,
+        variant           = 'sam_h',
     )
 
     print("\n加载 HoVer-Net...")
@@ -477,10 +512,16 @@ def main():
           f"中心 {OUT_SIZE}×{OUT_SIZE}）")
     print(f"{'=' * W}")
 
-    print(f"\n各类召回率对比（GT 核区域内）")
+    print(f"\n各类召回率对比(GT 核区域内,加跨模型反差列)")
     print(f"{'=' * W}")
-    print(f"{'类别':>14}  {'HR基线':>10}  {'消融模型':>10}  "
-          f"{'本文方法':>10}  {'Δ(本文-HR)':>12}")
+    has_cv_recall = cellvit_json is not None and 'confusion_matrix' in (cellvit_json or {}) \
+                    and 'recall_per_class' in cellvit_json['confusion_matrix']
+    if has_cv_recall:
+        print(f"{'类别':>14}  {'HR(HV)':>8}  {'本文(HV)':>9}  "
+              f"{'改善率(HV)':>10}  {'改善率(CV)':>10}  {'反差Δ%':>9}")
+    else:
+        print(f"{'类别':>14}  {'HR基线':>10}  {'消融模型':>10}  "
+              f"{'本文方法':>10}  {'Δ(本文-HR)':>12}  {'改善率':>9}")
     print("-" * W)
 
     for i in range(nr_types):
@@ -490,18 +531,55 @@ def main():
             continue
         delta = recall_full[i] - recall_hr[i]
         arrow = '↑' if delta > 0.001 else ('↓' if delta < -0.001 else '—')
-        print(f"{name:>14}  {recall_hr[i]:>10.4f}  {recall_abl[i]:>10.4f}  "
-              f"{recall_full[i]:>10.4f}  {delta:>+10.4f} {arrow}  "
-              f"(GT={n_gt:>8})")
+        imp_hv = _improvement_ratio(recall_hr[i], recall_full[i])
+
+        if has_cv_recall:
+            cv_entry = cellvit_json['confusion_matrix']['recall_per_class'].get(name)
+            if cv_entry and cv_entry.get('improvement_ratio') is not None:
+                imp_cv = cv_entry['improvement_ratio']
+                # 反差:HoVer-Net 改善率 vs CellViT 改善率 的差(百分点)
+                gap = (imp_hv - imp_cv) * 100 if not (math.isnan(imp_hv) or imp_cv != imp_cv) \
+                      else float('nan')
+                gap_s = f"{gap:>+7.1f}pp" if not (isinstance(gap, float) and math.isnan(gap)) \
+                        else f"{'N/A':>9}"
+                imp_cv_s = f"{imp_cv*100:>+7.1f}%"
+            else:
+                imp_cv_s = f"{'N/A':>9}"; gap_s = f"{'N/A':>9}"
+            print(f"{name:>14}  {recall_hr[i]:>8.4f}  {recall_full[i]:>9.4f}  "
+                  f"{_fmt_pct(imp_hv):>10}  {imp_cv_s:>10}  {gap_s:>9}")
+        else:
+            print(f"{name:>14}  {recall_hr[i]:>10.4f}  {recall_abl[i]:>10.4f}  "
+                  f"{recall_full[i]:>10.4f}  {delta:>+10.4f} {arrow}  {_fmt_pct(imp_hv):>9}")
+
+    if has_cv_recall:
+        print("\n  说明:HV = HoVer-Net 评估,CV = CellViT 评估")
+        print("       反差Δ% = 改善率(HV) − 改善率(CV),单位百分点(pp)")
+        print("       理想情况:|反差| 较小 → DGFR 修改对两种判别器的提升幅度接近 → 跨模型泛化")
 
     oa_hr   = (all_hr   == all_gt).mean()
     oa_abl  = (all_abl  == all_gt).mean()
     oa_full = (all_full == all_gt).mean()
-    print(f"\n整体准确率（Overall Accuracy）：")
+    imp_oa_hv = _improvement_ratio(oa_hr, oa_full)
+    print(f"\n整体准确率(Overall Accuracy)：")
     print(f"  HR基线  = {oa_hr:.4f}")
     print(f"  消融模型 = {oa_abl:.4f}")
     print(f"  本文方法 = {oa_full:.4f}  Δ(vs HR) = {oa_full - oa_hr:+.4f}  "
           f"Δ(vs 消融) = {oa_full - oa_abl:+.4f}")
+    print(f"  改善率(HV)= {_fmt_pct(imp_oa_hv)} (HR→1.0 差距覆盖)")
+
+    # CellViT 反差(若有 JSON)
+    if cellvit_json and 'global' in cellvit_json:
+        cv_g = cellvit_json['global']
+        cv_imp = cv_g.get('improvement_ratio_oa_full_vs_hr')
+        cv_oa = cv_g.get('overall_acc', {})
+        if cv_imp is not None and cv_oa.get('hr') is not None:
+            print(f"\n  ── 跨模型反差(Overall Accuracy)──")
+            print(f"  HR  : HoVer-Net = {oa_hr:.4f}    CellViT = {cv_oa['hr']:.4f}")
+            print(f"  Full: HoVer-Net = {oa_full:.4f}    CellViT = {cv_oa['full']:.4f}")
+            print(f"  改善率: HoVer-Net = {_fmt_pct(imp_oa_hv)}    "
+                  f"CellViT = {_fmt_pct(cv_imp)}")
+            gap_pp = (imp_oa_hv - cv_imp) * 100
+            print(f"  反差 = {gap_pp:+.2f} pp (越接近 0,跨模型泛化越好)")
 
     # ── 交集区域准确率（HoVer-Net(HR) 判对的区域） ────────────────────
     inter_mask = (all_gt > 0) & (all_hr == all_gt)
@@ -516,61 +594,87 @@ def main():
         print(f"  交集像素数 = {inter_mask.sum():,}  "
               f"占核区域比例 = {inter_mask.mean():.3f}")
 
-    # ── 退步/进步分析 ────────────────────────────────────────────────
+    # ── 错误重定向分析(HoVer-Net 视角,与主脚本 confusion_matrix_compare 一致)
     print(f"\n{'=' * W}")
-    print("退步/进步分析（HoVer-Net 视角）")
+    print("错误重定向分析(HR 错的修复 vs HR 对的引入)")
     print(f"{'=' * W}")
 
     hr_correct   = (all_hr   == all_gt)
-    abl_correct  = (all_abl  == all_gt)
     full_correct = (all_full == all_gt)
 
-    both_correct_full_wrong = hr_correct & abl_correct & ~full_correct
-    only_full_correct       = ~hr_correct & ~abl_correct & full_correct
+    # 修复:HR 错 → Full 对
+    error_corrected   = (~hr_correct) & full_correct
+    # 引入:HR 对 → Full 错
+    error_introduced  =  hr_correct & (~full_correct)
 
-    total_nuc  = len(all_gt)
-    n_regress  = both_correct_full_wrong.sum()
-    n_improve  = only_full_correct.sum()
+    n_corrected   = int(error_corrected.sum())
+    n_introduced  = int(error_introduced.sum())
+    n_hr_wrong    = int((~hr_correct).sum())
+    n_hr_right    = int(hr_correct.sum())
+    rate_corrected   = n_corrected  / max(n_hr_wrong, 1)
+    rate_introduced  = n_introduced / max(n_hr_right, 1)
+    redirect_ratio   = n_corrected  / max(n_introduced, 1)
 
-    print(f"\n  核区域总像素数            : {total_nuc:>10,}")
-    print(f"  退步像素数 (两者对本文错)  : {n_regress:>10,}  "
-          f"({100 * n_regress / total_nuc:.2f}%)")
-    print(f"  进步像素数 (仅本文对)      : {n_improve:>10,}  "
-          f"({100 * n_improve / total_nuc:.2f}%)")
-    print(f"  进步/退步比                : "
-          f"{n_improve / max(n_regress, 1):.2f}x")
+    print(f"\n  HR 错误像素总数         : {n_hr_wrong:>10,}")
+    print(f"  Full 修复的错误像素     : {n_corrected:>10,}  "
+          f"(纠正率 = {rate_corrected*100:>5.2f}%)")
+    print(f"  HR 正确像素总数         : {n_hr_right:>10,}")
+    print(f"  Full 引入的新错误像素   : {n_introduced:>10,}  "
+          f"(引入率 = {rate_introduced*100:>5.2f}%)")
+    print(f"  纠错/引入比             : {redirect_ratio:>10.2f}x   "
+          f"(每引入 1 个错误,纠正 {redirect_ratio:.2f} 个;越大越好)")
 
-    print(f"\n  按 GT 类别细分退步情况：")
-    print(f"  {'类别':>14}  {'GT像素':>8}  {'退步像素':>8}  {'退步率':>8}  "
-          f"{'退步时被误分为（Top-3）'}")
-    print(f"  {'-' * 75}")
+    # 跨模型反差(若有 CellViT JSON)
+    if cellvit_json and 'confusion_matrix' in cellvit_json \
+            and 'error_redirect' in cellvit_json['confusion_matrix']:
+        cv_er = cellvit_json['confusion_matrix']['error_redirect']
+        cv_ratio = cv_er.get('redirect_ratio')
+        if cv_ratio is not None:
+            print(f"\n  ── 跨模型反差(纠错/引入比)──")
+            print(f"  HoVer-Net : {redirect_ratio:.2f}x")
+            print(f"  CellViT   : {cv_ratio:.2f}x")
+            print(f"  反差比例  : {redirect_ratio/cv_ratio:.2f}  "
+                  f"(接近 1.0 → 跨模型泛化好)")
 
+    # 按 GT 类别看修复 vs 引入
+    print(f"\n  按 GT 类别细分:")
+    print(f"  {'类别':>14}  {'GT像素':>8}  {'修复像素':>8}  {'修复率':>7}  "
+          f"{'引入像素':>8}  {'引入率':>7}")
+    print(f"  {'-' * 70}")
     for cls_id in range(nr_types):
         name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f'Class_{cls_id}'
-        gt_cls_mask   = (all_gt == cls_id)
-        regress_mask  = both_correct_full_wrong & gt_cls_mask
-        n_gt_cls      = gt_cls_mask.sum()
-        n_regress_cls = regress_mask.sum()
-        if n_gt_cls == 0 or n_regress_cls == 0:
+        gt_cls_mask = (all_gt == cls_id)
+        n_gt_cls = int(gt_cls_mask.sum())
+        if n_gt_cls == 0:
             continue
-        wrong_preds = all_full[regress_mask]
-        unique, counts = np.unique(wrong_preds, return_counts=True)
-        top3 = sorted(zip(counts, unique), reverse=True)[:3]
-        top3_str = "  ".join(
-            f"{CLASS_NAMES[c] if c < len(CLASS_NAMES) else f'Cls{c}'}({cnt})"
-            for cnt, c in top3)
-        print(f"  {name:>14}  {n_gt_cls:>8,}  {n_regress_cls:>8,}  "
-              f"{100 * n_regress_cls / n_gt_cls:>7.2f}%  {top3_str}")
+        cls_corrected_n  = int((error_corrected  & gt_cls_mask).sum())
+        cls_introduced_n = int((error_introduced & gt_cls_mask).sum())
+        cls_wrong_n      = int(((~hr_correct) & gt_cls_mask).sum())
+        cls_right_n      = int((hr_correct  & gt_cls_mask).sum())
+        cls_corr_rate = cls_corrected_n  / max(cls_wrong_n, 1)
+        cls_intr_rate = cls_introduced_n / max(cls_right_n, 1)
+        print(f"  {name:>14}  {n_gt_cls:>8,}  {cls_corrected_n:>8,}  "
+              f"{cls_corr_rate*100:>6.2f}%  {cls_introduced_n:>8,}  "
+              f"{cls_intr_rate*100:>6.2f}%")
 
     # ── Per-tissue 汇总 ─────────────────────────────────────────────
     all_tissues = sorted(tissue_pixels.keys())
 
     print(f"\n{'=' * W}")
-    print("按 Tissue Type 分组 —— 整体准确率（HoVer-Net 评估）")
+    print("按 Tissue Type 分组 —— 整体准确率(HoVer-Net 评估,带改善率与提升最大类)")
     print(f"{'=' * W}")
-    print(f"{'Tissue':<22} {'N':>4}  {'HR基线':>8}  {'消融模型':>9}  "
-          f"{'本文方法':>9}  {'Δ(本文-HR)':>12}")
-    print("-" * W)
+    has_cv_pt = cellvit_json is not None and 'confusion_matrix' in (cellvit_json or {}) \
+                and 'per_tissue_cm' in cellvit_json['confusion_matrix']
+    if has_cv_pt:
+        print(f"{'Tissue':<22}{'N':>4}  {'HR(HV)':>8}  {'Full(HV)':>9}  "
+              f"{'改善率(HV)':>10}  {'改善率(CV)':>10}  {'反差pp':>8}  {'提升最大类':<22}")
+    else:
+        print(f"{'Tissue':<22}{'N':>4}  {'HR':>8}  {'消融':>9}  {'本文':>9}  "
+              f"{'Δ':>9}  {'改善率':>9}  {'提升最大类':<22}")
+    print("-" * (W + 30))
+
+    # 收集 per-tissue 用于条形图
+    pt_oa_hr_list, pt_oa_abl_list, pt_oa_ful_list = [], [], []
 
     for tname in all_tissues:
         tp   = tissue_pixels[tname]
@@ -580,45 +684,48 @@ def main():
         tful = np.concatenate(tp['full'])
         n    = tissue_n[tname]
 
-        t_oa_hr  = (thr  == tgt).mean()
-        t_oa_abl = (tabl == tgt).mean()
-        t_oa_ful = (tful == tgt).mean()
+        t_oa_hr  = float((thr  == tgt).mean())
+        t_oa_abl = float((tabl == tgt).mean())
+        t_oa_ful = float((tful == tgt).mean())
         delta    = t_oa_ful - t_oa_hr
-        arrow    = '↑' if delta > 0.001 else ('↓' if delta < -0.001 else '—')
+        imp_hv   = _improvement_ratio(t_oa_hr, t_oa_ful)
 
-        print(f"{tname:<22} {n:>4}  {t_oa_hr:>8.4f}  {t_oa_abl:>9.4f}  "
-              f"{t_oa_ful:>9.4f}  {delta:>+10.4f} {arrow}")
-
-    # ── Per-tissue 各细胞类别召回率 ──────────────────────────────────
-    print(f"\n── 各细胞类别召回率：本文方法（Δ = 本文 − HR基线）──")
-    cell_cls = [c for c in range(1, min(nr_types, 6))]
-    header   = "  ".join(f"{CLASS_NAMES[c]:>16}" for c in cell_cls)
-    print(f"\n{'Tissue':<22} {'N':>4}  {header}")
-    print("-" * (26 + 18 * len(cell_cls)))
-
-    for tname in all_tissues:
-        tp   = tissue_pixels[tname]
-        tgt  = np.concatenate(tp['gt'])
-        thr  = np.concatenate(tp['hr'])
-        tful = np.concatenate(tp['full'])
-        n    = tissue_n[tname]
-
+        # 找该 tissue 的提升最大类
         tcm_hr   = confusion_matrix(tgt, thr,  labels=labels)
         tcm_full = confusion_matrix(tgt, tful, labels=labels)
         tr_hr    = np.diag(tcm_hr)   / tcm_hr.sum(axis=1).clip(min=1)
         tr_full  = np.diag(tcm_full) / tcm_full.sum(axis=1).clip(min=1)
+        cls_deltas = [(c, tr_full[c] - tr_hr[c])
+                      for c in range(1, min(nr_types, 6))
+                      if tcm_hr.sum(axis=1)[c] >= 30]
+        if cls_deltas:
+            best_c, best_d = max(cls_deltas, key=lambda x: x[1])
+            best_str = f"{CLASS_NAMES[best_c]}({best_d:+.3f})"
+        else:
+            best_str = "—"
 
-        cls_str = ""
-        for c in cell_cls:
-            n_gt_c = tcm_hr.sum(axis=1)[c]
-            if n_gt_c == 0:
-                cls_str += f"{'  N/A':>16}  "
+        pt_oa_hr_list.append(t_oa_hr); pt_oa_abl_list.append(t_oa_abl); pt_oa_ful_list.append(t_oa_ful)
+
+        if has_cv_pt:
+            cv_pt = cellvit_json['confusion_matrix']['per_tissue_cm'].get(tname, {})
+            cv_imp = cv_pt.get('improvement_ratio')
+            if cv_imp is not None and not (isinstance(imp_hv, float) and math.isnan(imp_hv)):
+                gap_pp = (imp_hv - cv_imp) * 100
+                gap_s  = f"{gap_pp:>+6.1f}pp"
+                imp_cv_s = f"{cv_imp*100:>+7.1f}%"
             else:
-                delta = tr_full[c] - tr_hr[c]
-                arrow = '↑' if delta > 0.001 else ('↓' if delta < -0.001 else '—')
-                cls_str += f"{tr_full[c]:>6.4f}({delta:>+.4f}{arrow})  "
+                gap_s = f"{'N/A':>8}"; imp_cv_s = f"{'N/A':>10}"
+            print(f"{tname:<22}{n:>4}  {t_oa_hr:>8.4f}  {t_oa_ful:>9.4f}  "
+                  f"{_fmt_pct(imp_hv):>10}  {imp_cv_s:>10}  {gap_s:>8}  {best_str:<22}")
+        else:
+            arrow = '↑' if delta > 0.001 else ('↓' if delta < -0.001 else '—')
+            print(f"{tname:<22}{n:>4}  {t_oa_hr:>8.4f}  {t_oa_abl:>9.4f}  "
+                  f"{t_oa_ful:>9.4f}  {delta:>+8.4f}{arrow}  "
+                  f"{_fmt_pct(imp_hv):>9}  {best_str:<22}")
 
-        print(f"{tname:<22} {n:>4}  {cls_str}")
+    # 注:Per-tissue × per-cell-type 二维表已被合并为上表的"提升最大类"列
+    # 详细的各类召回率分析见 confusion_matrix_compare.py(CellViT 视角)
+
 
     print(f"\n{'=' * W}")
 
@@ -660,8 +767,8 @@ def main():
     plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04, label='Recall')
     plt.tight_layout()
 
-    os.makedirs('./logs', exist_ok=True)
-    cm_path = './logs/cross_model_confusion_matrix_hovernet.png'
+    cm_path = './logs/downstream_Cellvitsamh/cross_model_confusion_matrix_hovernet.png'
+    os.makedirs(os.path.dirname(cm_path) or '.', exist_ok=True)
     plt.savefig(cm_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"\n混淆矩阵图已保存: {cm_path}")
@@ -672,18 +779,10 @@ def main():
 
     x     = np.arange(n_tissues)
     width = 0.25
-    oa_hr_list, oa_abl_list, oa_ful_list = [], [], []
-
-    for tname in all_tissues:
-        tp   = tissue_pixels[tname]
-        tgt  = np.concatenate(tp['gt'])
-        oa_hr_list.append((np.concatenate(tp['hr'])   == tgt).mean())
-        oa_abl_list.append((np.concatenate(tp['abl']) == tgt).mean())
-        oa_ful_list.append((np.concatenate(tp['full'])== tgt).mean())
-
-    ax.bar(x - width, oa_hr_list,  width, label='HR baseline', color='#4878D0')
-    ax.bar(x,         oa_abl_list, width, label='Ablation',    color='#EE854A')
-    ax.bar(x + width, oa_ful_list, width, label='Full (ours)', color='#6ACC65')
+    # 复用上面 per-tissue 主表已计算的数据,避免重复 concatenate
+    ax.bar(x - width, pt_oa_hr_list,  width, label='HR baseline', color='#4878D0')
+    ax.bar(x,         pt_oa_abl_list, width, label='Ablation',    color='#EE854A')
+    ax.bar(x + width, pt_oa_ful_list, width, label='Full (ours)', color='#6ACC65')
 
     ax.set_xticks(x)
     ax.set_xticklabels(all_tissues, rotation=35, ha='right', fontsize=9)
@@ -695,26 +794,211 @@ def main():
     ax.grid(axis='y', alpha=0.3)
     plt.tight_layout()
 
-    tissue_path = './logs/cross_model_per_tissue_accuracy_hovernet.png'
+    tissue_path = './logs/downstream_Cellvitsamh/cross_model_per_tissue_accuracy_hovernet.png'
+    os.makedirs(os.path.dirname(tissue_path) or '.', exist_ok=True)
     plt.savefig(tissue_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Per-tissue 准确率图已保存: {tissue_path}")
 
-    # ── 与 CellViT 评估结果的对比提示 ────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # 绝对 Δ 纵向对比表 —— 跨模型泛化性的核心证据
+    # 不依赖改善率(分母 1−HR 受 baseline 差距影响),只看 Δ 和方向一致性
+    # ─────────────────────────────────────────────────────────────────────
+    if cellvit_json:
+        print(f"\n{'=' * W}")
+        print("绝对 Δ 纵向对比 —— 跨模型方向一致性")
+        print("(避开 baseline 差距问题:核心看两评估器 Δ 是否同号且同方向)")
+        print(f"{'=' * W}")
+
+        rows = []   # (指标, cv_hr, cv_full, cv_delta, hv_hr, hv_full, hv_delta, 类型)
+        # 1. Overall Accuracy
+        cv_g = cellvit_json.get('global', {})
+        cv_oa = cv_g.get('overall_acc', {}) or {}
+        cv_oa_hr   = cv_oa.get('hr')
+        cv_oa_full = cv_oa.get('full')
+        if cv_oa_hr is not None and cv_oa_full is not None:
+            cv_d = cv_oa_full - cv_oa_hr
+            hv_d = oa_full - oa_hr
+            rows.append(('Overall_Acc', cv_oa_hr, cv_oa_full, cv_d,
+                         oa_hr, oa_full, hv_d, 'higher_better'))
+
+        # 2. 各类召回率
+        cv_rpc = (cellvit_json.get('confusion_matrix') or {}).get('recall_per_class', {})
+        for i in range(nr_types):
+            n_gt = cm_hr.sum(axis=1)[i]
+            if n_gt == 0:
+                continue
+            name = CLASS_NAMES[i] if i < len(CLASS_NAMES) else f'Class_{i}'
+            if name == 'Background':
+                continue
+            cv_e = cv_rpc.get(name)
+            if cv_e is None or cv_e.get('recall_hr') is None:
+                continue
+            cv_d = cv_e['recall_full'] - cv_e['recall_hr']
+            hv_d = recall_full[i] - recall_hr[i]
+            rows.append((f'Recall_{name}',
+                         cv_e['recall_hr'], cv_e['recall_full'], cv_d,
+                         recall_hr[i], recall_full[i], hv_d, 'higher_better'))
+
+        # 3. 纠错/引入比(越大越好)
+        cv_er = (cellvit_json.get('confusion_matrix') or {}).get('error_redirect', {})
+        cv_ratio = cv_er.get('redirect_ratio')
+        if cv_ratio is not None:
+            # 这里的 hr 列填 1.0 作为参考(纠错=引入时为 1.0,无修改时也接近 1.0)
+            # 所以"Δ"近似 ratio − 1.0,正值表示净纠错
+            rows.append(('纠错/引入比', 1.0, cv_ratio, cv_ratio - 1.0,
+                         1.0, redirect_ratio, redirect_ratio - 1.0,
+                         'ratio'))
+
+        # 表头
+        print(f"{'指标':<22}  {'CV: HR / Full / Δ':^28}  {'HV: HR / Full / Δ':^28}  {'方向':>6}")
+        print("-" * (22 + 30 + 30 + 8))
+
+        n_consistent = 0
+        n_total = 0
+        for r in rows:
+            metric, cv_hr_v, cv_full_v, cv_d, hv_hr_v, hv_full_v, hv_d, kind = r
+            n_total += 1
+            same_sign = (cv_d >= 0 and hv_d >= 0) or (cv_d < 0 and hv_d < 0)
+            if same_sign:
+                n_consistent += 1
+            arrow = '✓ 同向' if same_sign else '✗ 反向'
+            if kind == 'ratio':
+                cv_str = f"{cv_hr_v:>5.2f}/{cv_full_v:>5.2f}/{cv_d:>+5.2f}"
+                hv_str = f"{hv_hr_v:>5.2f}/{hv_full_v:>5.2f}/{hv_d:>+5.2f}"
+            else:
+                cv_str = f"{cv_hr_v:>6.4f}/{cv_full_v:>6.4f}/{cv_d:>+7.4f}"
+                hv_str = f"{hv_hr_v:>6.4f}/{hv_full_v:>6.4f}/{hv_d:>+7.4f}"
+            print(f"{metric:<22}  {cv_str:^28}  {hv_str:^28}  {arrow:>6}")
+
+        # 方向一致性总判
+        consistency_rate = n_consistent / max(n_total, 1)
+        print(f"\n  方向一致性: {n_consistent}/{n_total} = {consistency_rate*100:.0f}%")
+        print(f"  说明:'同向' = 两评估器都看到 Δ 同号(都正/都负),不依赖 baseline 大小。")
+        print(f"      论点核心:DGFR 修改方向具有跨模型可迁移性。")
+
+    # ── 实验总结(重写:基于方向一致性 + 绝对 Δ + 净纠错,不依赖改善率反差) ──
     print(f"\n{'=' * W}")
     print("实验总结")
     print(f"{'=' * W}")
-    print(f"\n本实验使用 HoVer-Net（训练时未见过的判别器）评估 SPM-UNet 的推理结果。")
-    print(f"若本文方法在 HoVer-Net 评估下仍优于消融模型和 HR 基线，")
-    print(f"则说明图像修改具有跨模型泛化性，不是过拟合到 CellViT 的决策边界。")
-    print(f"\n关键指标：")
-    print(f"  Overall Accuracy  Δ(本文 vs HR)  = {oa_full - oa_hr:+.4f}")
-    print(f"  Overall Accuracy  Δ(本文 vs 消融) = {oa_full - oa_abl:+.4f}")
-    print(f"  进步/退步比                       = "
-          f"{n_improve / max(n_regress, 1):.2f}x")
-    print(f"\n请将上述结果与 CellViT 评估结果（compare_baseline_with_semantic.py）对比，")
-    print(f"以验证跨模型泛化性。")
+    print(f"\n本实验使用 HoVer-Net(训练时未见过的判别器)评估 SPM-UNet 的推理结果。")
+    print(f"\n关键指标(HoVer-Net 评估):")
+    print(f"  Overall Accuracy  Δ(Full − HR)     = {oa_full - oa_hr:+.4f}  "
+          f"{'(正向)' if oa_full > oa_hr else '(负向!)'}")
+    print(f"  Overall Accuracy  改善率           = {_fmt_pct(imp_oa_hv)}")
+    print(f"  纠错/引入比                        = {redirect_ratio:.2f}x  "
+          f"{'(净纠错)' if redirect_ratio > 1.0 else '(净退步!)'}")
+
+    if cellvit_json and 'global' in cellvit_json:
+        cv_imp = cellvit_json['global'].get('improvement_ratio_oa_full_vs_hr')
+        cv_oa_full = (cellvit_json['global'].get('overall_acc') or {}).get('full')
+        cv_oa_hr_v = (cellvit_json['global'].get('overall_acc') or {}).get('hr')
+        cv_er_ratio = ((cellvit_json.get('confusion_matrix') or {})
+                       .get('error_redirect') or {}).get('redirect_ratio')
+
+        # 多维度评判,不再只看改善率反差
+        print(f"\n  ── 跨模型一致性多维度判定 ──")
+        cv_oa_delta = (cv_oa_full - cv_oa_hr_v) if (cv_oa_full is not None and cv_oa_hr_v is not None) else None
+        cond_oa = (oa_full > oa_hr) and (cv_oa_delta is not None and cv_oa_delta > 0)
+        cond_redir = (redirect_ratio > 1.0) and (cv_er_ratio is not None and cv_er_ratio > 1.0)
+        cond_consistency = (consistency_rate >= 0.7) if 'consistency_rate' in locals() else None
+
+        cv_oa_d_str = f"{cv_oa_delta:+.4f}" if cv_oa_delta is not None else "N/A"
+        print(f"  ① 两评估器 Δ(Overall Acc) 同正?  "
+              f"{'✅' if cond_oa else '❌'}  "
+              f"(HV={oa_full-oa_hr:+.4f}, CV={cv_oa_d_str})")
+
+        if cv_er_ratio is not None:
+            print(f"  ② 两评估器纠错/引入比 > 1?       "
+                  f"{'✅' if cond_redir else '❌'}  "
+                  f"(HV={redirect_ratio:.2f}x, CV={cv_er_ratio:.2f}x)")
+        else:
+            print(f"  ② 两评估器纠错/引入比 > 1?       N/A")
+
+        if cond_consistency is not None:
+            print(f"  ③ 方向一致性 ≥ 70%?             "
+                  f"{'✅' if cond_consistency else '❌'}  "
+                  f"({n_consistent}/{n_total} = {consistency_rate*100:.0f}%)")
+
+        # 综合评判
+        passed = sum([1 for c in [cond_oa, cond_redir, cond_consistency] if c is True])
+        total_checks = sum([1 for c in [cond_oa, cond_redir, cond_consistency] if c is not None])
+        if passed == total_checks and total_checks >= 2:
+            verdict = "✅ 跨模型泛化性成立(三项核心检查全部通过)"
+        elif passed >= 2:
+            verdict = "⚠️  跨模型部分泛化(主要正向但存在反差)"
+        else:
+            verdict = "❌ 跨模型泛化性较弱"
+        print(f"\n  综合评判: {verdict}")
+        if cv_imp is not None and not (isinstance(imp_oa_hv, float) and math.isnan(imp_oa_hv)):
+            print(f"\n  附注:改善率反差({(imp_oa_hv - cv_imp)*100:+.1f} pp)受两评估器 baseline 差距影响,")
+            print(f"      不作为主判依据;以 Δ 同向 + 净纠错为准。")
+    else:
+        print(f"\n  注:未加载 CellViT 评估 JSON;请先运行 compare_baseline_with_senmatic.py 与")
+        print(f"     confusion_matrix_compare.py 生成 cellvit_results.json,再用本脚本对比")
     print(f"{'=' * W}")
+
+    # ── HoVer-Net 评估结果 JSON 导出 ──────────────────────────────────
+    def _f(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        if hasattr(v, '__float__'):
+            try:
+                return float(v)
+            except Exception:
+                return None
+        return v
+
+    hv_recall_per_class = {}
+    for i in range(nr_types):
+        n_gt = int(cm_hr.sum(axis=1)[i])
+        if n_gt == 0:
+            continue
+        name = CLASS_NAMES[i] if i < len(CLASS_NAMES) else f'Class_{i}'
+        hv_recall_per_class[name] = {
+            'n_gt_pixels': n_gt,
+            'recall_hr':   _f(recall_hr[i]),
+            'recall_abl':  _f(recall_abl[i]),
+            'recall_full': _f(recall_full[i]),
+            'improvement_ratio': _f(_improvement_ratio(recall_hr[i], recall_full[i])),
+        }
+
+    hv_per_tissue = {}
+    for ti, tname in enumerate(all_tissues):
+        hv_per_tissue[tname] = {
+            'n': int(tissue_n[tname]),
+            'overall_acc': {
+                'hr': _f(pt_oa_hr_list[ti]),
+                'ablation': _f(pt_oa_abl_list[ti]),
+                'full': _f(pt_oa_ful_list[ti]),
+            },
+            'improvement_ratio': _f(_improvement_ratio(pt_oa_hr_list[ti], pt_oa_ful_list[ti])),
+        }
+
+    hv_results = {
+        'evaluator': 'HoVer-Net',
+        'n_samples': int(n_valid),
+        'global': {
+            'overall_acc': {'hr': _f(oa_hr), 'ablation': _f(oa_abl), 'full': _f(oa_full)},
+            'improvement_ratio_oa': _f(imp_oa_hv),
+            'recall_per_class': hv_recall_per_class,
+            'error_redirect': {
+                'n_corrected':  int(n_corrected),
+                'n_introduced': int(n_introduced),
+                'redirect_ratio':    _f(redirect_ratio),
+                'correction_rate':   _f(rate_corrected),
+                'introduction_rate': _f(rate_introduced),
+            },
+        },
+        'per_tissue': hv_per_tissue,
+    }
+
+    hv_json_path = './logs/downstream_Cellvitsamh/hovernet_results.json'
+    os.makedirs(os.path.dirname(hv_json_path) or '.', exist_ok=True)
+    with open(hv_json_path, 'w', encoding='utf-8') as f:
+        json.dump(hv_results, f, ensure_ascii=False, indent=2)
+    print(f"\n  ✅ HoVer-Net 评估 JSON 已导出: {hv_json_path}")
+    print(f"     供未来其他跨模型评估脚本(如 Prov-GigaPath / GPFM)对比")
 
 
 if __name__ == '__main__':

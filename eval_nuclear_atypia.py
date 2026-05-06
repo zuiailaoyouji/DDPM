@@ -54,6 +54,25 @@ CLASS_NAMES = ['Background', 'Neoplastic', 'Inflammatory',
                'Connective', 'Dead', 'Epithelial']
 
 
+def _improvement_ratio(hr_val, full_val, upper=1.0):
+    """适用于"越高越好"的指标(Spearman ρ 之类)。Δ / (上限 − HR)。"""
+    gap = upper - hr_val
+    if gap <= 1e-8 or hr_val != hr_val:
+        return float('nan')
+    return (full_val - hr_val) / gap
+
+def _error_reduction(hr_err, full_err):
+    """适用于"越低越好"的指标(MAE/RMSE/相对误差)。(HR_err − Full_err) / HR_err。"""
+    if hr_err <= 1e-8 or hr_err != hr_err:
+        return float('nan')
+    return (hr_err - full_err) / hr_err
+
+def _fmt_pct(r):
+    if isinstance(r, float) and r != r:
+        return f"{'N/A':>7}"
+    return f"{r*100:>+6.1f}%"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CellViT 推理 + 官方后处理（同 eval_detection_segmentation.py）
 # ═══════════════════════════════════════════════════════════════════════════
@@ -222,12 +241,66 @@ def _compute_summary(features, H, W):
 
 
 def compute_feature_fidelity(gt_s, pred_s):
+    """
+    特征保真度:每个指标的相对误差(or SAPE)。
+    - 一般指标用相对误差 |p-g|/|g|
+    - area_cov / mean_nnd 等小值易被放大的指标用 SAPE: |p-g| / ((|p|+|g|)/2 + ε)
+    """
+    SAPE_KEYS = {'area_cov', 'mean_nnd'}  # 这些小值用 SAPE,防止被放大
     results = {}
     for key in ['median_area','mean_circularity','mean_eccentricity','mean_solidity',
                 'mean_aspect_ratio','nuclear_density','nuclear_area_ratio','area_cov','mean_nnd']:
-        g, p = gt_s.get(key,0.), pred_s.get(key,0.)
-        results[key] = abs(p-g)/(abs(g)+1e-8) if g != 0 else abs(p-g)
+        g, p = gt_s.get(key, 0.), pred_s.get(key, 0.)
+        if key in SAPE_KEYS:
+            denom = (abs(p) + abs(g)) / 2.0 + 1e-8
+            results[key] = abs(p - g) / denom
+        else:
+            results[key] = abs(p-g)/(abs(g)+1e-8) if g != 0 else abs(p-g)
     return results
+
+
+# ── 细胞级 per-class 统计 ───────────────────────────────────────────────
+def compute_per_class_morphology(features, n_classes=6):
+    """
+    按 cell type 分桶,算每类的形态学统计量(直接对该类细胞求统计,不再 patch-mean)。
+    返回 {cell_type: dict(area_mean, circ_mean, ecc_mean, sol_mean, ar_mean, n_count)}
+    只包含 patch 内出现的类型(n_count > 0)。
+    """
+    out = {}
+    if not features:
+        return out
+    for c in range(1, n_classes):
+        cf = [f for f in features if f.get('cell_type', 0) == c]
+        if not cf:
+            continue
+        out[c] = dict(
+            n_count    = len(cf),
+            area_mean  = float(np.mean([f['area'] for f in cf])),
+            circ_mean  = float(np.mean([f['circularity'] for f in cf])),
+            ecc_mean   = float(np.mean([f['eccentricity'] for f in cf])),
+            sol_mean   = float(np.mean([f['solidity'] for f in cf])),
+            ar_mean    = float(np.mean([f['aspect_ratio'] for f in cf])),
+        )
+    return out
+
+def compute_per_class_fidelity(gt_per_class, pred_per_class):
+    """对每类细胞,算它的形态特征相对误差(只在该类 GT 和 pred 都出现时计算)。"""
+    SAPE_KEYS = set()  # 这里 5 个特征都不需要 SAPE(数值范围都比较稳)
+    out = {}
+    for c, g_d in gt_per_class.items():
+        if c not in pred_per_class:
+            continue
+        p_d = pred_per_class[c]
+        cls_err = {}
+        for k in ['area_mean', 'circ_mean', 'ecc_mean', 'sol_mean', 'ar_mean']:
+            g, p = g_d.get(k, 0.), p_d.get(k, 0.)
+            if k in SAPE_KEYS:
+                denom = (abs(p)+abs(g))/2. + 1e-8
+                cls_err[k] = abs(p-g) / denom
+            else:
+                cls_err[k] = abs(p-g)/(abs(g)+1e-8) if g != 0 else abs(p-g)
+        out[c] = cls_err
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -235,8 +308,8 @@ def compute_feature_fidelity(gt_s, pred_s):
 # ═══════════════════════════════════════════════════════════════════════════
 
 print("加载 CellViT...")
-cellvit = load_cellvit('/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth',
-                       '/home/xuwen/DDPM/CellViT', device)
+cellvit = load_cellvit('/home/xuwen/DDPM/CellViT/CellViT-SAM-H-x40.pth',
+                       '/home/xuwen/DDPM/CellViT', device, variant='sam_h')
 
 def load_unet(p, s):
     u = create_model(use_semantic=s).to(device)
@@ -245,8 +318,8 @@ def load_unet(p, s):
     print(f"  加载 {p}  epoch={c.get('epoch','?')}"); return u
 
 print("\n加载 UNet...")
-unet_abl = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_ablation.pth", False)
-unet_full = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_correction.pth", True)
+unet_abl = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_ablation.pth", False)
+unet_full = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_correction.pth", True)
 
 scheduler = DDPMScheduler(num_train_timesteps=1000)
 dataset = PanNukeDataset(fold_dirs=['/data/xuwen/PanNuke/Fold 3'], target_size=256)
@@ -300,6 +373,16 @@ tissue_atypia = defaultdict(lambda:{k:[] for k in keys})
 tissue_gt_atypia = defaultdict(list)
 tissue_feat_errs = defaultdict(lambda:{k:defaultdict(list) for k in keys})
 tissue_n = defaultdict(int)
+
+# per-cell-type 形态学保真度容器:cell_feat_errs[cell_type][method][feat_key] = [errs]
+cell_feat_errs = {c: {k: defaultdict(list) for k in keys} for c in range(1, 6)}
+# per-cell-type GT 核计数(各 patch 累计;反映该类样本量)
+cell_count_gt = {c: 0 for c in range(1, 6)}
+
+# 第二层 per-tissue 容器(组织学指标:density / nar / cov / nnd / n_nuclei)
+tissue_hist_metrics = defaultdict(
+    lambda: {k: defaultdict(list) for k in keys + ['gt']}
+)
 
 # ── 可视化辅助 ───────────────────────────────────────────────────────
 CLASS_COLORS = np.array([
@@ -386,14 +469,35 @@ for i in si:
     hr_feats, _ = extract_morphological_features(hr_inst, hr_it)
     full_feats, _ = extract_morphological_features(full_inst, full_it)
 
+    # 计算 GT per-class 形态学(用于本 patch 的 per-cell-type 误差)
+    gt_per_cls = compute_per_class_morphology(gt_feats)
+    # 累计 GT 每类细胞数
+    for c, gd in gt_per_cls.items():
+        cell_count_gt[c] += gd['n_count']
+
     for mk, pi, pit in [('hr',hr_inst,hr_it),('ablation',abl_inst,abl_it),('full',full_inst,full_it)]:
-        _, psum = extract_morphological_features(pi, pit)
+        psum_feats, psum = extract_morphological_features(pi, pit)
         patch_summaries[mk].append(psum)
         atypia_scores[mk].append(psum['atypia_score'])
+        # patch 级保真度
         fid = compute_feature_fidelity(gt_sum, psum)
         for fk, fv in fid.items(): feat_errs[mk][fk].append(fv)
+        # per-tissue
         tissue_atypia[tn][mk].append(psum['atypia_score'])
         for fk, fv in fid.items(): tissue_feat_errs[tn][mk][fk].append(fv)
+        # 第二层 per-tissue 组织学指标(原始值,后面对 GT 算 MAE)
+        for hk in ('nuclear_density', 'nuclear_area_ratio', 'area_cov', 'mean_nnd', 'n_nuclei'):
+            tissue_hist_metrics[tn][mk][hk].append(psum[hk])
+        # per-cell-type 形态学保真度
+        pred_per_cls = compute_per_class_morphology(psum_feats)
+        cls_err = compute_per_class_fidelity(gt_per_cls, pred_per_cls)
+        for c, errs in cls_err.items():
+            for fk, fv in errs.items():
+                cell_feat_errs[c][mk][fk].append(fv)
+
+    # 同 patch 的 GT 组织学值(用于 per-tissue MAE)
+    for hk in ('nuclear_density', 'nuclear_area_ratio', 'area_cov', 'mean_nnd', 'n_nuclei'):
+        tissue_hist_metrics[tn]['gt'][hk].append(gt_sum[hk])
 
     tissue_gt_atypia[tn].append(gt_sum['atypia_score'])
     tissue_n[tn] += 1
@@ -432,29 +536,78 @@ def _m(l): v=[x for x in l if not(isinstance(x,float) and x!=x)]; return np.mean
 
 W = 95
 
-# 第一层
+# ═══════════════════════════════════════════════════════════════════════════
+# 第一层:形态学特征保真度
+# ═══════════════════════════════════════════════════════════════════════════
+W = 100
+
+# ── 第一层 A:Patch 级聚合(全局,作为整体参考)──────────────────────────
 print(f"\n{'='*W}")
-print("第一层：形态学特征保真度（相对误差 vs GT，↓ 越低越好）")
+print("第一层 A:形态学特征保真度 - 全局 patch 级(相对误差 vs GT,↓ 越低越好)")
 print(f"{'='*W}")
 feat_display = [('median_area','面积中位数'),('mean_circularity','平均圆度'),
     ('mean_eccentricity','平均离心率'),('mean_solidity','平均凸度'),
     ('mean_aspect_ratio','平均纵横比'),('nuclear_density','核密度'),
-    ('nuclear_area_ratio','核面积占比'),('area_cov','面积CoV(多形性)'),
-    ('mean_nnd','平均最近邻距离')]
-print(f"{'特征':<20} {'HR基线':>12} {'消融模型':>12} {'本文方法':>12} {'Δ(本文-HR)':>12}")
+    ('nuclear_area_ratio','核面积占比'),('area_cov','面积CoV(多形性)*'),
+    ('mean_nnd','平均最近邻距离*')]
+print(f"{'特征':<22} {'HR基线':>10} {'消融模型':>10} {'本文方法':>10} {'Δ(本文-HR)':>11} {'误差减少':>9}")
 print("-"*W)
 for fk, fn in feat_display:
     h,a,f=_m(feat_errs['hr'][fk]),_m(feat_errs['ablation'][fk]),_m(feat_errs['full'][fk])
     d=f-h; ar='↓改善' if d<-.001 else('↑退步' if d>.001 else '—')
-    print(f"{fn:<20} {h:>12.4f} {a:>12.4f} {f:>12.4f} {d:>+10.4f} {ar}")
+    err_red = _error_reduction(h, f)
+    print(f"{fn:<22} {h:>10.4f} {a:>10.4f} {f:>10.4f} {d:>+9.4f} {ar} {_fmt_pct(err_red):>9}")
+print("说明:* 标记的指标用 SAPE = |p−g|/((|p|+|g|)/2);其余用相对误差 |p−g|/|g|")
+print("    误差减少 = (HR_err − Full_err) / HR_err,正值越大表示改进越多")
 
-# 第二层
+# ── 第一层 B:Per-cell-type 形态学(医学逻辑核心) ─────────────────────
 print(f"\n{'='*W}")
-print("第二层：组织学指标（Patch 级均值，括号内为 vs GT 的 MAE）")
+print("第一层 B:Per-cell-type 形态学保真度(相对误差,按 GT 类细胞分组求平均)")
+print(f"{'='*W}")
+print("说明:每 patch 内按 cell type 求该类的平均形态(area/circ/ecc/sol/ar),")
+print("    再对全局求 patch 平均的相对误差 |pred-gt|/|gt|。↓ 越低越好。")
+
+# 表格:行 = cell type,列 = (面积/圆度/离心率/凸度/纵横比) × {HR,Abl,Full,Δ}
+feat_keys = [('area_mean','面积'), ('circ_mean','圆度'), ('ecc_mean','离心率'),
+             ('sol_mean','凸度'), ('ar_mean','纵横比')]
+
+# 紧凑展示:每行一个细胞类,每个指标显示 HR/Abl/Full/Δ
+W3 = 130
+print(f"\n{'细胞类':<14}{'GT核数':>7}  ", end='')
+for fk, fn in feat_keys:
+    print(f"{fn+' (HR/Abl/Full | Δ)':^22}", end='  ')
+print()
+print("-"*W3)
+for c in range(1, 6):
+    if cell_count_gt[c] == 0:   # 该类未在样本中出现
+        continue
+    line = f"{CLASS_NAMES[c]:<14}{cell_count_gt[c]:>7}  "
+    for fk, fn in feat_keys:
+        h = _m(cell_feat_errs[c]['hr'][fk])
+        a = _m(cell_feat_errs[c]['ablation'][fk])
+        f = _m(cell_feat_errs[c]['full'][fk])
+        d = f - h
+        ar = '↓' if d < -.001 else ('↑' if d > .001 else '·')
+        if h != h:   # NaN
+            cell = f"{'N/A':^22}"
+        else:
+            cell = f"{h:.3f}/{a:.3f}/{f:.3f} {ar}"
+            cell = f"{cell:^22}"
+        line += cell + "  "
+    print(line)
+
+print(f"\n  备注:N/A 表示该类在 patch 中样本不足(GT 与 pred 必须同时出现该类)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 第二层:组织学指标(Patch 级,加 per-tissue)
+# ═══════════════════════════════════════════════════════════════════════════
+print(f"\n{'='*W}")
+print("第二层 A:组织学指标 - 全局(Patch 级均值,括号内为 vs GT 的 MAE)")
 print(f"{'='*W}")
 hk = [('nuclear_density','核密度(/万px)'),('nuclear_area_ratio','核面积占比'),
       ('area_cov','多形性(CoV)'),('mean_nnd','最近邻距离'),('n_nuclei','核数量')]
-print(f"{'指标':<20} {'GT':>10} {'HR(MAE)':>15} {'消融(MAE)':>15} {'本文(MAE)':>15}")
+print(f"{'指标':<20} {'GT':>10} {'HR(MAE)':>15} {'消融(MAE)':>15} {'本文(MAE)':>15} {'误差减少':>9}")
 print("-"*W)
 for k, nm in hk:
     gv = [s[k] for s in gt_summaries]
@@ -462,11 +615,42 @@ for k, nm in hk:
     av = [s[k] for s in patch_summaries['ablation']]
     fv = [s[k] for s in patch_summaries['full']]
     gm = np.mean(gv)
-    hm,am,fm = np.mean(hv),np.mean(av),np.mean(fv)
+    hm, am, fm = np.mean(hv), np.mean(av), np.mean(fv)
     hmae = np.mean(np.abs(np.array(hv)-np.array(gv)))
     amae = np.mean(np.abs(np.array(av)-np.array(gv)))
     fmae = np.mean(np.abs(np.array(fv)-np.array(gv)))
-    print(f"{nm:<20} {gm:>10.2f} {hm:>7.2f}({hmae:.2f}) {am:>7.2f}({amae:.2f}) {fm:>7.2f}({fmae:.2f})")
+    err_red = _error_reduction(hmae, fmae)
+    print(f"{nm:<20} {gm:>10.2f} {hm:>7.2f}({hmae:.2f}) {am:>7.2f}({amae:.2f}) {fm:>7.2f}({fmae:.2f}) {_fmt_pct(err_red):>9}")
+
+print(f"\n{'='*W}")
+print("第二层 B:组织学指标 - Per-tissue(MAE vs GT,↓ 越低越好)")
+print(f"{'='*W}")
+W4 = 120
+print(f"{'Tissue':<20}{'N':>3}  "
+      f"{'核密度 MAE (HR/Abl/Full)':^28}  "
+      f"{'多形性 CoV MAE (HR/Abl/Full)':^32}  "
+      f"{'NND MAE (HR/Abl/Full)':^28}")
+print("-"*W4)
+for t in sorted(tissue_hist_metrics.keys()):
+    n = tissue_n[t]
+    gv = np.array(tissue_hist_metrics[t]['gt']['nuclear_density'])
+    if len(gv) == 0:
+        continue
+    def _mae(method, key):
+        pv = np.array(tissue_hist_metrics[t][method][key])
+        gvk = np.array(tissue_hist_metrics[t]['gt'][key])
+        if len(pv) == 0 or len(gvk) == 0:
+            return float('nan')
+        return float(np.mean(np.abs(pv - gvk)))
+    nd_h, nd_a, nd_f = _mae('hr','nuclear_density'), _mae('ablation','nuclear_density'), _mae('full','nuclear_density')
+    cv_h, cv_a, cv_f = _mae('hr','area_cov'), _mae('ablation','area_cov'), _mae('full','area_cov')
+    nnd_h, nnd_a, nnd_f = _mae('hr','mean_nnd'), _mae('ablation','mean_nnd'), _mae('full','mean_nnd')
+    print(f"{t:<20}{n:>3}  "
+          f"{nd_h:>6.2f}/{nd_a:.2f}/{nd_f:.2f}{'':>9}  "
+          f"{cv_h:>7.4f}/{cv_a:.4f}/{cv_f:.4f}{'':>5}  "
+          f"{nnd_h:>6.2f}/{nnd_a:.2f}/{nnd_f:.2f}")
+
+
 
 # 第三层
 print(f"\n{'='*W}")
@@ -484,23 +668,27 @@ armse = np.sqrt(np.mean((aa-ga)**2))
 frmse = np.sqrt(np.mean((fa-ga)**2))
 hrho,_ = spearmanr(ga,ha); arho,_ = spearmanr(ga,aa); frho,_ = spearmanr(ga,fa)
 
-print(f"\n{'指标':<22} {'HR基线':>12} {'消融模型':>12} {'本文方法':>12} {'Δ(本文-HR)':>12}")
+print(f"\n{'指标':<22} {'HR基线':>10} {'消融模型':>10} {'本文方法':>10} {'Δ(本文-HR)':>11} {'改善幅度':>9}")
 print("-"*W)
+# 误差类指标用"误差减少率"
 for nm, hv, av, fv in [('Atypia MAE',hmae,amae,fmae),('Atypia RMSE',hrmse,armse,frmse)]:
     d=fv-hv; ar='↓改善' if d<-.001 else('↑退步' if d>.001 else '—')
-    print(f"{nm:<22} {hv:>12.4f} {av:>12.4f} {fv:>12.4f} {d:>+10.4f} {ar}")
+    err_red = _error_reduction(hv, fv)
+    print(f"{nm:<22} {hv:>10.4f} {av:>10.4f} {fv:>10.4f} {d:>+9.4f} {ar} {_fmt_pct(err_red):>9}")
+# 相关系数用"改善率(覆盖了 HR→1.0 的多少)"
 d=frho-hrho; ar='↑改善' if d>.001 else('↓退步' if d<-.001 else '—')
-print(f"{'Spearman ρ':<22} {hrho:>12.4f} {arho:>12.4f} {frho:>12.4f} {d:>+10.4f} {ar}")
+imp_rho = _improvement_ratio(hrho, frho, upper=1.0)
+print(f"{'Spearman ρ':<22} {hrho:>10.4f} {arho:>10.4f} {frho:>10.4f} {d:>+9.4f} {ar} {_fmt_pct(imp_rho):>9}")
 
 print(f"\n  GT Atypia: mean={ga.mean():.4f} std={ga.std():.4f} "
       f"min={ga.min():.4f} max={ga.max():.4f}")
+print(f"  说明:误差减少 = (HR_err − Full_err) / HR_err;Spearman ρ 改善 = (Full−HR)/(1−HR)")
 
 # per tissue
 print(f"\n{'='*W}")
-print("按 Tissue Type —— 异型性评分 MAE & Spearman ρ")
+print("按 Tissue Type —— 异型性评分 MAE & Spearman ρ(MAE 加误差减少率)")
 print(f"{'='*W}")
-print(f"{'Tissue':<22}{'N':>3}  {'GT_mean':>8}  {'MAE':^26}  {'ρ(Full)':>8}")
-print(f"{'':<22}{'':>3}  {'':>8}  {'HR':>7}{'Abl':>8}{'Full':>8}  {'':>8}")
+print(f"{'Tissue':<22}{'N':>3}  {'GT_mean':>8}  {'MAE (HR/Abl/Full)':^26}  {'ρ(Full)':>8}  {'误差减少':>9}")
 print("-"*W)
 for t in sorted(tissue_atypia):
     n = tissue_n[t]; tg = np.array(tissue_gt_atypia[t])
@@ -508,8 +696,9 @@ for t in sorted(tissue_atypia):
     tf = np.array(tissue_atypia[t]['full'])
     mh = np.mean(np.abs(th-tg)); ma_ = np.mean(np.abs(ta-tg)); mf = np.mean(np.abs(tf-tg))
     tr = spearmanr(tg,tf)[0] if n>=3 else float('nan')
-    d=mf-mh; ar='↓' if d<-.001 else('↑' if d>.001 else '—')
-    print(f"{t:<22}{n:>3}  {tg.mean():>8.4f}  {mh:>7.4f}{ma_:>8.4f}{mf:>8.4f}  {tr:>8.4f}  Δ={d:+.4f}{ar}")
+    err_red = _error_reduction(mh, mf)
+    print(f"{t:<22}{n:>3}  {tg.mean():>8.4f}  "
+          f"{mh:>6.4f}/{ma_:.4f}/{mf:.4f}  {tr:>8.4f}  {_fmt_pct(err_red):>9}")
 
 print(f"\n{'='*W}\n有效样本: {nv}\n{'='*W}")
 
@@ -585,10 +774,10 @@ if vis_cases:
                fontsize=7, ncol=1, bbox_to_anchor=(0.99, 0.99))
 
     plt.tight_layout()
-    os.makedirs('./logs', exist_ok=True)
-    save_path = './logs/nuclear_atypia_cases.png'
+    save_path = './logs/downstream_Cellvitsamh/nuclear_atypia_cases.png'
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    plt.close() 
     print(f"\n异型性可视化已保存: {save_path}")
 
     # ── 可视化 2：Atypia Score 散点图（GT vs 各方法） ──────────────────
@@ -612,7 +801,8 @@ if vis_cases:
         ax.grid(alpha=0.2)
 
     plt.tight_layout()
-    scatter_path = './logs/atypia_scatter.png'
+    scatter_path = './logs/downstream_Cellvitsamh/atypia_scatter.png'
+    os.makedirs(os.path.dirname(scatter_path) or '.', exist_ok=True)
     plt.savefig(scatter_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"散点图已保存: {scatter_path}")
@@ -636,7 +826,8 @@ if vis_cases:
     ax4.set_title(f'Per-tissue Atypia MAE — ensemble N={N_RUNS}')
     ax4.legend(); ax4.grid(axis='y', alpha=0.3)
     plt.tight_layout()
-    bar_path = './logs/atypia_mae_per_tissue.png'
+    bar_path = './logs/downstream_Cellvitsamh/nuclear_atypia_mae_per_tissue.png'
+    os.makedirs(os.path.dirname(bar_path) or '.', exist_ok=True)
     plt.savefig(bar_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"MAE 条形图已保存: {bar_path}")

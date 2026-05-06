@@ -53,6 +53,17 @@ CLASS_NAMES = ['Background', 'Neoplastic', 'Inflammatory',
                'Connective', 'Dead', 'Epithelial']
 
 
+def _improvement_ratio(hr_val, full_val, upper=1.0):
+    """(Full − HR) / (上限 − HR)。上限默认 1.0,适用于 F1/PQ/AJI/DICE。"""
+    gap = upper - hr_val
+    if gap <= 1e-8 or hr_val != hr_val:  # NaN
+        return float('nan')
+    return (full_val - hr_val) / gap
+
+def _fmt_pct(r):
+    return f"{r*100:>+6.1f}%" if not (isinstance(r, float) and r != r) else f"{'N/A':>7}"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CellViT 完整推理 + 官方后处理
 # ═══════════════════════════════════════════════════════════════════════════
@@ -202,14 +213,67 @@ def compute_dice_m(gt_map, pred_map, th=0.5):
                           /(np.sum(gt_map==g)+np.sum(pred_map==p)+1e-8)
                           for g,p,_ in matched]))
 
+def compute_det_per_class(gt_map, gt_itype, pred_map, pred_itype,
+                          n_classes=6, iou_thresh=0.5):
+    """
+    做法 B:全局匹配 → 按 GT 类型拆 TP/FP/FN(分类错误不双倍计费)。
+
+    - TP_c:匹配对中 GT 类型为 c 的数量(无论 pred 类型是否对)
+    - FN_c:未匹配的 GT 中类型为 c 的数量
+    - FP_c:未匹配的 pred 中类型为 c 的数量
+    - SQ_c:类 c 的匹配对的 IoU 平均
+    - DQ_c = TP_c / (TP_c + 0.5*FP_c + 0.5*FN_c)
+    - PQ_c = DQ_c * SQ_c
+
+    返回 {ct: dict(precision/recall/f1/PQ/DQ/SQ/TP/FP/FN)} 仅含出现的类。
+    """
+    matched, fn_ids, fp_ids = match_instances(gt_map, pred_map, iou_thresh)
+
+    TP_c = {c: 0 for c in range(1, n_classes)}
+    FP_c = {c: 0 for c in range(1, n_classes)}
+    FN_c = {c: 0 for c in range(1, n_classes)}
+    iou_sum_c = {c: 0.0 for c in range(1, n_classes)}
+
+    # 匹配对:按 GT 类型归桶,IoU 用于 SQ
+    for g, p, iou in matched:
+        c = gt_itype.get(g, 0)
+        if 1 <= c < n_classes:
+            TP_c[c] += 1
+            iou_sum_c[c] += iou
+
+    for g in fn_ids:
+        c = gt_itype.get(g, 0)
+        if 1 <= c < n_classes:
+            FN_c[c] += 1
+
+    for p in fp_ids:
+        c = pred_itype.get(p, 0)
+        if 1 <= c < n_classes:
+            FP_c[c] += 1
+
+    out = {}
+    for c in range(1, n_classes):
+        TP, FP, FN = TP_c[c], FP_c[c], FN_c[c]
+        if TP + FP + FN == 0:
+            continue   # 该类不出现于此 patch
+        prec = TP / (TP + FP) if TP + FP > 0 else 0.0
+        rec  = TP / (TP + FN) if TP + FN > 0 else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
+        DQ   = TP / (TP + 0.5*FP + 0.5*FN)
+        SQ   = (iou_sum_c[c] / TP) if TP > 0 else 0.0
+        PQ   = DQ * SQ
+        out[c] = dict(precision=prec, recall=rec, f1=f1,
+                      PQ=PQ, DQ=DQ, SQ=SQ, TP=TP, FP=FP, FN=FN)
+    return out
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════════════════════
 
 print("加载 CellViT...")
-cellvit = load_cellvit('/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth',
-                       '/home/xuwen/DDPM/CellViT', device)
+cellvit = load_cellvit('/home/xuwen/DDPM/CellViT/CellViT-SAM-H-x40.pth',
+                       '/home/xuwen/DDPM/CellViT', device, variant='sam_h')
 
 def load_unet(p, s):
     u = create_model(use_semantic=s).to(device)
@@ -218,8 +282,8 @@ def load_unet(p, s):
     print(f"  加载 {p}  epoch={c.get('epoch','?')}"); return u
 
 print("\n加载 UNet...")
-unet_abl = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_ablation.pth", False)
-unet_full = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_correction.pth", True)
+unet_abl = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_ablation.pth", False)
+unet_full = load_unet("/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_correction.pth", True)
 
 scheduler = DDPMScheduler(num_train_timesteps=1000)
 dataset = PanNukeDataset(fold_dirs=['/data/xuwen/PanNuke/Fold 3'], target_size=256)
@@ -323,12 +387,11 @@ for i in si:
         gm[mk]['AJI'].append(aji); gm[mk]['DICE'].append(dice)
         for k,v in d.items(): tm[tn][mk][k].append(v)
         tm[tn][mk]['AJI'].append(aji); tm[tn][mk]['DICE'].append(dice)
-        for ct in range(1,6):
-            gc = np.where(np.isin(gt_inst,[k for k,v in gt_it.items() if v==ct]), gt_inst, 0)
-            pc = np.where(np.isin(pi,[k for k,v in pit.items() if v==ct]), pi, 0)
-            if gc.max()==0 and pc.max()==0: continue
-            cd = compute_det(gc, pc)
-            for k2,v2 in cd.items(): cm[ct][mk][k2].append(v2)
+        # per-cell-type 改用做法 B:全局匹配 → 按 GT 类型拆 TP/FP/FN
+        cls_metrics = compute_det_per_class(gt_inst, gt_it, pi, pit, n_classes=6)
+        for ct, mdict in cls_metrics.items():
+            for k2, v2 in mdict.items():
+                cm[ct][mk][k2].append(v2)
 
     if nv % 20 == 0:
         print(f"{nv:>4}  {tn:<18}  "
@@ -357,34 +420,79 @@ for i in si:
 
 # 汇总
 def _m(l): v=[x for x in l if not(isinstance(x,float) and x!=x)]; return np.mean(v) if v else float('nan')
-W = 85
+W = 100
 print(f"\n{'='*W}\n细胞核检测与分割指标（全局）—— CellViT 官方后处理\n{'='*W}")
-print(f"{'指标':<14} {'HR基线':>12} {'消融模型':>12} {'本文方法':>12} {'Δ(本文-HR)':>12}")
+print(f"{'指标':<14} {'HR基线':>10} {'消融模型':>10} {'本文方法':>10} {'Δ(本文-HR)':>12} {'改善率':>9}")
 print("-"*W)
 for mn in ['PQ','DQ','SQ','precision','recall','f1','AJI','DICE']:
     h,a,f=_m(gm['hr'][mn]),_m(gm['ablation'][mn]),_m(gm['full'][mn])
     d=f-h; ar='↑' if d>.001 else('↓' if d<-.001 else '—')
-    print(f"{mn:<14} {h:>12.4f} {a:>12.4f} {f:>12.4f} {d:>+10.4f} {ar}")
+    imp = _improvement_ratio(h, f)
+    print(f"{mn:<14} {h:>10.4f} {a:>10.4f} {f:>10.4f} {d:>+10.4f} {ar} {_fmt_pct(imp):>9}")
+print("说明:改善率 = (Full − HR) / (1 − HR),覆盖了 HR→1.0 差距的多少")
 
 for mk,lb in [('hr','HR'),('ablation','消融'),('full','本文')]:
     print(f"  {lb} 平均: TP={_m(gm[mk]['TP']):.1f} FP={_m(gm[mk]['FP']):.1f} FN={_m(gm[mk]['FN']):.1f}")
 
-print(f"\n{'='*W}\n按 Tissue Type 分组\n{'='*W}")
-print(f"{'Tissue':<22}{'N':>3}  {'F1':^26}  {'PQ':^26}  {'AJI_F':>7}")
-print(f"{'':<22}{'':>3}  {'HR':>7}{'Abl':>8}{'Full':>8}  {'HR':>7}{'Abl':>8}{'Full':>8}  {'':>7}")
-print("-"*W)
+W2 = 130
+print(f"\n{'='*W2}\n按 Tissue Type 分组（F1/PQ 加改善率,DICE 三联,AJI 仅 Full)\n{'='*W2}")
+print(f"{'Tissue':<22}{'N':>3}  "
+      f"{'F1 (HR/Abl/Full)':^28}  "
+      f"{'PQ (HR/Abl/Full) | 改善率':^36}  "
+      f"{'DICE (HR/Abl/Full)':^26}  "
+      f"{'AJI_F':>7}")
+print("-"*W2)
 for t in sorted(tm):
     n=len(tm[t]['hr']['f1'])
+    f_h, f_a, f_f = _m(tm[t]['hr']['f1']), _m(tm[t]['ablation']['f1']), _m(tm[t]['full']['f1'])
+    p_h, p_a, p_f = _m(tm[t]['hr']['PQ']), _m(tm[t]['ablation']['PQ']), _m(tm[t]['full']['PQ'])
+    d_h, d_a, d_f = _m(tm[t]['hr']['DICE']), _m(tm[t]['ablation']['DICE']), _m(tm[t]['full']['DICE'])
+    aji_f = _m(tm[t]['full']['AJI'])
+    pq_imp = _improvement_ratio(p_h, p_f)
     print(f"{t:<22}{n:>3}  "
-          f"{_m(tm[t]['hr']['f1']):>7.4f}{_m(tm[t]['ablation']['f1']):>8.4f}{_m(tm[t]['full']['f1']):>8.4f}  "
-          f"{_m(tm[t]['hr']['PQ']):>7.4f}{_m(tm[t]['ablation']['PQ']):>8.4f}{_m(tm[t]['full']['PQ']):>8.4f}  "
-          f"{_m(tm[t]['full']['AJI']):>7.4f}")
+          f"{f_h:>7.4f}/{f_a:.4f}/{f_f:.4f}  "
+          f"{p_h:>7.4f}/{p_a:.4f}/{p_f:.4f} | {_fmt_pct(pq_imp)}  "
+          f"{d_h:>7.4f}/{d_a:.4f}/{d_f:.4f}  "
+          f"{aji_f:>7.4f}")
 
-print(f"\n{'='*W}\n按细胞类型分组\n{'='*W}")
+print(f"\n{'='*W2}\n按细胞类型 · 检测三联(全局匹配后按 GT 类拆,做法 B)\n{'='*W2}")
+print("说明:全局做检测匹配,再按 GT 类型分桶 TP/FN,按 pred 类型分桶 FP")
+print("    分类错误不双倍计费(空间对了即 TP),分类质量另见 confusion_matrix_compare.py")
+print(f"{'类别':<14}{'N':>4}  "
+      f"{'F1 (HR/Abl/Full)':^28}  "
+      f"{'Precision (HR/Abl/Full)':^32}  "
+      f"{'Recall (HR/Abl/Full)':^28}")
+print("-"*W2)
 for ct in range(1,6):
     if ct not in cm: continue
-    print(f"{CLASS_NAMES[ct]:<14} F1: HR={_m(cm[ct]['hr']['f1']):.4f} Abl={_m(cm[ct]['ablation']['f1']):.4f} "
-          f"Full={_m(cm[ct]['full']['f1']):.4f}  PQ: HR={_m(cm[ct]['hr']['PQ']):.4f} Full={_m(cm[ct]['full']['PQ']):.4f}")
+    n = len(cm[ct]['hr']['f1'])
+    f_h, f_a, f_f = _m(cm[ct]['hr']['f1']), _m(cm[ct]['ablation']['f1']), _m(cm[ct]['full']['f1'])
+    p_h, p_a, p_f = _m(cm[ct]['hr']['precision']), _m(cm[ct]['ablation']['precision']), _m(cm[ct]['full']['precision'])
+    r_h, r_a, r_f = _m(cm[ct]['hr']['recall']), _m(cm[ct]['ablation']['recall']), _m(cm[ct]['full']['recall'])
+    print(f"{CLASS_NAMES[ct]:<14}{n:>4}  "
+          f"{f_h:>7.4f}/{f_a:.4f}/{f_f:.4f}  "
+          f"{p_h:>9.4f}/{p_a:.4f}/{p_f:.4f}  "
+          f"{r_h:>7.4f}/{r_a:.4f}/{r_f:.4f}")
+
+print(f"\n{'='*W2}\n按细胞类型 · 全景质量(PQ = DQ × SQ)\n{'='*W2}")
+print(f"{'类别':<14}{'N':>4}  "
+      f"{'PQ (HR/Abl/Full)':^28}  "
+      f"{'DQ (HR/Abl/Full)':^28}  "
+      f"{'SQ (HR/Abl/Full)':^28}  "
+      f"{'PQ改善率':>9}")
+print("-"*W2)
+for ct in range(1,6):
+    if ct not in cm: continue
+    n = len(cm[ct]['hr']['PQ'])
+    pq_h, pq_a, pq_f = _m(cm[ct]['hr']['PQ']), _m(cm[ct]['ablation']['PQ']), _m(cm[ct]['full']['PQ'])
+    dq_h, dq_a, dq_f = _m(cm[ct]['hr']['DQ']), _m(cm[ct]['ablation']['DQ']), _m(cm[ct]['full']['DQ'])
+    sq_h, sq_a, sq_f = _m(cm[ct]['hr']['SQ']), _m(cm[ct]['ablation']['SQ']), _m(cm[ct]['full']['SQ'])
+    pq_imp = _improvement_ratio(pq_h, pq_f)
+    print(f"{CLASS_NAMES[ct]:<14}{n:>4}  "
+          f"{pq_h:>7.4f}/{pq_a:.4f}/{pq_f:.4f}  "
+          f"{dq_h:>7.4f}/{dq_a:.4f}/{dq_f:.4f}  "
+          f"{sq_h:>7.4f}/{sq_a:.4f}/{sq_f:.4f}  "
+          f"{_fmt_pct(pq_imp):>9}")
 
 print(f"\n有效样本: {nv}")
 
@@ -451,8 +559,8 @@ if vis_cases:
                fontsize=8, ncol=1, bbox_to_anchor=(0.99, 0.99))
 
     plt.tight_layout()
-    os.makedirs('./logs', exist_ok=True)
-    save_path = './logs/detection_segmentation_cases.png'
+    save_path = './logs/downstream_Cellvitsamh/detection_segmentation_cases.png'
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"\n可视化已保存: {save_path}")
@@ -473,7 +581,8 @@ if vis_cases:
     ax2.set_title(f'Per-tissue PQ — ensemble N={N_RUNS}')
     ax2.legend(); ax2.set_ylim(0, 1.05); ax2.grid(axis='y', alpha=0.3)
     plt.tight_layout()
-    bar_path = './logs/detection_pq_per_tissue.png'
+    bar_path = './logs/downstream_Cellvitsamh/detection_pq_per_tissue.png'
+    os.makedirs(os.path.dirname(bar_path) or '.', exist_ok=True)
     plt.savefig(bar_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"PQ 条形图已保存: {bar_path}")

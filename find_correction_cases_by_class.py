@@ -19,10 +19,10 @@ find_correction_cases_by_class.py
       - 本文方法比消融模型在该类别召回率上高 > min_improve
     输出：correction_cases_by_class_ablation.png
 
-  第二轮：按 tissue type 筛选（新增）
-    对每个 tissue type，找整体 Dir_Acc 提升最大的 patch
-    （Full 整体准确率 − Ablation 整体准确率 最大，且 > TISSUE_MIN_IMPROVE）。
-    输出：correction_cases_by_tissue_ablation.png
+  第二轮:按 tissue type 筛选(新增)
+    对每个 tissue type,找整体 Overall_Acc 提升最大的 patch
+    (Full Overall_Acc − HR Overall_Acc 最大,且 > TISSUE_MIN_IMPROVE)。
+    输出:correction_cases_by_tissue_ablation.png
 
 可视化每个案例 8 列：
   HR | 消融模型 | 本文方法 |（空列）|
@@ -78,14 +78,15 @@ TARGET_CLASSES = {
 
 # ── 第二轮参数：按 tissue type ────────────────────────────────────────
 TISSUE_MIN_NUC_PIXELS = 100   # GT 核区域最少像素数
-TISSUE_MIN_IMPROVE    = 0.005 # Full Dir_Acc − Ablation Dir_Acc 最低提升阈值
+TISSUE_MIN_IMPROVE    = 0.005 # Full Overall_Acc − HR Overall_Acc 最低提升阈值
 
 # ── 加载模型 ─────────────────────────────────────────────────────────
 print("加载 CellViT...")
 cellvit = load_cellvit(
-    model_path        = '/home/xuwen/DDPM/CellViT/CellViT-256-x40.pth',
+    model_path        = '/home/xuwen/DDPM/CellViT/CellViT-SAM-H-x40.pth',
     cellvit_repo_path = '/home/xuwen/DDPM/CellViT',
     device            = device,
+    variant           = 'sam_h',
 )
 
 
@@ -99,11 +100,11 @@ def load_unet(ckpt_path, use_semantic):
 
 print("加载 UNet 模型...")
 unet_ablation = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_ablation.pth",
+    "/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_ablation.pth",
     use_semantic=False,
 )
 unet_full = load_unet(
-    "/home/xuwen/DDPM/logs/checkpoints_correction_v3/best_unet_correction.pth",
+    "/home/xuwen/DDPM/logs/checkpoints_correction_samh/best_unet_correction.pth",
     use_semantic=True,
 )
 
@@ -299,11 +300,11 @@ for i in scan_indices:
                   f"HR={hr_recall:.3f}  Abl={abl_recall:.3f}  "
                   f"Full={full_recall:.3f}  Δ={improve:+.3f}")
 
-    # ── 第二轮：按 tissue type（整体 Dir_Acc） ────────────────────────
+    # ── 第二轮：按 tissue type（整体 Overall_Acc） ─────────────────────
     oa_hr   = overall_acc(hr_np,   gt_np, cell_mask)
     oa_abl  = overall_acc(abl_np,  gt_np, cell_mask)
     oa_full = overall_acc(full_np, gt_np, cell_mask)
-    tissue_improve = oa_full - oa_abl
+    tissue_improve = oa_full - oa_hr   # ← 主表叙事：DGFR 相对 HR 基线的整体改进
 
     if (tissue_improve >= TISSUE_MIN_IMPROVE and
             tissue_improve > best_tissue_improve[type_name]):
@@ -319,7 +320,7 @@ for i in scan_indices:
         )
         print(f"  [Tissue]   更新 {type_name:<22} | 样本{i:>4} | "
               f"HR={oa_hr:.3f}  Abl={oa_abl:.3f}  "
-              f"Full={oa_full:.3f}  Δ={tissue_improve:+.3f}")
+              f"Full={oa_full:.3f}  Δ(Full−HR)={tissue_improve:+.3f}")
 
 
 # ── 通用绘图函数 ──────────────────────────────────────────────────────
@@ -383,7 +384,7 @@ def draw_cases(cases, fig_title, save_path,
                 spine.set_linewidth(3)
 
     plt.tight_layout()
-    os.makedirs('./logs', exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"已保存: {save_path}")
@@ -403,7 +404,7 @@ draw_cases(
     fig_title       = (f'Per-class correction cases — t={INFER_T}, single-step inference\n'
                        'Full model improves over ablation '
                        '(evaluated on GT nucleus region vs GT label)'),
-    save_path       = './logs/correction_cases_by_class_ablation.png',
+    save_path       = './logs/downstream_Cellvitsamh/correction_cases_by_class_ablation.png',
     row_label_fn    = lambda c: (f"[{CLASS_NAMES[c['target_cls']]}]\n"
                                  f"tissue={c['type_name']}"),
     info_text_fn    = lambda c: (f"HR={c['hr_recall']:.3f}\n"
@@ -424,8 +425,9 @@ if found_cls_cases:
     fig_l.legend(handles=legend_patches, title='Cell type (focus)',
                  loc='center', ncol=4, fontsize=9)
     plt.tight_layout()
-    plt.savefig('./logs/correction_cases_by_class_legend.png',
-                dpi=150, bbox_inches='tight')
+    legend_path = './logs/downstream_Cellvitsamh/correction_cases_by_class_legend.png'
+    os.makedirs(os.path.dirname(legend_path) or '.', exist_ok=True)
+    plt.savefig(legend_path, dpi=150, bbox_inches='tight')
     plt.close()
 
 # ── 输出第二张图：按 tissue type ──────────────────────────────────────
@@ -446,15 +448,15 @@ if missing_tissues:
 draw_cases(
     cases           = found_tissue_cases,
     fig_title       = (f'Per-tissue correction cases — t={INFER_T}, single-step inference\n'
-                       'Best overall Dir_Acc improvement: Full vs Ablation '
+                       'Best overall Overall_Acc improvement: Full vs HR baseline '
                        '(GT nucleus region)'),
-    save_path       = './logs/correction_cases_by_tissue_ablation.png',
+    save_path       = './logs/downstream_Cellvitsamh/correction_cases_by_tissue_ablation.png',
     row_label_fn    = lambda c: (f"[{c['type_name']}]\n"
                                  f"idx={c['idx']}"),
     info_text_fn    = lambda c: (f"HR={c['oa_hr']:.3f}\n"
                                  f"Abl={c['oa_abl']:.3f}\n"
                                  f"Full={c['oa_full']:.3f}  "
-                                 f"Δ={c['improvement']:+.3f}"),
+                                 f"Δ(Full−HR)={c['improvement']:+.3f}"),
     border_color_fn = lambda c: tissue_color(c['type_name']),
 )
 
@@ -475,9 +477,9 @@ for case in found_cls_cases:
           f"{case['improvement']:>+8.4f}")
 
 print(f"\n{'='*W}")
-print("第二轮：按 Tissue Type 典型案例汇总（整体 Dir_Acc）")
+print("第二轮:按 Tissue Type 典型案例汇总(整体 Overall_Acc)")
 print(f"{'Tissue':<22}  {'样本':>5}  "
-      f"{'HR Acc':>8}  {'消融 Acc':>9}  {'本文 Acc':>9}  {'Δ':>8}")
+      f"{'HR Acc':>8}  {'消融 Acc':>9}  {'本文 Acc':>9}  {'Δ(Full−HR)':>10}")
 print("-" * W)
 for case in found_tissue_cases:
     print(f"{case['type_name']:<22}  "
@@ -485,7 +487,7 @@ for case in found_tissue_cases:
           f"{case['oa_hr']:>8.4f}  "
           f"{case['oa_abl']:>9.4f}  "
           f"{case['oa_full']:>9.4f}  "
-          f"{case['improvement']:>+8.4f}")
+          f"{case['improvement']:>+10.4f}")
 for t in missing_tissues:
     print(f"{t:<22}  {'—':>5}  {'未找到满足条件的案例'}")
 print(f"{'='*W}")
